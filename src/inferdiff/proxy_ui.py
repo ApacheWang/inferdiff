@@ -51,13 +51,13 @@ header {
 #connection[data-state="live"] { color: var(--emerald); }
 #connection[data-state="error"] { color: var(--crimson); }
 main { max-width: 100rem; margin: auto; padding: clamp(1rem, 3vw, 2.5rem); }
-.metrics { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: .75rem; margin-bottom: 1.25rem; }
+.metrics { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: .75rem; margin-bottom: 1.25rem; }
 .tile, .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; }
 .tile { padding: .9rem 1rem; }
 .tile dt { color: var(--muted); font-size: .85rem; }
 .tile dd { font-size: clamp(1.25rem, 2.6vw, 1.95rem); margin-top: .2rem; overflow-wrap: anywhere; }
 .p0 { color: var(--crimson); }
-.p1 { color: var(--amber); }
+.p1, .failover { color: var(--amber); }
 .stream { color: var(--emerald); }
 .timing { color: var(--violet); }
 .workspace { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(17rem, 1fr); gap: 1rem; align-items: start; }
@@ -75,6 +75,10 @@ td.path { width: 100%; }
 .path button { display: block; padding: .15rem .2rem; background: none; border: 0; text-align: left; overflow-wrap: anywhere; }
 .metric { white-space: nowrap; }
 .badge { display: inline-block; white-space: nowrap; padding: .06rem .45rem; border: 1px solid var(--border); border-radius: 5px; }
+.failover.badge {
+  margin-inline-start: .15rem; font-size: .72rem;
+  background: rgba(247, 199, 110, .08); border-color: rgba(247, 199, 110, .28);
+}
 .muted { color: var(--muted); }
 .empty { padding: 1.15rem 1rem; }
 .inspector-inner { padding: 0 1rem 1rem; }
@@ -104,6 +108,7 @@ td.path { width: 100%; }
 #copy-notice, #clear-notice { font-size: .83rem; }
 #clear-notice { margin-bottom: .75rem; }
 @media (max-width: 820px) {
+  .metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .workspace { grid-template-columns: minmax(0, 1fr); }
   .table-scroll { max-height: 45vh; }
 }
@@ -131,6 +136,7 @@ td.path { width: 100%; }
   <dl class="metrics">
     <div class="tile"><dt data-label="total">Total Requests</dt><dd id="requests_total">—</dd></div>
     <div class="tile"><dt data-label="stream">Streaming</dt><dd class="stream" id="streaming_requests">—</dd></div>
+    <div class="tile"><dt data-label="failovers">Failovers</dt><dd class="failover" id="failovers_total">—</dd></div>
     <div class="tile"><dt data-label="p0">P0 Breaches</dt><dd class="p0" id="p0_breaches">—</dd></div>
     <div class="tile"><dt data-label="p1">P1 Warnings</dt><dd class="p1" id="p1_warnings">—</dd></div>
     <div class="tile"><dt data-label="median">Median TTFT</dt><dd class="timing" id="median_ttft_ms">—</dd></div>
@@ -178,6 +184,7 @@ const translations = {
   en: {
     title: "Live Proxy", auto: "Auto-refresh", refresh: "Refresh", clear: "Clear events",
     total: "Total Requests", stream: "Streaming", p0: "P0 Breaches", p1: "P1 Warnings", median: "Median TTFT",
+    failovers: "Failovers", failover: "FAILOVER",
     requests: "Recent Requests", all: "All", breach: "Breaches Only", method: "Method", path: "Path",
     status: "Status", duration: "Total", findings: "Findings", inspector: "Frame & Finding Inspector", close: "Close",
     copy: "Copy Redacted Issue Report", loading: "Loading…", live: "Live", paused: "Paused",
@@ -197,6 +204,7 @@ const translations = {
   zh: {
     title: "实时代理", auto: "自动刷新", refresh: "刷新", clear: "清除事件",
     total: "请求总数", stream: "流式请求", p0: "P0 违规", p1: "P1 警告", median: "首令牌延迟中位数",
+    failovers: "故障切换次数", failover: "故障切换",
     requests: "最近请求", all: "全部", breach: "仅看违规", method: "方法", path: "路径",
     status: "状态", duration: "总耗时", findings: "检测结果", inspector: "帧与检测结果检查器", close: "关闭",
     copy: "复制已脱敏的问题报告", loading: "正在加载…", live: "实时", paused: "已暂停",
@@ -254,7 +262,7 @@ function showStatus() {
   connection.dataset.state = state;
   const message = label(statusError ? "connectionError" : state);
   if (connection.textContent !== message) connection.textContent = message;
-  for (const key of ["requests_total", "streaming_requests", "p0_breaches", "p1_warnings"]) {
+  for (const key of ["requests_total", "streaming_requests", "failovers_total", "p0_breaches", "p1_warnings"]) {
     byId(key).textContent = status?.[key] ?? "—";
   }
   byId("median_ttft_ms").textContent = ms(status?.median_ttft_ms);
@@ -286,8 +294,9 @@ function showRows() {
     if (event.p0_breaches) badges.append(element("span", `P0 × ${event.p0_breaches}`, "p0 badge"));
     if (event.p1_warnings) badges.append(element("span", `P1 × ${event.p1_warnings}`, "p1 badge"));
     if (!badges.hasChildNodes()) badges.append(element("span", "—", "muted"));
-    row.append(element("td", event.method, "metric"), path,
-      element("td", event.status, event.status >= 400 ? "metric p0" : "metric"),
+    const upstream = element("td", event.status, event.status >= 400 ? "metric p0" : "metric");
+    if (event.failover_used) upstream.append(" ", element("span", label("failover"), "failover badge"));
+    row.append(element("td", event.method, "metric"), path, upstream,
       element("td", ms(event.ttft_ms), "metric timing"),
       element("td", ms(event.total_ms), "metric"), badges);
     if (event.id === activeId) restoreFocus = button;

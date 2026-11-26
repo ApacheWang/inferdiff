@@ -9,6 +9,7 @@ import ipaddress
 import json
 import math
 import re
+import socket
 import statistics
 import sys
 import threading
@@ -16,8 +17,9 @@ import time
 import uuid
 import zlib
 from collections import deque
+from contextlib import ExitStack, closing
 from pathlib import Path
-from urllib.parse import SplitResult, unquote, unquote_plus, urlsplit
+from urllib.parse import SplitResult, quote_plus, unquote, unquote_plus, urlsplit
 
 from ._urls import RecorderError, validate_url
 from .detectors import Finding, audit_trace
@@ -36,6 +38,7 @@ from .redact import (
     extract_body_secret_values,
     extract_header_secret_values,
     extract_url_secret_values,
+    has_control_chars,
     is_protocol_enum,
     is_protocol_event,
     sanitize_url_path,
@@ -77,6 +80,8 @@ _UI_CLEAR = _UI_ROOT + "/clear"
 _UI_EVENT_PREFIX = _UI_ROOT + "/event/"
 _UI_ROUTES = _UI_PAGES | {_UI_STATUS, _UI_CLEAR}
 _READ_SIZE = 8192
+_RETRYABLE_STATUSES = {429, 502, 503, 504}
+_UPSTREAM_HEADER = "X-Inferdiff-Upstream"
 _URL_QUERY = re.compile(r"((?:https?://|(?<![\w/:])/)[^\s<>\"'\\?#]+)\?[^\s<>\"'\\#]+", re.IGNORECASE)
 _PATH_SUFFIX = re.compile(r"[?#]|%(?:25)*(?:3f|23)", re.IGNORECASE)
 
@@ -134,8 +139,14 @@ def _encode_chunk(data: bytes) -> bytes:
 
 
 def _header_secrets(headers) -> list[str]:
-    return [secret for name, value in headers.items()
-            for secret in extract_header_secret_values({name: value}, min_length=1)]
+    secrets = [secret for name, value in headers.items()
+               for secret in extract_header_secret_values({name: value}, min_length=1)]
+    for value in headers.get_all("Authorization", []):
+        # A provider-specific scheme can still carry a key reflected on its own.
+        parts = value.split(None, 1)
+        if len(parts) == 2 and parts[1].strip():
+            secrets.append(parts[1].strip())
+    return secrets
 
 
 def _query_secrets(query: str) -> list[str]:
@@ -146,6 +157,48 @@ def _query_secrets(query: str) -> list[str]:
         if raw:
             secrets.extend((raw, unquote_plus(raw)))
     return secrets
+
+
+def _upstream_path(upstream: SplitResult, path: str) -> str:
+    return "*" if path == "*" else upstream.path.rstrip("/") + path
+
+
+def _fallback_auth(headers: list[tuple[str, str]], query: str, key: str) -> str:
+    """Replace credentials in their existing carriers, or use Bearer auth."""
+    replaced = False
+    for index, (name, value) in enumerate(headers):
+        if name.lower() == "authorization":
+            parts = value.split(None, 1)
+            key_value = f"{parts[0]} {key}" if len(parts) == 2 else key
+        elif name.lower() in {"x-api-key", "x-goog-api-key", "api-key"}:
+            key_value = key
+        else:
+            continue
+        headers[index] = (name, key_value)
+        replaced = True
+    fields = query.split("&")
+    for index, field in enumerate(fields):
+        name = field.partition("=")[0]
+        if unquote_plus(name).lower() in {"key", "x-goog-api-key"}:
+            fields[index] = f"{name}={quote_plus(key)}"
+            replaced = True
+    if not replaced:
+        headers.append(("Authorization", f"Bearer {key}"))
+    return "&".join(fields)
+
+
+def _primary_failure_reason(error: OSError | http.client.HTTPException) -> str:
+    if isinstance(error, ConnectionRefusedError):
+        return "ConnectionRefused"
+    if isinstance(error, TimeoutError):
+        return "Timeout"
+    if isinstance(error, socket.gaierror):
+        return "DNSFailure"
+    if isinstance(error, http.client.RemoteDisconnected):
+        return "RemoteDisconnected"
+    if isinstance(error, http.client.HTTPException):
+        return "UpstreamProtocolError"
+    return "SocketError"
 
 
 def _display(text: str, secrets: list[str]) -> str:
@@ -184,6 +237,10 @@ class _UpstreamResponse(http.client.HTTPResponse):
             http.client.parse_headers(self.fp)
             status_line = super()._read_status()
         return status_line
+
+
+class _IncompleteRequest(ValueError):
+    """The downstream request body ended before its HTTP framing was complete."""
 
 
 class _Capture:
@@ -350,8 +407,11 @@ class ProxyServer(http.server.ThreadingHTTPServer):
     def __init__(
         self, address: tuple[str, int], upstream: SplitResult, *, save_dir: Path | None,
         only_breaches: bool, timeout: float, max_requests: int, no_color: bool, no_ui: bool = False,
+        fallback: SplitResult | None = None, fallback_api_key: str | None = None,
     ) -> None:
         self.upstream = upstream
+        self.fallback = fallback
+        self.fallback_api_key = fallback_api_key
         self.save_dir = save_dir
         self.only_breaches = only_breaches
         self.socket_timeout = timeout
@@ -360,6 +420,7 @@ class ProxyServer(http.server.ThreadingHTTPServer):
         self.ui_enabled = not no_ui
         self.lock = threading.Lock()
         self.requests_total = 0
+        self.failovers_total = 0
         self.streaming_requests = 0
         self.p0_breaches = 0
         self.p1_warnings = 0
@@ -385,6 +446,10 @@ class ProxyServer(http.server.ThreadingHTTPServer):
             self.active += 1
             return True
 
+    def record_failover(self) -> None:
+        with self.lock:
+            self.failovers_total += 1
+
     def complete(self, event: dict, streaming: bool, findings: list[Finding], line: str) -> None:
         with self.lock:
             self.log(line)
@@ -407,6 +472,7 @@ class ProxyServer(http.server.ThreadingHTTPServer):
             ttfts = [event["ttft_ms"] for event in events if event["ttft_ms"] is not None]
             snapshot = {
                 "requests_total": self.requests_total,
+                "failovers_total": self.failovers_total,
                 "streaming_requests": self.streaming_requests,
                 "p0_breaches": self.p0_breaches,
                 "p1_warnings": self.p1_warnings,
@@ -427,6 +493,7 @@ class ProxyServer(http.server.ThreadingHTTPServer):
 class _ProxyHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server: ProxyServer
+    _upstream_role: str | None = None
 
     def setup(self) -> None:
         self.request.settimeout(self.server.socket_timeout)
@@ -435,6 +502,11 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args) -> None:
         # Even parse-time errors in BaseHTTPRequestHandler can include a raw target.
         pass
+
+    def end_headers(self) -> None:
+        if self._upstream_role is not None:
+            self.send_header(_UPSTREAM_HEADER, self._upstream_role)
+        super().end_headers()
 
     def __getattr__(self, name):
         if name.startswith("do_"):
@@ -518,25 +590,25 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(503, "Proxy request limit reached")
             return
 
-        upstream = self.server.upstream
-        upstream_path = "*" if star else upstream.path.rstrip("/") + path
-        upstream_query = "&".join(part for part in (upstream.query, query) if part)
-        outgoing_target = upstream_path
-        if not star and (upstream_query or query_sep):
-            outgoing_target += "?" + upstream_query
-        endpoint_path = "/" if star else upstream_path
-        endpoint = f"{upstream.scheme}://{upstream.netloc}{endpoint_path}"
-        secrets = _header_secrets(self.headers) + _query_secrets(upstream_query) + extract_url_secret_values(endpoint)
+        upstream, fallback = self.server.upstream, self.server.fallback
+        fallback_key = self.server.fallback_api_key
+        secrets = _header_secrets(self.headers) + _query_secrets(query)
+        for destination in (upstream, fallback):
+            if destination is not None:
+                destination_path = "/" if star else _upstream_path(destination, path)
+                secrets.extend(_query_secrets(destination.query))
+                secrets.extend(extract_url_secret_values(destination._replace(path=destination_path).geturl()))
+        if fallback_key is not None:
+            secrets.append(fallback_key)
         start = time.monotonic_ns()
         capture = None
+        endpoint = ""
         header_time = start
         status = 502
         clean = False
         raw_body = bytearray()
         response_started = False
-        conn_class = http.client.HTTPSConnection if upstream.scheme == "https" else http.client.HTTPConnection
-        conn = conn_class(upstream.hostname, upstream.port, timeout=self.server.socket_timeout)
-        conn.response_class = _UpstreamResponse
+        primary_failure_reason = None
         try:
             try:
                 request_chunked, request_length = _framing(self.headers)
@@ -544,11 +616,39 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
                 status = 400
                 self.send_error(status, "Invalid request body framing")
                 return
-            if not self._send_request(conn, outgoing_target, request_chunked, request_length, raw_body):
-                status = 400
-                self.send_error(status, "Incomplete request body")
-                return
-            with conn.getresponse() as response:
+            if request_chunked:
+                # The chunk parser can read ahead. End the downstream connection after this request.
+                self.close_connection = True
+            request_body = self._read_request_body(request_chunked, request_length, raw_body)
+            with ExitStack() as upstream_io:
+                self._upstream_role = "primary"
+                try:
+                    response = self._request_upstream(
+                        upstream_io, upstream, target, request_chunked, request_length, request_body,
+                    )
+                except (OSError, http.client.HTTPException) as error:
+                    if fallback is None:
+                        raise
+                    primary_failure_reason = _primary_failure_reason(error)
+                else:
+                    if fallback is not None and response.status in _RETRYABLE_STATUSES:
+                        primary_failure_reason = f"HTTP {response.status}"
+
+                # Only the request is replayed. Commit the chosen response headers
+                # before reading any of its body, and never retry after this block.
+                if fallback is not None and primary_failure_reason is not None:
+                    upstream_io.close()
+                    # A connect/write error can leave some of the client body unread.
+                    for _ in request_body:
+                        pass
+                    self._upstream_role = "fallback"
+                    self.server.record_failover()
+                    upstream = fallback
+                    replay = (raw_body[offset:offset + _READ_SIZE] for offset in range(0, len(raw_body), _READ_SIZE))
+                    response = self._request_upstream(
+                        upstream_io, upstream, target, request_chunked, request_length, replay, fallback_key,
+                    )
+
                 header_time = time.monotonic_ns()
                 if response.status == 101:
                     self.send_error(status, "Upstream protocol upgrades are unsupported")
@@ -562,6 +662,8 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
                 status = response.status
                 has_body = self.command != "HEAD" and not (100 <= status < 200 or status in (204, 304))
                 if has_body:
+                    upstream_path = _upstream_path(upstream, path)
+                    endpoint = upstream._replace(path="/" if star else upstream_path, query="").geturl()
                     capture = _Capture(upstream_path, response.getheader("Content-Type", ""),
                                        response.getheader("Content-Encoding", "").strip().lower(), response_chunked)
                 downstream_chunked = has_body and response_length is None and self.request_version == "HTTP/1.1"
@@ -571,42 +673,63 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
                     clean = self._relay_body(response, response_chunked, response_length, downstream_chunked, capture)
                 else:
                     clean = True
+        except _IncompleteRequest:
+            status = 400
+            self.send_error(status, "Incomplete request body")
         except (OSError, http.client.HTTPException, ValueError):
             if not response_started:
                 status = 502
                 self.send_error(status, "Upstream request failed")
         finally:
-            conn.close()
+            failover_used = self._upstream_role == "fallback"
+            self._upstream_role = None
             if not clean:
                 self.close_connection = True
-            self._complete(capture, endpoint, path, status, start, header_time, clean, secrets, raw_body)
+            self._complete(capture, endpoint, path, status, start, header_time, clean, secrets, raw_body,
+                           failover_used, primary_failure_reason)
 
-    def _send_request(self, conn, target, chunked, length, raw_body) -> bool:
-        upstream = self.server.upstream
-        conn.putrequest(self.command, target, skip_host=True, skip_accept_encoding=True)
+    def _read_request_body(self, chunked, length, raw_body):
+        for data, clean in _body_chunks(self.rfile, chunked=chunked, length=length or 0):
+            if not clean:
+                raise _IncompleteRequest()
+            if data:
+                raw_body.extend(data)
+                yield data
+
+    def _request_upstream(self, stack, upstream, target, chunked, length, body, api_key=None):
+        path, query_sep, query = target.partition("?")
+        outgoing_target = _upstream_path(upstream, path)
+        outgoing_query = "" if path == "*" else "&".join(part for part in (upstream.query, query) if part)
+        headers = _end_to_end(self.headers)
+        if api_key is not None:
+            outgoing_query = _fallback_auth(headers, outgoing_query, api_key)
+        if path != "*" and (outgoing_query or query_sep):
+            outgoing_target += "?" + outgoing_query
+
+        conn_class = http.client.HTTPSConnection if upstream.scheme == "https" else http.client.HTTPConnection
+        conn = stack.enter_context(closing(conn_class(upstream.hostname, upstream.port, timeout=self.server.socket_timeout)))
+        conn.response_class = _UpstreamResponse
+        conn.putrequest(self.command, outgoing_target, skip_host=True, skip_accept_encoding=True)
         conn.putheader("Host", upstream.netloc)
-        for name, value in _end_to_end(self.headers):
+        for name, value in headers:
             if name.lower() != "host":
                 conn.putheader(name, value)
         if chunked:
             conn.putheader("Transfer-Encoding", "chunked")
-            # The chunk parser can read ahead. End the downstream connection after this request.
-            self.close_connection = True
         elif length is not None:
             conn.putheader("Content-Length", str(length))
         conn.endheaders()
-        for data, clean in _body_chunks(self.rfile, chunked=chunked, length=length or 0):
-            if data:
-                raw_body.extend(data)
-                conn.send(_encode_chunk(data) if chunked else data)
-            elif clean and chunked:
-                conn.send(_encode_chunk(b""))
-        return clean
+        for data in body:
+            conn.send(_encode_chunk(data) if chunked else data)
+        if chunked:
+            conn.send(_encode_chunk(b""))
+        return stack.enter_context(conn.getresponse())
 
     def _send_headers(self, response, length, chunked, has_body) -> None:
         self.send_response_only(response.status, response.reason)
         for name, value in _end_to_end(response.headers):
-            self.send_header(name, value)
+            if name.lower() != _UPSTREAM_HEADER.lower():
+                self.send_header(name, value)
         if chunked:
             self.send_header("Transfer-Encoding", "chunked")
         elif length is not None and (has_body or self.command == "HEAD" or response.status == 304):
@@ -634,7 +757,10 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
                 capture.feed(data, now)
         return False
 
-    def _complete(self, capture, endpoint, path, status, start, header_time, clean, secrets, raw_body) -> None:
+    def _complete(
+        self, capture, endpoint, path, status, start, header_time, clean, secrets, raw_body,
+        failover_used, primary_failure_reason,
+    ) -> None:
         end = time.monotonic_ns()
         event = {"method": "[redacted]", "path": "[redacted]", "status": status, "ttft_ms": None,
                  "total_ms": _elapsed(start, end), "findings_count": 0}
@@ -642,7 +768,8 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
         streaming = capture is not None and capture.streaming
         if self.server.ui_enabled:
             event.update(id=f"proxy_{uuid.uuid4().hex}", streaming=streaming, frame_count=0, finish_reason=None,
-                         terminal_status=None, dialect=capture.dialect if streaming else None, frames=[], findings=[])
+                         terminal_status=None, dialect=capture.dialect if streaming else None, frames=[], findings=[],
+                         failover_used=failover_used, primary_failure_reason=primary_failure_reason)
         try:
             body = _request_metadata(raw_body)
             secrets.extend(extract_body_secret_values(body))
@@ -710,15 +837,27 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
         return f"[{tag}] {line}"
 
 
+def _validate_upstream_url(url: str) -> SplitResult:
+    target = validate_url(url)
+    if target.fragment or any(char.isspace() for char in url):
+        raise RecorderError("Upstream URL must contain no whitespace or fragment.")
+    return target
+
+
 def create_proxy_server(
     upstream: str, *, host: str = "127.0.0.1", port: int = 8787, save_dir: str | Path | None = None,
     only_breaches: bool = False, timeout: float = 120, max_requests: int = 0, no_color: bool = False,
-    no_ui: bool = False,
+    no_ui: bool = False, fallback_url: str | None = None, fallback_api_key: str | None = None,
 ) -> ProxyServer:
     """Bind a proxy to an address. The caller owns the serving loop and cleanup."""
-    target = validate_url(upstream)
-    if target.fragment or any(char.isspace() for char in upstream):
-        raise RecorderError("Upstream URL must contain no whitespace or fragment.")
+    target = _validate_upstream_url(upstream)
+    fallback = _validate_upstream_url(fallback_url) if fallback_url is not None else None
+    if fallback_api_key is not None:
+        if fallback is None:
+            raise RecorderError("--fallback-api-key requires --fallback-url.")
+        if (not isinstance(fallback_api_key, str) or not fallback_api_key.strip()
+                or has_control_chars(fallback_api_key) or any(ord(char) > 255 for char in fallback_api_key)):
+            raise RecorderError("Invalid fallback API key.")
     if not 0 <= port <= 65535:
         raise RecorderError("Proxy port must be between 0 and 65535.")
     if not math.isfinite(timeout) or timeout <= 0:
@@ -733,6 +872,7 @@ def create_proxy_server(
             raise RecorderError("Could not create proxy trace directory.") from None
     try:
         return ProxyServer((host, port), target, save_dir=directory, only_breaches=only_breaches,
-                           timeout=timeout, max_requests=max_requests, no_color=no_color, no_ui=no_ui)
+                           timeout=timeout, max_requests=max_requests, no_color=no_color, no_ui=no_ui,
+                           fallback=fallback, fallback_api_key=fallback_api_key)
     except OSError:
         raise RecorderError("Could not bind proxy listener.") from None

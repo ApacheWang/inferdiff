@@ -284,10 +284,20 @@ _PROBE_OPTIONS = {
 
 
 def _cmd_proxy(args: argparse.Namespace) -> int:
+    raw_key = args.fallback_api_key
+    if raw_key is not None:
+        raw_key = raw_key.strip()
+        if raw_key.startswith("env:"):
+            raw_key = "$" + raw_key.removeprefix("env:")
+    try:
+        fallback_api_key = resolve_api_key(raw_key)
+    except ValueError:
+        raise ValueError("Invalid --fallback-api-key or unavailable environment variable.") from None
     with create_proxy_server(
         args.upstream, host=args.host, port=args.port, save_dir=args.save_dir,
         only_breaches=args.only_breaches, timeout=args.timeout, max_requests=args.max_requests,
         no_color=args.no_color, no_ui=args.no_ui,
+        fallback_url=args.fallback_url, fallback_api_key=fallback_api_key,
     ) as server:
         server.log(f"inferdiff proxy listening on port {server.server_port}")
         if server.ui_enabled:
@@ -679,6 +689,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_proxy = sub.add_parser("proxy", help="Forward local HTTP traffic and audit live LLM streams")
     p_proxy.add_argument("--upstream", required=True, help="Upstream HTTP(S) base URL")
+    p_proxy.add_argument("--fallback-url", help="HTTP(S) base URL for retrying pre-response upstream failures")
+    p_proxy.add_argument("--fallback-api-key", help="Override fallback authentication (literal key or env:NAME)")
     p_proxy.add_argument("--host", default="127.0.0.1", help="Listen address (default: 127.0.0.1)")
     p_proxy.add_argument("--port", type=int, default=8787, help="Listen port (default: 8787)")
     p_proxy.add_argument("--save-dir", help="Directory for redacted .trace.jsonl captures")

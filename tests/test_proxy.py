@@ -7,6 +7,7 @@ import http.client
 import http.server
 import io
 import json
+import socket
 import tempfile
 import threading
 import time
@@ -14,7 +15,7 @@ import unittest
 from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 from inferdiff.cli import main
 from inferdiff.schema import strict_json_loads
@@ -56,7 +57,15 @@ def _upstream(respond):
             pass
 
         def do_request(self):
-            body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            if self.headers.get("Transfer-Encoding") == "chunked":
+                chunks = []
+                while size := int(self.rfile.readline(), 16):
+                    chunks.append(self.rfile.read(size))
+                    self.rfile.readline()
+                self.rfile.readline()
+                body = b"".join(chunks)
+            else:
+                body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
             requests.append((self.command, self.path, dict(self.headers.items()), body))
             respond(self)
 
@@ -75,8 +84,8 @@ def _proxy(upstream, **options):
 
 
 @contextmanager
-def _response(port, method, path, *, body=None, headers=None):
-    client = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+def _response(port, method, path, *, body=None, headers=None, timeout=3):
+    client = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     try:
         client.request(method, path, body=body, headers=headers or {})
         with client.getresponse() as response:
@@ -319,6 +328,29 @@ class TestProxy(unittest.TestCase):
                 dashboard = f"Dashboard: http://127.0.0.1:{server.server_port}/_inferdiff/"
                 self.assertEqual(dashboard in output.getvalue().splitlines(), enabled)
 
+    def test_proxy_cli_resolves_fallback_key_from_environment_without_logging_it(self):
+        from inferdiff.proxy import create_proxy_server
+
+        fallback = "http://127.0.0.1:8081"
+        key, name = "fake-environment-fallback-secret", "INFERDIFF_TEST_FALLBACK_KEY"
+        args = ["proxy", "--upstream", "http://127.0.0.1:8080", "--port", "0",
+                "--fallback-url", fallback, "--fallback-api-key", f"env:{name}"]
+        output = io.StringIO()
+        with (
+            redirect_stdout(output), redirect_stderr(output),
+            patch("inferdiff.cli.create_proxy_server", wraps=create_proxy_server) as create,
+            patch("inferdiff.proxy.ProxyServer.serve_forever", autospec=True),
+        ):
+            with patch.dict("os.environ", {name: key}):
+                self.assertEqual(main(args), 0)
+            self.assertEqual(create.call_args.kwargs["fallback_url"], fallback)
+            self.assertEqual(create.call_args.kwargs["fallback_api_key"], key)
+            with patch.dict("os.environ", clear=True):
+                self.assertNotEqual(main(args), 0)
+            self.assertEqual(create.call_count, 1)
+        self.assertNotIn(key, output.getvalue())
+        self.assertNotIn(name, output.getvalue())
+
     def test_first_sse_chunk_reaches_client_before_upstream_releases_second(self):
         for chunked in (False, True):
             with self.subTest(chunked=chunked):
@@ -363,6 +395,225 @@ class TestProxy(unittest.TestCase):
                     event = status["recent_events"][0]
                     self.assertGreaterEqual(event["ttft_ms"], 0)
                     self.assertGreaterEqual(event["total_ms"], event["ttft_ms"])
+
+    def test_primary_503_fails_over_to_unbuffered_sse_and_redacts_both_keys(self):
+        primary_key = "fake-primary-failover-secret"
+        primary_header_key = "fake-primary-header-secret"
+        fallback_key = "fake-fallback-secret+/"
+        encoded_fallback = quote(fallback_key, safe="")
+        path = f"/{primary_key}/{encoded_fallback}{CHAT_PATH}"
+        query = urlencode({"key": primary_header_key, "mode": "fixture"})
+        headers = {"Authorization": f"Api-Key {primary_key}", "x-api-key": primary_header_key}
+        echoed = json.dumps({"choices": [{"index": 0, "delta": {"content": f"{primary_key} {fallback_key}"}}]})
+        first = b"data: " + echoed.encode("ascii") + b"\n\n"
+        release = threading.Event()
+
+        def unavailable(handler):
+            # The fallback must start without consuming the primary error body.
+            handler.send_response(503)
+            handler.send_header("Content-Length", "20")
+            handler.end_headers()
+            release.wait(timeout=5)
+            handler.close_connection = True
+
+        def stream(handler):
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream")
+            handler.send_header("Transfer-Encoding", "chunked")
+            handler.send_header("X-Inferdiff-Upstream", "untrusted")
+            handler.end_headers()
+            try:
+                handler.wfile.write(f"{len(first):X}\r\n".encode("ascii") + first + b"\r\n")
+                handler.wfile.flush()
+                if release.wait(timeout=5):
+                    handler.wfile.write(f"{len(TERMINAL):X}\r\n".encode("ascii") + TERMINAL + b"\r\n0\r\n\r\n")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        logs, errors, export = io.StringIO(), io.StringIO(), io.StringIO()
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            redirect_stdout(logs), redirect_stderr(errors),
+            _upstream(unavailable) as (primary, primary_requests),
+            _upstream(stream) as (fallback, fallback_requests),
+            _proxy(primary, fallback_url=fallback + "/fallback?region=west",
+                   fallback_api_key=fallback_key, save_dir=tmp) as (port, _),
+        ):
+            try:
+                with _response(port, "POST", f"{path}?{query}", body=BODY, headers=headers) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.headers.get_all("X-Inferdiff-Upstream"), ["fallback"])
+                    self.assertEqual(response.read(len(first)), first)
+                    live, _ = self.status(port, events=0)
+                    self.assertEqual(live["failovers_total"], 1)
+                    release.set()
+                    self.assertEqual(response.read(), TERMINAL)
+            finally:
+                release.set()
+            status, status_raw = self.status(port, events=1)
+            self.assertEqual(status["requests_total"], 1)
+            self.assertEqual(status["streaming_requests"], 1)
+            self.assertEqual(status["failovers_total"], 1)
+            summary = status["recent_events"][0]
+            self.assertIs(summary["failover_used"], True)
+            self.assertEqual(summary["primary_failure_reason"], "HTTP 503")
+            with _response(port, "GET", "/_inferdiff/") as response:
+                self.assertEqual(response.status, 200)
+                html = response.read().decode("utf-8")
+            with _response(port, "GET", f"/_inferdiff/event/{summary['id']}") as response:
+                self.assertEqual(response.status, 200)
+                event_raw = response.read().decode("utf-8")
+            traces = list(Path(tmp).glob("*.trace.jsonl"))
+            self.assertEqual(len(traces), 1)
+            trace = traces[0].read_text(encoding="utf-8")
+            with redirect_stdout(export):
+                self.assertEqual(main(["export", str(traces[0]), "--include-body", "--include-wire"]), 0)
+
+        self.assertEqual(len(primary_requests), 1)
+        method, target, sent_headers, sent_body = primary_requests[0]
+        self.assertEqual((method, target, sent_body), ("POST", f"{path}?{query}", BODY))
+        sent_headers = {name.lower(): value for name, value in sent_headers.items()}
+        self.assertEqual(sent_headers["authorization"], f"Api-Key {primary_key}")
+        self.assertEqual(sent_headers["x-api-key"], primary_header_key)
+
+        self.assertEqual(len(fallback_requests), 1)
+        method, target, sent_headers, sent_body = fallback_requests[0]
+        self.assertEqual((method, urlsplit(target).path, sent_body), ("POST", "/fallback" + path, BODY))
+        self.assertCountEqual(parse_qsl(urlsplit(target).query), [("region", "west"), ("key", fallback_key),
+                                                                 ("mode", "fixture")])
+        sent_headers = {name.lower(): value for name, value in sent_headers.items()}
+        self.assertEqual(sent_headers["host"], urlsplit(fallback).netloc)
+        self.assertEqual(sent_headers["authorization"], f"Api-Key {fallback_key}")
+        self.assertEqual(sent_headers["x-api-key"], fallback_key)
+
+        event = strict_json_loads(event_raw)
+        self.assertIs(event["failover_used"], True)
+        self.assertEqual(event["primary_failure_reason"], "HTTP 503")
+        for label in ("Failovers", "FAILOVER", "故障切换次数", "故障切换"):
+            self.assertIn(label, html)
+        for name, output in (("dashboard", html), ("status", status_raw), ("event", event_raw),
+                             ("Issue Markdown", event["issue_markdown"]), ("stdout", logs.getvalue()),
+                             ("stderr", errors.getvalue()), ("trace", trace), ("CLI export", export.getvalue())):
+            with self.subTest(surface=name):
+                for secret in (primary_key, primary_header_key, fallback_key, encoded_fallback):
+                    self.assertNotIn(secret, output)
+
+    def test_failed_fallback_returns_502_with_fallback_attribution(self):
+        def disconnect(handler):
+            handler.close_connection = True
+
+        with (
+            _upstream(lambda h: _reply(h, b"", status=503, headers=(("Connection", "close"),))) as (
+                primary, primary_requests,
+            ),
+            _upstream(disconnect) as (fallback, fallback_requests),
+            _proxy(primary, fallback_url=fallback) as (port, _),
+        ):
+            with _response(port, "POST", CHAT_PATH, body=BODY) as response:
+                self.assertEqual(response.status, 502)
+                self.assertEqual(response.headers.get_all("X-Inferdiff-Upstream"), ["fallback"])
+                response.read()
+            status, _ = self.status(port, events=1)
+        self.assertEqual(status["failovers_total"], 1)
+        summary = status["recent_events"][0]
+        self.assertIs(summary["failover_used"], True)
+        self.assertEqual(summary["primary_failure_reason"], "HTTP 503")
+        self.assertEqual(len(primary_requests), 1)
+        self.assertEqual(len(fallback_requests), 1)
+
+    def test_only_retryable_http_statuses_use_fallback(self):
+        def respond(handler):
+            code = int(handler.path.rsplit("/", 1)[-1])
+            _reply(handler, b"primary", status=code, content_type="text/plain",
+                   headers=(("Connection", "close"),))
+
+        with (
+            _upstream(respond) as (primary, _),
+            _upstream(lambda h: _reply(h, b"fallback", content_type="text/plain")) as (fallback, requests),
+            _proxy(primary, fallback_url=fallback) as (port, _),
+        ):
+            cases = [(400, False), (500, False), (429, True), (502, True), (503, True), (504, True)]
+            for code, retries in cases:
+                with self.subTest(code=code), _response(port, "GET", f"/status/{code}") as response:
+                    expected_upstream = "fallback" if retries else "primary"
+                    self.assertEqual(response.status, 200 if retries else code)
+                    self.assertEqual(response.headers["X-Inferdiff-Upstream"], expected_upstream)
+                    self.assertEqual(response.read(), expected_upstream.encode("ascii"))
+            status, _ = self.status(port, events=len(cases))
+        self.assertEqual(status["failovers_total"], 4)
+        self.assertEqual([target for _, target, _, _ in requests],
+                         ["/status/429", "/status/502", "/status/503", "/status/504"])
+
+    def test_primary_stream_with_d1_breach_never_uses_fallback(self):
+        wire = FIRST + _breach()
+        with (
+            _upstream(lambda h: _reply(h, wire)) as (primary, primary_requests),
+            _upstream(lambda h: _reply(h, TERMINAL)) as (fallback, fallback_requests),
+            _proxy(primary, fallback_url=fallback) as (port, _),
+        ):
+            with _response(port, "POST", CHAT_PATH, body=BODY) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.headers["X-Inferdiff-Upstream"], "primary")
+                self.assertEqual(response.read(), wire)
+            status, _ = self.status(port, events=1)
+            self.assertEqual(status["failovers_total"], 0)
+            summary = status["recent_events"][0]
+            self.assertIs(summary["failover_used"], False)
+            self.assertIsNone(summary["primary_failure_reason"])
+            with _response(port, "GET", f"/_inferdiff/event/{summary['id']}") as response:
+                event = strict_json_loads(response.read())
+            self.assertIn(("D1", "P0"), [(finding["detector_id"], finding["severity"]) for finding in event["findings"]])
+        self.assertEqual(len(primary_requests), 1)
+        self.assertEqual(fallback_requests, [])
+
+    def test_primary_connection_refused_replays_post_with_incoming_auth(self):
+        path = f"{CHAT_PATH}?key=fake-incoming-query-key"
+        headers = {"Authorization": "Bearer fake-incoming-bearer", "x-api-key": "fake-incoming-header-key"}
+        with socket.socket() as refused, _upstream(lambda h: _reply(h, FIRST + TERMINAL)) as (fallback, requests):
+            refused.bind(("127.0.0.1", 0))
+            primary = f"http://127.0.0.1:{refused.getsockname()[1]}"
+            with _proxy(primary, fallback_url=fallback) as (port, _):
+                with _response(port, "POST", path, body=BODY, headers=headers, timeout=5) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.headers["X-Inferdiff-Upstream"], "fallback")
+                    self.assertEqual(response.read(), FIRST + TERMINAL)
+                status, _ = self.status(port, events=1)
+        self.assertEqual(status["failovers_total"], 1)
+        summary = status["recent_events"][0]
+        self.assertIs(summary["failover_used"], True)
+        self.assertEqual(summary["primary_failure_reason"], "ConnectionRefused")
+        self.assertEqual(len(requests), 1)
+        method, target, sent_headers, sent_body = requests[0]
+        self.assertEqual((method, target, sent_body), ("POST", path, BODY))
+        sent_headers = {name.lower(): value for name, value in sent_headers.items()}
+        for name, value in headers.items():
+            self.assertEqual(sent_headers[name.lower()], value)
+
+    def test_primary_header_timeout_replays_chunked_request(self):
+        release = threading.Event()
+        chunks = (BODY[:11], BODY[11:])
+
+        def wait_without_sending_headers(handler):
+            release.wait(timeout=5)
+            handler.close_connection = True
+
+        with (
+            _upstream(wait_without_sending_headers) as (primary, primary_requests),
+            _upstream(lambda h: _reply(h, FIRST + TERMINAL)) as (fallback, fallback_requests),
+            _proxy(primary, fallback_url=fallback, timeout=0.3) as (port, _),
+        ):
+            try:
+                with _response(port, "POST", CHAT_PATH, body=iter(chunks)) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.headers["X-Inferdiff-Upstream"], "fallback")
+                    self.assertEqual(response.read(), FIRST + TERMINAL)
+            finally:
+                release.set()
+            status, _ = self.status(port, events=1)
+        self.assertEqual(status["failovers_total"], 1)
+        self.assertEqual(status["recent_events"][0]["primary_failure_reason"], "Timeout")
+        self.assertEqual([body for _, _, _, body in primary_requests], [BODY])
+        self.assertEqual([body for _, _, _, body in fallback_requests], [BODY])
 
     def test_live_breach_forwards_original_bytes_and_saves_auditable_trace(self):
         wire = _breach()

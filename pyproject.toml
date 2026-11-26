@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inferdiff"
+version = "0.1.0"
+description = "Wire-level regression diff and silent-failure forensics CLI for LLM serving upgrades"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = []
+authors = [
+    { name = "ApacheWang" },
+]
+keywords = ["llm", "inference", "sse", "ndjson", "diff", "vllm", "llama-cpp", "sglang", "ollama", "testing"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Testing",
+]
+
+[project.optional-dependencies]
+httpx = ["httpx>=0.27"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+inferdiff = "inferdiff.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/ApacheWang/inferdiff"
+Repository = "https://github.com/ApacheWang/inferdiff"
+Issues = "https://github.com/ApacheWang/inferdiff/issues"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,31 @@
+{
+  "model": "qwen3-8b-instruct",
+  "stream": true,
+  "temperature": 0,
+  "seed": 42,
+  "max_output_tokens": 24,
+  "tools": [
+    {
+      "type": "function",
+      "name": "glob_files",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": "string"
+          },
+          "exclude": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "pattern"
+        ]
+      }
+    }
+  ],
+  "input": "List C++ sources excluding build dirs."
+}

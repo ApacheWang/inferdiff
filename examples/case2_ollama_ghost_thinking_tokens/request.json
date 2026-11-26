@@ -1,0 +1,16 @@
+{
+  "model": "qwen3:8b",
+  "stream": true,
+  "think": true,
+  "options": {
+    "temperature": 0,
+    "seed": 7,
+    "num_predict": 40
+  },
+  "messages": [
+    {
+      "role": "user",
+      "content": "Return the default TCP port of Redis as digits only."
+    }
+  ]
+}

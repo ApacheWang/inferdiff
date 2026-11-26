@@ -1,13 +1,13 @@
 # inferdiff
 
 [![CI](https://github.com/ApacheWang/inferdiff/actions/workflows/ci.yml/badge.svg)](https://github.com/ApacheWang/inferdiff/actions/workflows/ci.yml)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://github.com/ApacheWang/inferdiff)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://github.com/ApacheWang/inferdiff)
 [![Zero Dependencies](https://raw.githubusercontent.com/ApacheWang/inferdiff/main/assets/badge-zero-deps.svg)](https://github.com/ApacheWang/inferdiff/blob/main/pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/ApacheWang/inferdiff/blob/main/LICENSE)
 
 **Wireshark & protocol bill-checker for streaming LLM APIs.**
 
-Catch silent `HTTP 200 OK` failures — truncated tool JSON, ghost thinking starvation, buffered nonconformant SSE relays, and illusory benchmark speedups — with **zero third-party runtime dependencies** (Python 3.11+ standard library only).
+Catch silent `HTTP 200 OK` failures — truncated tool JSON, ghost thinking starvation, buffered nonconformant SSE relays, and illusory benchmark speedups — with **zero third-party runtime dependencies** (Python 3.10+ standard library only).
 
 [中文文档 (README.zh-CN.md)](https://github.com/ApacheWang/inferdiff/blob/main/README.zh-CN.md) · [PyPI (`inferdiff`)](https://pypi.org/project/inferdiff/) · [Releases](https://github.com/ApacheWang/inferdiff/releases)
 
@@ -26,7 +26,7 @@ Standard uptime monitors and latency benchmarks only check HTTP status codes and
 
 ## 5-Second Quickstart (Zero Install via `uvx` or `pip`)
 
-Zero-install via [`uvx`](https://docs.astral.sh/uv/guides/tools/) directly from [PyPI](https://pypi.org/project/inferdiff/), or install locally with `pip` (Python 3.11+, zero third-party dependencies):
+Zero-install via [`uvx`](https://docs.astral.sh/uv/guides/tools/) directly from [PyPI](https://pypi.org/project/inferdiff/), or install locally with `pip` (Python 3.10+, zero third-party dependencies):
 
 ```bash
 # 1. Zero-install live health check on a local engine (llama-server, vLLM, SGLang, Ollama)
@@ -73,14 +73,33 @@ Every `diff --html`, `audit --html`, `doctor --html`, and `export --format html`
 | `C6` (P0) | Multi-byte UTF-8 / 4-byte emoji `U+FFFD` corruption or swallowed stream tail | `quick`, `full`, `relay` | [`vLLM #68324`](https://github.com/vllm-project/vllm/issues/68324), [`#47161`](https://github.com/vllm-project/vllm/issues/47161) |
 | `C7` (P1) | Buffered non-streaming response dumped as a fake SSE burst | `quick`, `full`, `relay` | [`LiteLLM #5803`](https://github.com/BerriAI/litellm/issues/5803) |
 | `C8` (P2) | Randomized-prefix same-seed heterogeneous backend pool drift (advisory) | `full`, `relay` | [vLLM Benchmarking CLI](https://docs.vllm.ai/en/stable/benchmarking/cli/) |
+| `C9` (P0) | Anthropic Messages lifecycle, dishonest `max_tokens` termination, and missing output usage | `--only C9` or `--protocol anthropic` | [Anthropic streaming messages](https://platform.claude.com/docs/en/build-with-claude/streaming) |
+
+```bash
+inferdiff doctor https://api.anthropic.com/v1 --model "$CLAUDE_MODEL" \
+  --protocol anthropic --anthropic-version 2023-06-01 --json
+```
+
+C9 requests a long tool argument with a 32-token budget and falls back to a long text prompt if the server rejects the tool request. It validates text, thinking, and tool input deltas. It uses `x-api-key` and falls back to `ANTHROPIC_API_KEY`. `--anthropic-version` alone also selects C9, and `--only C1,C9` runs both checks against a gateway's sibling routes. HTTP 404 or 405 on `/v1/messages` yields `SKIP`.
 
 ## Recording, Side-by-Side Comparison & Bundled Examples
+
+Run the same canaries against two targets and export the side-by-side results.
+
+```bash
+inferdiff compare \
+  --a-url https://api.example.com/v1 --a-key '$KEY_A' --a-model model-id --a-label Baseline \
+  --b-url https://relay.example.com/v1 --b-key '$KEY_B' --b-model model-id --b-label Relay \
+  --only C1,C4,C7 --out-json compare.json --out-md compare.md --out-html compare.html
+```
+
+Use `--markdown` for paste-ready stdout. The report includes per-check statuses, model and fingerprint differences, finish reasons, tool and thinking-stream differences, and B/A latency ratios. By default, latency regression requires a B/A increase of at least 50% and 20 ms on matched samples. The verdict prioritizes suspected model mismatch, then contract drift, then latency regression. The report retains all observed differences.
 
 ```bash
 # Record one request or a multi-line .jsonl suite (strict RFC 9112 framing + per-frame flush)
 inferdiff record --url http://127.0.0.1:8080/v1/responses -d request.json -o target.trace.jsonl
 
-# Compare two live endpoints sequentially with per-target scoped credentials
+# Replay a specific request against two endpoints with per-target credentials
 inferdiff compare \
   --before-url http://127.0.0.1:8080/v1/chat/completions \
   --after-url  http://127.0.0.1:8081/v1/chat/completions \
@@ -139,7 +158,7 @@ Use `ApacheWang/inferdiff@v0.1.1` directly in GitHub Actions to run a live `doct
 ### Explicit Non-Goals
 
 - **No LLM-as-a-Judge or capability leaderboards**: `inferdiff` never grades prose quality, math/coding intelligence, or jailbreak resistance. Every verdict is a deterministic function of raw wire bytes, JSON syntax trees, and monotonic frame timestamps.
-- **No heavy runtime stack**: Core CLI and HTML/SVG waterfall rendering stay 100% Python 3.11+ standard library (`0` mandatory `pip` packages, `0` Node.js runtime, `0` external CDN requests).
+- **No heavy runtime stack**: Core CLI and HTML/SVG waterfall rendering stay 100% Python 3.10+ standard library (`0` mandatory `pip` packages, `0` Node.js runtime, `0` external CDN requests).
 
 ## Roadmap (v0.2: Non-Intrusive KV & Storage Probes)
 

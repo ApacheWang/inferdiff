@@ -23,6 +23,7 @@ VALID_DIALECTS = (
     "openai-responses",
     "sglang-native",
     "ollama-ndjson",
+    "anthropic-messages",
 )
 
 UsageValue = Union[int, str]
@@ -566,6 +567,7 @@ def assemble_summary(
             ev in ("response.completed", "response.incomplete", "response.failed") for ev in closed_events
         ) and not norm.get("protocol_error")
         is_ollama_done = "ollama.done" in closed_events or "done:true" in closed_events
+        is_anthropic_stop = dialect == "anthropic-messages" and "message_stop" in closed_events
 
         # Detect protocol violations from dialect normalizers
         if norm.get("protocol_error"):
@@ -586,7 +588,7 @@ def assemble_summary(
         if is_typed_resp_term:
             saw_typed_responses_terminal = True
             saw_done_sentinel = True
-        if is_ollama_done:
+        if is_ollama_done or is_anthropic_stop:
             saw_done_sentinel = True
 
         text_delta = norm.get("text_delta") or ""
@@ -671,7 +673,9 @@ def assemble_summary(
         if rec["delta_entries"] and done_snap is not None and streamed_args != done_snap:
             args_mismatch = True
             args_mismatch_detail = "streamed arguments.delta differs from arguments.done snapshot"
-        elif rec["delta_entries"] and item_snap is not None and streamed_args != item_snap:
+        # Anthropic sends the initial input object before any JSON fragments.
+        elif (rec["delta_entries"] and item_snap is not None and streamed_args != item_snap
+              and dialect != "anthropic-messages"):
             args_mismatch = True
             args_mismatch_detail = "streamed arguments.delta differs from final item snapshot"
         elif done_snap is not None and item_snap is not None and done_snap != item_snap:
@@ -699,6 +703,8 @@ def assemble_summary(
                 if has_lone_surrogate(parsed_args):
                     json_valid = False
                     json_error = "Arguments contain invalid lone UTF-16 surrogate"
+                elif dialect == "anthropic-messages" and not isinstance(parsed_args, dict):
+                    json_error = "Anthropic tool input must be a JSON object"
                 else:
                     json_valid = True
             except (json.JSONDecodeError, ValueError, RecursionError) as exc:

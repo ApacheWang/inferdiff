@@ -718,7 +718,7 @@ def render_audit_html(
 
 
 def render_doctor_html(report: DoctorReport, *, include_wire: bool = False) -> str:
-    """Render the C1..C8 Doctor Health Scorecard + multi-lane SVG frame waterfalls."""
+    """Render the Doctor Health Scorecard and multi-lane SVG frame waterfalls."""
     b_cls = "b-red" if report.grade == "F" else ("b-amb" if report.warning_count > 0 else "b-grn")
     verdict = f"DOCTOR GRADE: {report.grade} · EXIT {report.exit_code}"
     tok_str = f"{report.total_tokens:,} tok" if report.total_tokens is not None else "unknown"
@@ -792,12 +792,12 @@ def render_doctor_html(report: DoctorReport, *, include_wire: bool = False) -> s
             f'<span class="pill">profile: {_esc(report.profile)}</span> <span class="pill">model: {_esc(redact_secret_text(report.model), 48)}</span></div>'
             f'<div class="pill">{_esc(redact_secret_text(report.target_url), 72)}</div></div>'
             f'<div class="kpis">{kpis}</div></div>'
-            f'<div class="sec"><div class="sec-h"><h2>Canary Multi-Lane Frame Waterfall (C1-C8)</h2>'
+            f'<div class="sec"><div class="sec-h"><h2>Canary Multi-Lane Frame Waterfall</h2>'
             f'<div><button id="btn-abs" class="btn on" type="button">Absolute ms</button> '
             f'<button id="btn-norm" class="btn" type="button">Normalized %</button></div></div>'
             f"{_legend_html()}{svg_abs}{svg_norm}"
             f'<pre id="click-wire" class="code" style="margin-top:8px">Click any frame bar above to inspect its summary.</pre></div>'
-            f'<div class="sec"><div class="sec-h"><h2>Endpoint &amp; Relay Canary Matrix (C1-C8)</h2></div>'
+            f'<div class="sec"><div class="sec-h"><h2>Endpoint &amp; Relay Canary Matrix</h2></div>'
             f"<table><thead><tr><th>Status</th><th>Probe</th><th>Time</th><th>Frames</th><th>Tokens</th><th>Verdict &amp; Evidence</th><th>Ref</th></tr></thead>"
             f"<tbody>{''.join(rows)}</tbody></table></div>"
         )

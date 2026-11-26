@@ -148,19 +148,25 @@ def redact_headers(headers: Mapping[str, str] | Sequence[Tuple[str, str]]) -> Di
     return out
 
 
-def extract_header_secret_values(headers: Mapping[str, str]) -> list[str]:
-    """Return raw sensitive header/token values (len >= 6) so echoed secrets can be scrubbed."""
+def extract_header_secret_values(headers: Mapping[str, str], *, min_length: int = 6) -> list[str]:
+    """Return sensitive header and token values for scrubbing reflections."""
     secrets_out: list[str] = []
     for k, v in headers.items():
         if not is_sensitive_header(k) or not isinstance(v, str):
             continue
         raw = v.strip()
-        if len(raw) >= 6:
+        if len(raw) >= min_length:
             secrets_out.append(raw)
         parts = raw.split(None, 1)
-        if len(parts) == 2 and parts[0].lower() in RECOGNIZED_AUTH_SCHEMES and len(parts[1].strip()) >= 6:
+        if len(parts) == 2 and parts[0].lower() in RECOGNIZED_AUTH_SCHEMES and len(parts[1].strip()) >= min_length:
             secrets_out.append(parts[1].strip())
     return sorted(set(secrets_out), key=len, reverse=True)
+
+
+def extract_query_secret_values(query: str) -> list[str]:
+    """Return non-allowlisted query values that can be echoed by a target."""
+    return [value for name, value in urllib.parse.parse_qsl(query)
+            if len(value) >= 6 and name.lower() not in SAFE_EXPORT_QUERY_KEYS]
 
 
 def scrub_known_secrets(text: str, known_secrets: Sequence[str] = ()) -> str:

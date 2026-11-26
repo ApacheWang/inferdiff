@@ -8,7 +8,7 @@ version = "0.1.1"
 description = "Wireshark for streaming LLMs: catch HTTP 200 silent truncations, broken tool JSON, fake SSE relays & usage drops."
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = []
 authors = [
     { name = "ApacheWang" },
@@ -19,6 +19,7 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -26,7 +27,6 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-httpx = ["httpx>=0.27"]
 dev = ["pytest>=8.0"]
 
 [project.scripts]

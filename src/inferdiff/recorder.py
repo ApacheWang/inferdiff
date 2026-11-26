@@ -12,7 +12,6 @@ import secrets
 import socket
 import ssl
 import time
-import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple, Union
@@ -26,6 +25,7 @@ from .probes import (
 from .probes._task import TTFT_HOOK_BUDGET, ProbeTask, run_ttft_hook
 from .redact import (
     extract_header_secret_values,
+    extract_query_secret_values,
     has_control_chars,
     redact_headers,
     sanitize_url_for_error,
@@ -62,6 +62,16 @@ _NONBLOCKING_TTFT_HOOKS = frozenset({
 })
 # Only the built-ins accept the recorder's monotonic EOF time.
 _EOF_CUTOFF_HOOKS = frozenset({CompositeBackendProbe.sample_eof, LinuxProcIoProbe.sample_eof})
+
+
+class RecorderHTTPError(RecorderError):
+    """A non-200 HTTP response received before recording could begin."""
+
+    def __init__(self, status_code: int, url: str) -> None:
+        self.status_code = status_code
+        super().__init__(
+            f"HTTP {status_code} from {sanitize_url_for_error(url)} (expected HTTP 200 for streaming capture)"
+        )
 
 
 def validate_and_merge_headers(
@@ -559,7 +569,7 @@ def build_frame_from_chunk(
             sglang_prev_text,
         )
 
-    if dialect != "ollama-ndjson" and chunk.payload_text == "[DONE]":
+    if dialect not in ("ollama-ndjson", "anthropic-messages") and chunk.payload_text == "[DONE]":
         done_norm = dict(empty_norm)
         done_norm["phase"] = "TERMINAL"
         done_norm["closed_events"] = ["[DONE]"]
@@ -782,18 +792,11 @@ def record_stream(
     # Streaming capture strictly requires HTTP 200; never expose raw query or response body in errors
     if status_code != 200:
         conn.close()
-        raise RecorderError(
-            f"HTTP {status_code} from {sanitize_url_for_error(url)} (expected HTTP 200 for streaming capture)"
-        )
+        raise RecorderHTTPError(status_code, url)
 
     redacted_req_headers = redact_headers(send_headers)
     outgoing_secrets = extract_header_secret_values(send_headers)
-    # Also capture any non-allowlisted query param values as secrets to scrub if reflected
-    if parsed.query:
-        for qk, qv in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
-            if len(qv) >= 6 and qk.lower() not in ("api-version", "version", "alt", "stream"):
-                outgoing_secrets.append(qv)
-        outgoing_secrets = sorted(set(outgoing_secrets), key=len, reverse=True)
+    outgoing_secrets.extend(extract_query_secret_values(parsed.query))
 
     safe_stored_url = sanitize_url_for_export(url)
     header = TraceHeader(

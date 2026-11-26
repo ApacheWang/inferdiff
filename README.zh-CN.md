@@ -1,13 +1,13 @@
 # inferdiff — 流式大模型接口的「协议验钞机」
 
 [![CI](https://github.com/ApacheWang/inferdiff/actions/workflows/ci.yml/badge.svg)](https://github.com/ApacheWang/inferdiff/actions/workflows/ci.yml)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://github.com/ApacheWang/inferdiff)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://github.com/ApacheWang/inferdiff)
 [![零第三方依赖](https://raw.githubusercontent.com/ApacheWang/inferdiff/main/assets/badge-zero-deps.svg)](pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 **HTTP 返回 `200 OK`，不代表你的流式推理真的没坏。**
 
-`inferdiff` 是一款**零第三方运行时依赖**（纯 Python 3.11+ 标准库）的流式线协议体检与回归取证 CLI，原生支持 `llama-server`、`vLLM`、`SGLang`、`Ollama` 及各类 OpenAI 兼容网关与中转 API。
+`inferdiff` 是一款**零第三方运行时依赖**（纯 Python 3.10+ 标准库）的流式线协议体检与回归取证 CLI，原生支持 `llama-server`、`vLLM`、`SGLang`、`Ollama` 及各类 OpenAI 兼容网关与中转 API。
 
 如果把压测工具比作“测水流快慢的水表”，把评测数据集比作“给作文打分的评委”，`inferdiff` 就是抓获底层静默损坏的 **Wireshark + 协议验钞机**。
 
@@ -26,7 +26,7 @@
 
 ## 5 秒零配置上手
 
-已正式上线 [PyPI](https://pypi.org/project/inferdiff/)，可通过 [`uvx`](https://docs.astral.sh/uv/guides/tools/) 零安装运行，或使用 `pip` 本地安装（Python 3.11+，零第三方运行时依赖）：
+已正式上线 [PyPI](https://pypi.org/project/inferdiff/)，可通过 [`uvx`](https://docs.astral.sh/uv/guides/tools/) 零安装运行，或使用 `pip` 本地安装（Python 3.10+，零第三方运行时依赖）：
 
 ```bash
 # 1. 无需录制历史包，零安装一键体检本地推理引擎并生成单文件 HTML 瀑布图
@@ -105,7 +105,7 @@ inferdiff export \
 ### 明确“不做什么”（Non-Goals）
 
 - **不做裁判模型打分与智商题库**：不消耗大量 Token 测数学题或代码题；所有告警 100% 基于原始线协议字节、JSON 语法树与单调时钟时间戳确定性给出。
-- **不引入重型运行时依赖**：核心 CLI 与 HTML/SVG 瀑布图渲染器永久保持 **Python 3.11+ 标准库零第三方强依赖**，不引入 Node.js、PyTorch 或任何外部 CDN 脚本。
+- **不引入重型运行时依赖**：核心 CLI 与 HTML/SVG 瀑布图渲染器永久保持 **Python 3.10+ 标准库零第三方强依赖**，不引入 Node.js、PyTorch 或任何外部 CDN 脚本。
 
 ## License
 

@@ -1,10 +1,11 @@
-"""inferdiff doctor: zero-setup C1..C8 canary probe suite for local engines & API relays."""
+"""inferdiff doctor: streaming contract canaries for local engines and API relays."""
 
 from __future__ import annotations
 
 import datetime
 import http.client
 import json
+import math
 import os
 import secrets
 import ssl
@@ -15,8 +16,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from . import __version__
+from .anthropic import ANTHROPIC_VERSION, inspect_anthropic_stream, record_anthropic_stream
 from .detectors import D1, D2, D3, D4, Finding, audit_trace
-from .recorder import RecorderError, record_stream, validate_and_merge_headers, validate_url
+from .recorder import RecorderError, RecorderHTTPError, record_stream, validate_and_merge_headers, validate_url
 from .redact import (
     extract_header_secret_values,
     sanitize_url_for_error,
@@ -48,10 +50,12 @@ PROBE_CATALOG: Dict[str, Tuple[str, str, str]] = {
     "C6": ("UTF8_MULTIBYTE_INTEGRITY", "P0", "https://github.com/vllm-project/vllm/issues/68324"),
     "C7": ("FAKE_STREAMING_BUFFER", "P1", "https://github.com/BerriAI/litellm/issues/5803"),
     "C8": ("SEED_AND_RELAY_DRIFT", "P2", "https://docs.vllm.ai/en/stable/benchmarking/cli/"),
+    "C9": ("anthropic_stream_contract", "P0", "https://platform.claude.com/docs/en/build-with-claude/streaming"),
 }
 
 C6_TARGET_TEXT = "吞吐量Δ=99.8% [🔥🚀🧪🌊]"
 C6_TRAILING_EMOJI = "🌊"
+C9_MAX_TOKENS = 32
 
 
 def _clean_display(text: Any, secrets_list: Sequence[str] = (), max_chars: int = 180) -> str:
@@ -171,6 +175,42 @@ def resolve_api_key(raw_key: Optional[str]) -> Optional[str]:
     return cand
 
 
+def select_doctor_probes(
+    profile: str,
+    only: Optional[Sequence[str]] = None,
+    *,
+    protocol: Optional[str] = None,
+    anthropic_version: Optional[str] = None,
+) -> Tuple[str, ...]:
+    if profile not in PROFILE_PROBES:
+        raise ValueError(f"Unknown doctor profile: {profile!r} (valid: quick, full, relay)")
+    if protocol not in (None, "openai", "anthropic"):
+        raise ValueError("Invalid protocol (expected openai or anthropic).")
+    if anthropic_version is not None and not anthropic_version.strip():
+        raise ValueError("--anthropic-version cannot be empty.")
+    if protocol == "openai" and anthropic_version is not None:
+        raise ValueError("--anthropic-version requires Anthropic Messages. Omit --protocol openai.")
+    if only is None:
+        return ("C9",) if protocol == "anthropic" or anthropic_version is not None else PROFILE_PROBES[profile]
+    requested = {probe.strip().upper() for probe in only if probe.strip()}
+    if not requested or requested - PROBE_CATALOG.keys():
+        raise ValueError(f"Invalid --only value. Valid canary checks are {', '.join(PROBE_CATALOG)}.")
+    if protocol == "anthropic" and requested != {"C9"}:
+        raise ValueError("--protocol anthropic supports C9. To include OpenAI checks, omit --protocol.")
+    if protocol == "openai" and "C9" in requested:
+        raise ValueError("C9 uses Anthropic Messages. To select C9, omit --protocol openai.")
+    return tuple(probe for probe in PROBE_CATALOG if probe in requested)
+
+
+def _doctor_headers(headers: Mapping[str, str], key: Optional[str], *, anthropic: bool = False) -> Dict[str, str]:
+    auth_name, env_name = ("x-api-key", "ANTHROPIC_API_KEY") if anthropic else ("Authorization", "OPENAI_API_KEY")
+    if key is None and not any(name.lower() in {auth_name.lower(), "authorization"} for name in headers):
+        key = (os.environ.get(env_name) or "").strip() or None
+    if key is None:
+        return dict(headers)
+    return validate_and_merge_headers(headers, {auth_name: key if anthropic else f"Bearer {key}"})
+
+
 def _format_origin(parsed: urllib.parse.SplitResult) -> str:
     host = parsed.hostname or ""
     if ":" in host and not host.startswith("["):
@@ -185,6 +225,29 @@ def _build_url(parsed: urllib.parse.SplitResult, new_path: str) -> str:
     if parsed.query:
         return f"{origin}{norm_path}?{parsed.query}"
     return f"{origin}{norm_path}"
+
+
+def _report_url(url: str, known_secrets: Sequence[str]) -> str:
+    safe = sanitize_url_for_export(url)
+    display = scrub_known_secrets(safe, known_secrets)
+    if display != safe:
+        try:
+            validate_url(display)
+        except RecorderError:
+            return ""
+    return display
+
+
+def _resolve_anthropic_urls(base_url: str) -> Tuple[str, str]:
+    parsed = validate_url(base_url)
+    path = parsed.path.rstrip("/")
+    for suffix in ("/messages", "/chat/completions", "/responses", "/api/chat", "/api"):
+        if path.lower().endswith(suffix):
+            path = path[:-len(suffix)]
+            break
+    if not path.lower().endswith("/v1"):
+        path += "/v1"
+    return _build_url(parsed, f"{path}/messages"), _build_url(parsed, f"{path}/models")
 
 
 def _http_get_json(url: str, headers: Mapping[str, str], timeout: float) -> Tuple[int, Optional[Dict[str, Any]]]:
@@ -247,9 +310,10 @@ def resolve_endpoints_and_model(
         or (parsed.port == 11434 and not path_low.endswith("/v1") and not path_low.endswith("/chat/completions"))
     )
 
-    if path_low.endswith("/chat/completions"):
-        prefix = base_path[: -len("/chat/completions")]
-        chat_url = _build_url(parsed, base_path)
+    if path_low.endswith(("/chat/completions", "/responses", "/v1/messages")):
+        suffix = next(s for s in ("/chat/completions", "/responses", "/messages") if path_low.endswith(s))
+        prefix = base_path[:-len(suffix)]
+        chat_url = _build_url(parsed, base_path if suffix == "/chat/completions" else f"{prefix}/chat/completions")
         responses_url: Optional[str] = _build_url(parsed, f"{prefix}/responses")
         models_url = _build_url(parsed, f"{prefix}/models")
         tags_url = _build_url(parsed, f"{prefix[:-3] if prefix.lower().endswith('/v1') else prefix}/api/tags")
@@ -1415,6 +1479,81 @@ def _run_c8(
     )
 
 
+def _run_c9(
+    url: str,
+    model: str,
+    headers: Dict[str, str],
+    timeout: float,
+    save_dir: Optional[Path],
+    secrets_list: Sequence[str],
+) -> ProbeResult:
+    code, severity, reference = PROBE_CATALOG["C9"]
+    count_prompt = "List the integers from 1 to 1000 in order, one per line. Start immediately with 1."
+    body = {
+        "model": model,
+        "max_tokens": C9_MAX_TOKENS,
+        "stream": True,
+        "messages": [{"role": "user", "content": count_prompt}],
+    }
+    tool_body = dict(
+        body,
+        messages=[{"role": "user", "content": "Call record_numbers with every integer from 1 to 1000 in order."}],
+        tools=[{
+            "name": "record_numbers",
+            "description": "Record an ordered list of numbers.",
+            "eager_input_streaming": True,
+            "input_schema": {
+                "type": "object",
+                "properties": {"numbers": {"type": "array", "items": {"type": "integer"}}},
+                "required": ["numbers"],
+            },
+        }],
+        tool_choice={"type": "tool", "name": "record_numbers"},
+    )
+    path = _save_path(save_dir, "c9_anthropic_stream_contract.trace.jsonl")
+    started = time.monotonic()
+    try:
+        try:
+            doc = record_anthropic_stream(url=url, request_body=tool_body, out_path=path, headers=headers,
+                                          label="doctor-C9", timeout=timeout)
+        except RecorderHTTPError as exc:
+            if exc.status_code not in (400, 422):
+                raise
+            doc = record_anthropic_stream(url=url, request_body=body, out_path=path, headers=headers,
+                                          label="doctor-C9", timeout=timeout)
+    except RecorderError as exc:
+        duration = (time.monotonic() - started) * 1000
+        if isinstance(exc, RecorderHTTPError) and exc.status_code in (404, 405):
+            return ProbeResult("C9", code, severity, "SKIP", f"/v1/messages is unsupported (HTTP {exc.status_code})",
+                               duration, 0, None, reference)
+        return ProbeResult("C9", code, severity, "ERROR", _clean_display(f"transport/HTTP error: {exc}", secrets_list),
+                           duration, 0, None, reference)
+
+    contract = inspect_anthropic_stream(doc, max_tokens=C9_MAX_TOKENS)
+    if contract.violations:
+        status, summary = "FAIL", _clean_display(contract.violations[0], secrets_list)
+    elif contract.stop_reason != "max_tokens":
+        status, summary = "SKIP", "Inconclusive: the stream stopped before there was evidence of a max_tokens cutoff."
+    elif not contract.delta_types:
+        status, summary = "SKIP", "Inconclusive: the stream reported max_tokens without content block deltas."
+    else:
+        status, summary = "PASS", "Matched message and content block lifecycle, honest max_tokens stop, and valid output usage."
+    return ProbeResult(
+        "C9", code, severity, status, summary,
+        doc.summary.timing.get("total_ms") or (time.monotonic() - started) * 1000,
+        doc.summary.total_frames, _doc_tokens(doc), reference,
+        trace_paths=[str(path)] if path else [], traces=[doc],
+        details={
+            "stop_reason": _clean_display(contract.stop_reason, secrets_list) if contract.stop_reason else None,
+            "output_tokens": contract.output_tokens,
+            "max_tokens": C9_MAX_TOKENS,
+            "delta_types": [_clean_display(kind, secrets_list) for kind in contract.delta_types],
+            "incomplete_tool_indices": list(contract.incomplete_tool_indices),
+            "violations": [_clean_display(message, secrets_list) for message in contract.violations],
+        },
+    )
+
+
 _PROBE_RUNNERS = {
     "C1": _run_c1,
     "C2": _run_c2,
@@ -1464,32 +1603,42 @@ def run_doctor(
     timeout: float = 60.0,
     save_dir: Optional[str] = None,
     strict: bool = False,
+    only: Optional[Sequence[str]] = None,
+    protocol: Optional[str] = None,
+    anthropic_version: Optional[str] = None,
 ) -> DoctorReport:
-    """Execute the C1..C8 canary suite against a live LLM endpoint or relay."""
-    if profile not in PROFILE_PROBES:
-        raise ValueError(f"Unknown doctor profile: {profile!r} (valid: quick, full, relay)")
-
-    # Auth precedence: explicit --api-key -> -H Authorization:... -> OPENAI_API_KEY -> none
-    req_headers: Dict[str, str] = validate_and_merge_headers({}, headers) if headers else {}
-    has_hdr_auth = any(k.lower() == "authorization" for k in req_headers)
-    if api_key is not None:
-        resolved_key = resolve_api_key(api_key)
-        if resolved_key:
-            req_headers = validate_and_merge_headers(req_headers, {"Authorization": f"Bearer {resolved_key}"})
-    elif not has_hdr_auth:
-        env_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
-        if env_key:
-            req_headers = validate_and_merge_headers(req_headers, {"Authorization": f"Bearer {env_key}"})
-
-    known_secrets = extract_header_secret_values(req_headers)
-
-    chat_url, responses_url, dialect, resolved_model = resolve_endpoints_and_model(
-        base_url,
-        model=model,
-        headers=req_headers,
-        timeout=timeout,
-        known_secrets=known_secrets,
-    )
+    """Execute selected live canaries; the standard profiles opt out of C9."""
+    probes = select_doctor_probes(profile, only, protocol=protocol, anthropic_version=anthropic_version)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("--timeout must be a finite number greater than zero.")
+    extra_headers = validate_and_merge_headers({}, headers)
+    key = resolve_api_key(api_key)
+    if "C9" in probes:
+        messages_url, models_url = _resolve_anthropic_urls(base_url)
+        messages_headers = _doctor_headers(extra_headers, key, anthropic=True)
+        if anthropic_version is not None or not any(name.lower() == "anthropic-version" for name in messages_headers):
+            messages_headers = validate_and_merge_headers(messages_headers, {
+                "anthropic-version": anthropic_version.strip() if anthropic_version else ANTHROPIC_VERSION,
+            })
+        messages_secrets = extract_header_secret_values(messages_headers)
+    if probes == ("C9",):
+        chat_url, dialect, known_secrets = messages_url, "anthropic-messages", messages_secrets
+        resolved_model = (model or "").strip()
+        if not resolved_model:
+            _, models = _http_get_json(models_url, messages_headers, min(timeout, 15.0))
+            data = models.get("data") if models else None
+            ids = [entry["id"] for entry in data if isinstance(entry, dict)
+                   and isinstance(entry.get("id"), str) and entry["id"]] if isinstance(data, list) else []
+            # Some relays don't expose model discovery. Send the probe so an absent Messages route still skips.
+            resolved_model = _pick_preferred_model(ids) or "inferdiff-probe"
+        messages_model = resolved_model
+    else:
+        req_headers = _doctor_headers(extra_headers, key)
+        known_secrets = extract_header_secret_values(req_headers)
+        chat_url, responses_url, dialect, resolved_model = resolve_endpoints_and_model(
+            base_url, model=model, headers=req_headers, timeout=timeout, known_secrets=known_secrets,
+        )
+        messages_model = (model or "").strip() or resolved_model
 
     if save_dir == "":
         ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -1503,9 +1652,12 @@ def run_doctor(
         out_dir.mkdir(parents=True, exist_ok=True)
 
     results: List[ProbeResult] = []
-    for pid in PROFILE_PROBES[profile]:
-        runner = _PROBE_RUNNERS[pid]
-        res = runner(chat_url, responses_url, dialect, resolved_model, req_headers, timeout, out_dir, profile, known_secrets)
+    for pid in probes:
+        if pid == "C9":
+            res = _run_c9(messages_url, messages_model, messages_headers, timeout, out_dir, messages_secrets)
+        else:
+            runner = _PROBE_RUNNERS[pid]
+            res = runner(chat_url, responses_url, dialect, resolved_model, req_headers, timeout, out_dir, profile, known_secrets)
         results.append(res)
 
     grade, rc, p0_count, warn_count, err_count = compute_wire_grade(results, strict=strict)
@@ -1513,8 +1665,8 @@ def run_doctor(
     total_tokens = sum(known_toks) if known_toks else None
 
     report = DoctorReport(
-        target_url=sanitize_url_for_export(base_url),
-        chat_url=sanitize_url_for_export(chat_url),
+        target_url=_report_url(base_url, known_secrets),
+        chat_url=_report_url(chat_url, known_secrets),
         dialect=dialect,
         model=_clean_display(resolved_model, known_secrets, 128),
         profile=profile,
@@ -1529,7 +1681,7 @@ def run_doctor(
     )
     if out_dir is not None:
         (out_dir / "doctor_summary.json").write_text(
-            json.dumps(report.to_dict(), ensure_ascii=True, indent=2) + "\n",
+            json.dumps(report.to_dict(), ensure_ascii=True, indent=2, allow_nan=False) + "\n",
             encoding="utf-8",
             newline="\n",
         )

@@ -4,12 +4,28 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from . import __version__
-from .canary import render_doctor_terminal, run_doctor
+from .canary import (
+    PROBE_CATALOG,
+    DoctorReport,
+    ProbeResult,
+    render_doctor_terminal,
+    resolve_api_key,
+    run_doctor,
+    select_doctor_probes,
+)
+from .comparison import (
+    compare_reports,
+    render_comparison_html,
+    render_comparison_markdown,
+    render_comparison_terminal,
+)
 from .detectors import AUDIT_RULE_LIST, VALID_AUDIT_DETECTORS, audit_trace
 from .differ import diff_traces
 from .exporter import (
@@ -20,7 +36,8 @@ from .exporter import (
     sanitize_trace_for_json_export,
 )
 from .probes import CompositeBackendProbe, LinuxProcIoProbe, LmcacheMpProbe, MooncakeStoreProbe
-from .recorder import RecorderError, record_stream, validate_and_merge_headers
+from .recorder import RecorderError, record_stream, validate_and_merge_headers, validate_url
+from .redact import extract_header_secret_values, extract_query_secret_values, sanitize_url_for_export
 from .schema import (
     EXIT_OK,
     EXIT_SEMANTIC_REGRESSION,
@@ -139,6 +156,15 @@ def _aggregate_exit_code(current: int, new_rc: int) -> int:
     return EXIT_OK
 
 
+def _canary_selection(args: argparse.Namespace) -> Dict[str, Any]:
+    return {
+        "profile": args.profile or "quick",
+        "only": args.only.split(",") if args.only is not None else None,
+        "protocol": args.protocol,
+        "anthropic_version": args.anthropic_version,
+    }
+
+
 def _cmd_doctor(args: argparse.Namespace) -> int:
     headers = _parse_headers(args.header)
     if args.html and args.save_dir:
@@ -148,10 +174,10 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         model=args.model or None,
         api_key=args.api_key,
         headers=headers,
-        profile=args.profile,
         timeout=args.timeout,
         save_dir=args.save_dir,
         strict=args.strict,
+        **_canary_selection(args),
     )
     if args.html:
         protected: List[str | Path] = []
@@ -162,7 +188,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         _assert_distinct_output_path(args.html, protected)
         _write_text_file(args.html, render_doctor_html(report))
     if args.json:
-        sys.stdout.write(json.dumps(report.to_dict(), ensure_ascii=True, separators=(",", ":")) + "\n")
+        sys.stdout.write(json.dumps(report.to_dict(), ensure_ascii=True, separators=(",", ":"), allow_nan=False) + "\n")
     else:
         sys.stdout.write(render_doctor_terminal(report, no_color=args.no_color))
         if args.html:
@@ -293,6 +319,99 @@ def _cmd_diff(args: argparse.Namespace) -> int:
 
 
 def _cmd_compare(args: argparse.Namespace) -> int:
+    if (any(getattr(args, f"{side}_{field}") is not None for side in ("a", "b")
+            for field in ("url", "key", "model", "label"))
+            or any(value is not None for value in (args.only, args.protocol, args.anthropic_version, args.profile))
+            or args.out_json or args.out_md or args.out_html or args.markdown):
+        return _cmd_compare_canaries(args)
+    return _cmd_compare_replay(args)
+
+
+def _run_compare_target(
+    url: str, model: Optional[str], api_key: Optional[str], *, headers: Dict[str, str],
+    timeout: float, selection: Dict[str, Any], probes: Sequence[str],
+) -> DoctorReport:
+    try:
+        return run_doctor(base_url=url, model=model, api_key=api_key, headers=headers, timeout=timeout, **selection)
+    except RecorderError as exc:
+        results = []
+        for probe in probes:
+            code, severity, reference = PROBE_CATALOG[probe]
+            results.append(ProbeResult(probe, code, severity, "ERROR", str(exc), 0.0, 0, None, reference))
+        return DoctorReport(
+            target_url=sanitize_url_for_export(url), chat_url="", dialect="unknown", model=model or "",
+            profile=selection["profile"], grade="F", exit_code=EXIT_USAGE_OR_IO_ERROR, p0_count=0,
+            warning_count=0, error_count=len(results), total_tokens=None, save_dir=None, results=results,
+        )
+
+
+def _cmd_compare_canaries(args: argparse.Namespace) -> int:
+    if not args.a_url or not args.b_url:
+        raise ValueError("Canary compare requires --a-url and --b-url.")
+    if (args.before_url or args.after_url or args.request or args.before_header or args.after_header or args.save_dir
+            or args.before_label or args.after_label or args.dialect != "auto" or args.fail_on
+            or any(_probe_config(args, prefix) for prefix in ("", "before_", "after_"))):
+        raise ValueError("Canary compare uses --a-* and --b-*; request replay uses --before-url, --after-url and --request.")
+    if args.out_html and args.html:
+        raise ValueError("Use only one of --out-html and --html.")
+    stdout_json = args.json or args.out_json == "-"
+    stdout_markdown = args.markdown or args.out_md == "-"
+    if stdout_json and stdout_markdown:
+        raise ValueError("Choose JSON or Markdown for stdout.")
+
+    out_html = args.out_html or args.html
+    paths = [out_html, *(path for path in (args.out_json, args.out_md) if path != "-")]
+    outputs = [_norm_path_key(path) for path in paths if path]
+    if len(outputs) != len(set(outputs)):
+        raise ValueError("Use a distinct file for each comparison output.")
+    if not math.isfinite(args.ttft_regress_pct) or args.ttft_regress_pct < 0:
+        raise ValueError("--ttft-regress-pct must be a finite nonnegative number.")
+    targets = (validate_url(args.a_url), validate_url(args.b_url))
+    selection = _canary_selection(args)
+    probes = select_doctor_probes(**selection)
+    headers = _parse_headers(args.header)
+    known_secrets = extract_header_secret_values(headers, min_length=1)
+    for target in targets:
+        known_secrets.extend(extract_query_secret_values(target.query))
+    fallback_keys = []
+    if probes != ("C9",):
+        fallback_keys.append(os.environ.get("OPENAI_API_KEY", "").strip())
+    if "C9" in probes:
+        fallback_keys.append(os.environ.get("ANTHROPIC_API_KEY", "").strip())
+    for key in (resolve_api_key(args.a_key), resolve_api_key(args.b_key), *fallback_keys):
+        if key:
+            known_secrets.append(key)
+
+    a = _run_compare_target(args.a_url, args.a_model, args.a_key, headers=headers, timeout=args.timeout,
+                            selection=selection, probes=probes)
+    b = _run_compare_target(args.b_url, args.b_model, args.b_key, headers=headers, timeout=args.timeout,
+                            selection=selection, probes=probes)
+    report = compare_reports(a, b, a_label=args.a_label or "A", b_label=args.b_label or "B",
+                             known_secrets=known_secrets, ignore_timing=args.ignore_timing,
+                             ttft_regress_pct=args.ttft_regress_pct)
+
+    if out_html:
+        _write_text_file(out_html, render_comparison_html(report))
+    if args.out_json or stdout_json:
+        payload = json.dumps(report.to_dict(), ensure_ascii=True, indent=2, allow_nan=False) + "\n"
+        if args.out_json and args.out_json != "-":
+            _write_text_file(args.out_json, payload)
+        if stdout_json:
+            sys.stdout.write(payload)
+    if args.out_md or stdout_markdown:
+        markdown = render_comparison_markdown(report)
+        if args.out_md and args.out_md != "-":
+            _write_text_file(args.out_md, markdown)
+        if stdout_markdown:
+            sys.stdout.write(markdown)
+    if not (stdout_json or stdout_markdown):
+        sys.stdout.write(render_comparison_terminal(report, no_color=args.no_color))
+    return report.exit_code
+
+
+def _cmd_compare_replay(args: argparse.Namespace) -> int:
+    if not (args.before_url and args.after_url and args.request):
+        raise ValueError("Request replay compare requires --before-url, --after-url and --request.")
     shared_headers = _parse_headers(args.header)
     before_headers = validate_and_merge_headers(shared_headers, _parse_headers(args.before_header))
     after_headers = validate_and_merge_headers(shared_headers, _parse_headers(args.after_header))
@@ -342,7 +461,7 @@ def _cmd_compare(args: argparse.Namespace) -> int:
         after,
         ignore_timing=args.ignore_timing,
         ttft_regress_pct=args.ttft_regress_pct,
-        fail_on=args.fail_on,
+        fail_on=args.fail_on or "p0",
     )
     if args.html:
         _write_text_file(args.html, render_diff_html(before, after, report))
@@ -432,6 +551,13 @@ def _add_probe_options(parser: argparse.ArgumentParser, side: str = "") -> None:
         parser.add_argument(f"--{prefix}probe-{name}", type=value_type, help=help_text + scope)
 
 
+def _add_canary_options(parser: argparse.ArgumentParser | argparse._ArgumentGroup) -> None:
+    parser.add_argument("--profile", choices=("quick", "full", "relay"), help="Canary profile (default: quick)")
+    parser.add_argument("--only", help="Comma-separated checks (C1 through C9)")
+    parser.add_argument("--protocol", choices=("openai", "anthropic"), help="Select Anthropic Messages (C9) or OpenAI canaries")
+    parser.add_argument("--anthropic-version", metavar="DATE", help="Anthropic version header (opts into C9 by default)")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="inferdiff",
@@ -441,12 +567,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     # doctor (primary zero-setup entry point per Spec §2.1)
-    p_doc = sub.add_parser("doctor", help="Zero-setup C1..C8 canary health check for local engines or API relays")
+    p_doc = sub.add_parser("doctor", help="Live C1..C9 streaming contract checks for engines and API relays")
     p_doc.add_argument("base_url", help="Target base URL (e.g. http://127.0.0.1:8080/v1 or https://api.example.com/v1)")
     p_doc.add_argument("--model", "-m", default="", help="Model ID (auto-discovers /models or /api/tags if omitted)")
-    p_doc.add_argument("--api-key", default=None, help="API key or $ENV_VAR (defaults to OPENAI_API_KEY, always redacted)")
+    p_doc.add_argument("--api-key", default=None, help="API key or $ENV_VAR (default: OPENAI_API_KEY or ANTHROPIC_API_KEY)")
     p_doc.add_argument("--header", "-H", action="append", default=[], help="Extra HTTP header 'Name: value' (repeatable)")
-    p_doc.add_argument("--profile", choices=("quick", "full", "relay"), default="quick", help="Canary profile (quick/full/relay)")
+    _add_canary_options(p_doc)
     p_doc.add_argument("--timeout", type=float, default=60.0, help="Per-probe socket timeout in seconds")
     p_doc.add_argument("--save-dir", default="", help="Directory to save canary .trace.jsonl files (default ./.inferdiff-doctor/<ts>/)")
     p_doc.add_argument("--html", default="", help="Write single-file airgap-safe HTML scorecard & SVG waterfall")
@@ -496,28 +622,39 @@ def build_parser() -> argparse.ArgumentParser:
 
     # compare
     p_cmp = sub.add_parser(
-        "compare", help="Record two live endpoints sequentially and diff immediately",
-        description="Record the baseline and target sequentially. Use per-side probe flags for distinct URLs. "
-                    "Shared probe flags require identical inference URLs and headers.",
+        "compare", help="Compare two live canary targets or replay a request against two endpoints",
+        description="Run canaries with --a-url and --b-url, or replay --request with --before-url and --after-url. "
+                    "Both modes contact targets sequentially.",
     )
-    p_cmp.add_argument("--before-url", required=True)
-    p_cmp.add_argument("--after-url", required=True)
-    p_cmp.add_argument("--request", "-d", required=True)
+    canaries = p_cmp.add_argument_group("A/B canary comparison")
+    for side in ("a", "b"):
+        canaries.add_argument(f"--{side}-url", help=f"Target {side.upper()} base URL")
+        canaries.add_argument(f"--{side}-key", help=f"Target {side.upper()} API key or $ENV_VAR")
+        canaries.add_argument(f"--{side}-model", help=f"Target {side.upper()} model ID (auto-discovers if omitted)")
+        canaries.add_argument(f"--{side}-label", help=f"Display label for target {side.upper()}")
+    _add_canary_options(canaries)
+    canaries.add_argument("--out-html", help="Write a self-contained A/B waterfall")
+    canaries.add_argument("--out-json", help="Write comparison JSON (use - for stdout)")
+    canaries.add_argument("--out-md", help="Write a Markdown comparison table (use - for stdout)")
+    canaries.add_argument("--markdown", "--md", action="store_true", help="Print the Markdown comparison table")
+    p_cmp.add_argument("--before-url", help="Baseline endpoint for request replay")
+    p_cmp.add_argument("--after-url", help="Target endpoint for request replay")
+    p_cmp.add_argument("--request", "-d", help="Request JSON for request replay")
     p_cmp.add_argument("--header", "-H", action="append", default=[], help="Shared HTTP header for both targets")
     p_cmp.add_argument("--before-header", action="append", default=[], help="HTTP header scoped only to --before-url")
     p_cmp.add_argument("--after-header", action="append", default=[], help="HTTP header scoped only to --after-url")
     p_cmp.add_argument("--dialect", choices=("auto", *VALID_DIALECTS), default="auto")
-    p_cmp.add_argument("--before-label", default="before")
-    p_cmp.add_argument("--after-label", default="after")
+    p_cmp.add_argument("--before-label")
+    p_cmp.add_argument("--after-label")
     p_cmp.add_argument("--timeout", type=float, default=120.0)
     p_cmp.add_argument("--save-dir", default="", help="Optional directory to save before/after traces")
     p_cmp.add_argument(
         "--ignore-timing",
         action="store_true",
-        help="Ignore TTFT regressions and pair-level D5 and D8 alerts",
+        help="Ignore timing regressions and pair-level D5 and D8 alerts",
     )
     p_cmp.add_argument("--ttft-regress-pct", type=float, default=50.0)
-    p_cmp.add_argument("--fail-on", choices=("p0", "p1", "any-diff"), default="p0")
+    p_cmp.add_argument("--fail-on", choices=("p0", "p1", "any-diff"), help="Request replay failure threshold (default: p0)")
     p_cmp.add_argument("--html", default="", help="Write dual-lane single-file HTML frame waterfall")
     p_cmp.add_argument("--json", action="store_true")
     p_cmp.add_argument("--no-color", action="store_true")

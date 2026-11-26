@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from ._probe_data import NUMBER, PROBE_FIELDS
+
 SCHEMA_VERSION = "inferdiff.trace.v1"
 
 EXIT_OK = 0
@@ -803,6 +805,46 @@ def _require_type(obj: Dict[str, Any], key: str, expected_type: Any, ctx: str) -
     return val
 
 
+def validate_backend_probe(value: Any, ctx: str) -> None:
+    """Validate known fields and bound the size and nesting of extension data."""
+    if value is None:
+        return
+    nodes_left = 2048
+    chars_left = 65536
+
+    def visit(item: Any, expected: Any, depth: int) -> None:
+        nonlocal nodes_left, chars_left
+        nodes_left -= 1
+        if depth > 8 or nodes_left < 0:
+            raise TraceSchemaError(f"{ctx}: backend_probe exceeds size or depth limits")
+        if isinstance(item, str):
+            chars_left -= len(item)
+            if chars_left < 0 or len(item) > 4096 or has_lone_surrogate(item):
+                raise TraceSchemaError(f"{ctx}: invalid backend_probe text")
+        if expected is NUMBER:
+            valid = is_finite_number(item)
+        elif expected is int:
+            valid = is_strict_int(item) and is_finite_number(item)
+        elif isinstance(expected, dict):
+            valid = isinstance(item, dict)
+        else:
+            valid = expected is None or isinstance(item, expected)
+        if not valid:
+            raise TraceSchemaError(f"{ctx}: invalid backend_probe field type")
+        if isinstance(item, dict):
+            fields = expected if isinstance(expected, dict) else {}
+            for key, child in item.items():
+                visit(key, str, depth + 1)
+                visit(child, fields.get(key, fields.get(None)), depth + 1)
+        elif isinstance(item, list):
+            for child in item:
+                visit(child, str if expected is list else None, depth + 1)
+        elif item is not None and not isinstance(item, (str, bool)) and not is_finite_number(item):
+            raise TraceSchemaError(f"{ctx}: backend_probe must contain finite JSON values")
+
+    visit(value, PROBE_FIELDS, 0)
+
+
 def load_trace(path: Union[str, Path]) -> TraceDocument:
     """Load and strictly validate an inferdiff.trace.v1 JSONL file."""
     src = Path(path)
@@ -859,8 +901,7 @@ def load_trace(path: Union[str, Path]) -> TraceDocument:
         req_copy["effective_params"] = extract_effective_params(req_copy["body"], dialect)
 
     bp_hdr = hdr_obj.get("backend_probe")
-    if bp_hdr is not None and not isinstance(bp_hdr, dict):
-        raise TraceSchemaError(f"{src}:header: field 'backend_probe' must be dict or null")
+    validate_backend_probe(bp_hdr, f"{src}:header")
 
     sum_obj = records[-1]
     if sum_obj.get("type") != "summary":
@@ -890,8 +931,7 @@ def load_trace(path: Union[str, Path]) -> TraceDocument:
     if "reported_usage" in assembled and assembled["reported_usage"] is not None and not isinstance(assembled["reported_usage"], dict):
         raise TraceSchemaError(f"{src}:summary.assembled: field 'reported_usage' must be object")
     bp_sum = sum_obj.get("backend_probe")
-    if bp_sum is not None and not isinstance(bp_sum, dict):
-        raise TraceSchemaError(f"{src}:summary: field 'backend_probe' must be dict or null")
+    validate_backend_probe(bp_sum, f"{src}:summary")
 
     frames: List[TraceFrame] = []
     for idx, rec in enumerate(records[1:-1]):

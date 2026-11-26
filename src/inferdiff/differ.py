@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from .detectors import Finding, audit_trace, detect_d5
+from .detectors import Finding, audit_trace, detect_d5, detect_d8_pair
 from .schema import (
     EXIT_OK,
     EXIT_SEMANTIC_REGRESSION,
@@ -559,7 +559,7 @@ def diff_traces(
     min_ttft_delta_ms: float = 0.0,
     fail_on: str = "p0",
 ) -> DiffReport:
-    """Compare two TraceDocuments with chunk-jitter-proof semantic alignment and D1..D5."""
+    """Compare two TraceDocuments with chunk-jitter-proof semantic alignment and D1..D8."""
     before_findings = audit_trace(before)
     after_findings = audit_trace(after)
     pair_findings = detect_d5(
@@ -568,9 +568,15 @@ def diff_traces(
         ignore_timing=ignore_timing,
         min_delta_ms=min_ttft_delta_ms,
     )
+    pair_findings.extend(detect_d8_pair(
+        before, after, ignore_timing=ignore_timing, min_delta_ms=min_ttft_delta_ms,
+    ))
 
-    before_keys = {(f.detector_id, f.code) for f in before_findings}
-    new_after = [f for f in after_findings if (f.detector_id, f.code) not in before_keys]
+    before_severity = {(f.detector_id, f.code): f.severity for f in before_findings}
+    new_after = [
+        f for f in after_findings
+        if (f.detector_id, f.code) not in before_severity or f.severity < before_severity[(f.detector_id, f.code)]
+    ]
     new_findings = new_after + pair_findings
 
     first_div, terminal_drifted = _find_first_divergence(before, after)

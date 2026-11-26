@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from . import __version__
 from .canary import render_doctor_terminal, run_doctor
-from .detectors import VALID_AUDIT_DETECTORS, audit_trace
+from .detectors import AUDIT_RULE_LIST, VALID_AUDIT_DETECTORS, audit_trace
 from .differ import diff_traces
 from .exporter import (
     render_audit_terminal,
@@ -19,6 +19,7 @@ from .exporter import (
     render_github_issue,
     sanitize_trace_for_json_export,
 )
+from .probes import CompositeBackendProbe, LinuxProcIoProbe, LmcacheMpProbe, MooncakeStoreProbe
 from .recorder import RecorderError, record_stream, validate_and_merge_headers
 from .schema import (
     EXIT_OK,
@@ -169,9 +170,42 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     return report.exit_code
 
 
+_PROBE_OPTIONS = {
+    "pid": (int, "Linux process ID for /proc/PID/io sampling"),
+    "lmcache": (str, "LMCache MP metrics URL (defaults to /metrics on an origin)"),
+    "mooncake-master": (str, "Mooncake Store master HTTP origin"),
+    "mooncake-client": (str, "Mooncake Store client HTTP origin"),
+}
+
+
+def _probe_config(args: argparse.Namespace, prefix: str = "") -> dict[str, Any]:
+    config = {}
+    for flag in _PROBE_OPTIONS:
+        name = flag.replace("-", "_")
+        value = getattr(args, f"{prefix}probe_{name}")
+        if value is not None:
+            config[name] = value
+    return config
+
+
+def _backend_probe(
+    *, lmcache: str | None = None, mooncake_master: str | None = None,
+    mooncake_client: str | None = None, pid: int | None = None,
+) -> Optional[CompositeBackendProbe]:
+    if all(value is None for value in (lmcache, mooncake_master, mooncake_client, pid)):
+        return None
+    return CompositeBackendProbe(
+        lmcache_mp=LmcacheMpProbe(lmcache) if lmcache is not None else None,
+        mooncake=MooncakeStoreProbe(mooncake_master, mooncake_client)
+        if mooncake_master is not None or mooncake_client is not None else None,
+        proc_io=LinuxProcIoProbe(pid) if pid is not None else None,
+    )
+
+
 def _cmd_record(args: argparse.Namespace) -> int:
     headers = _parse_headers(args.header)
     bodies = _load_request_bodies(args.request, allow_jsonl=True)
+    probe_config = _probe_config(args)
     agg_rc = EXIT_OK
 
     for idx, body in enumerate(bodies, start=1):
@@ -187,6 +221,7 @@ def _cmd_record(args: argparse.Namespace) -> int:
             dialect=args.dialect,
             label=lbl,
             timeout=args.timeout,
+            probe=_backend_probe(**probe_config),
         )
         findings = audit_trace(doc)
         sys.stdout.write(render_audit_terminal(doc, findings, no_color=args.no_color))
@@ -200,11 +235,11 @@ def _parse_only_detectors(raw_only: Optional[str]) -> Optional[set[str]]:
         return None
     tokens = [tok.strip().upper() for tok in raw_only.split(",") if tok.strip()]
     if not tokens:
-        raise ValueError("Invalid --only value: must specify one or more of D1, D2, D3, D4.")
+        raise ValueError(f"Invalid --only value. Valid audit rules are {AUDIT_RULE_LIST}.")
     unknown = sorted(set(tokens) - VALID_AUDIT_DETECTORS)
     if unknown:
         raise ValueError(
-            f"Unknown detector(s) in --only: {', '.join(unknown)} (valid for audit: D1, D2, D3, D4)."
+            f"Invalid detector selection for audit: {', '.join(unknown)}. Valid audit rules are {AUDIT_RULE_LIST}."
         )
     return set(tokens)
 
@@ -225,7 +260,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
             "findings": [f.to_dict() for f in findings],
             "exit_code": rc,
         }
-        sys.stdout.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n")
+        sys.stdout.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":"), allow_nan=False) + "\n")
     else:
         sys.stdout.write(render_audit_terminal(doc, findings, no_color=args.no_color))
         if args.html:
@@ -248,7 +283,8 @@ def _cmd_diff(args: argparse.Namespace) -> int:
     if args.html:
         _write_text_file(args.html, render_diff_html(before, after, report))
     if args.json:
-        sys.stdout.write(json.dumps(report.to_dict(include_wire=False), ensure_ascii=True, separators=(",", ":")) + "\n")
+        sys.stdout.write(json.dumps(report.to_dict(include_wire=False), ensure_ascii=True, separators=(",", ":"),
+                                    allow_nan=False) + "\n")
     else:
         sys.stdout.write(render_diff_terminal(report, no_color=args.no_color))
         if args.html:
@@ -272,6 +308,15 @@ def _cmd_compare(args: argparse.Namespace) -> int:
             protected.append(args.request)
         _assert_distinct_output_path(args.html, protected)
 
+    shared_probe = _probe_config(args)
+    before_config, after_config = _probe_config(args, "before_"), _probe_config(args, "after_")
+    if shared_probe and (
+        args.before_url != args.after_url or before_headers != after_headers or before_config or after_config
+    ):
+        raise ValueError("Shared --probe-* flags require identical inference URLs and headers. "
+                         "Use --before-probe-* and --after-probe-* to scope probes independently.")
+    before_probe = _backend_probe(**(before_config or shared_probe))
+    after_probe = _backend_probe(**(after_config or shared_probe))
     before = record_stream(
         url=args.before_url,
         request_body=body,
@@ -280,6 +325,7 @@ def _cmd_compare(args: argparse.Namespace) -> int:
         dialect=args.dialect,
         label=args.before_label or "before",
         timeout=args.timeout,
+        probe=before_probe,
     )
     after = record_stream(
         url=args.after_url,
@@ -289,6 +335,7 @@ def _cmd_compare(args: argparse.Namespace) -> int:
         dialect=args.dialect,
         label=args.after_label or "after",
         timeout=args.timeout,
+        probe=after_probe,
     )
     report = diff_traces(
         before,
@@ -300,7 +347,8 @@ def _cmd_compare(args: argparse.Namespace) -> int:
     if args.html:
         _write_text_file(args.html, render_diff_html(before, after, report))
     if args.json:
-        sys.stdout.write(json.dumps(report.to_dict(include_wire=False), ensure_ascii=True, separators=(",", ":")) + "\n")
+        sys.stdout.write(json.dumps(report.to_dict(include_wire=False), ensure_ascii=True, separators=(",", ":"),
+                                    allow_nan=False) + "\n")
     else:
         sys.stdout.write(render_diff_terminal(report, no_color=args.no_color))
         if args.html:
@@ -332,7 +380,8 @@ def _cmd_export(args: argparse.Namespace) -> int:
         elif args.format == "html":
             rendered = render_diff_html(before, after, report, include_body=args.include_body, include_wire=args.include_wire)
         else:
-            rendered = json.dumps(report.to_dict(include_wire=args.include_wire), ensure_ascii=True, indent=2) + "\n"
+            rendered = json.dumps(report.to_dict(include_wire=args.include_wire), ensure_ascii=True, indent=2,
+                                  allow_nan=False) + "\n"
     else:
         findings = audit_trace(before)
         rc = _audit_exit_code(findings, strict=True)
@@ -364,6 +413,7 @@ def _cmd_export(args: argparse.Namespace) -> int:
                     },
                     ensure_ascii=True,
                     indent=2,
+                    allow_nan=False,
                 )
                 + "\n"
             )
@@ -373,6 +423,13 @@ def _cmd_export(args: argparse.Namespace) -> int:
     else:
         sys.stdout.write(rendered)
     return rc
+
+
+def _add_probe_options(parser: argparse.ArgumentParser, side: str = "") -> None:
+    prefix = f"{side}-" if side else ""
+    scope = f" for the {side} request" if side else ""
+    for name, (value_type, help_text) in _PROBE_OPTIONS.items():
+        parser.add_argument(f"--{prefix}probe-{name}", type=value_type, help=help_text + scope)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -408,12 +465,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_rec.add_argument("--timeout", type=float, default=120.0, help="Socket timeout in seconds")
     p_rec.add_argument("--out", "-o", required=True, help="Output .trace.jsonl path (or prefix/dir for JSONL suites)")
     p_rec.add_argument("--no-color", action="store_true")
+    _add_probe_options(p_rec)
     p_rec.set_defaults(func=_cmd_record)
 
     # audit
-    p_aud = sub.add_parser("audit", help="Audit a single .trace.jsonl for D1..D4 silent failures")
+    p_aud = sub.add_parser("audit", help="Audit a single .trace.jsonl for silent failures and storage symptoms")
     p_aud.add_argument("trace_path", help="Path to .trace.jsonl")
-    p_aud.add_argument("--only", default=None, help="Comma-separated detector subset from D1,D2,D3,D4")
+    p_aud.add_argument("--only", default=None, help=f"Comma-separated subset of {AUDIT_RULE_LIST}")
     p_aud.add_argument("--html", default="", help="Write single-file airgap-safe HTML frame waterfall")
     p_aud.add_argument("--json", action="store_true", help="Emit sanitized JSON audit report")
     p_aud.add_argument("--strict", action="store_true", help="Treat P1 warnings as non-zero exit code 3")
@@ -427,7 +485,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_diff.add_argument(
         "--ignore-timing",
         action="store_true",
-        help="Ignore TTFT latency regression and D5 timing/benchmark-illusion alerts",
+        help="Ignore TTFT regressions and pair-level D5 and D8 alerts",
     )
     p_diff.add_argument("--ttft-regress-pct", type=float, default=50.0)
     p_diff.add_argument("--fail-on", choices=("p0", "p1", "any-diff"), default="p0")
@@ -437,7 +495,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_diff.set_defaults(func=_cmd_diff)
 
     # compare
-    p_cmp = sub.add_parser("compare", help="Record two live endpoints sequentially and diff immediately")
+    p_cmp = sub.add_parser(
+        "compare", help="Record two live endpoints sequentially and diff immediately",
+        description="Record the baseline and target sequentially. Use per-side probe flags for distinct URLs. "
+                    "Shared probe flags require identical inference URLs and headers.",
+    )
     p_cmp.add_argument("--before-url", required=True)
     p_cmp.add_argument("--after-url", required=True)
     p_cmp.add_argument("--request", "-d", required=True)
@@ -452,13 +514,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_cmp.add_argument(
         "--ignore-timing",
         action="store_true",
-        help="Ignore TTFT latency regression and D5 timing/benchmark-illusion alerts",
+        help="Ignore TTFT regressions and pair-level D5 and D8 alerts",
     )
     p_cmp.add_argument("--ttft-regress-pct", type=float, default=50.0)
     p_cmp.add_argument("--fail-on", choices=("p0", "p1", "any-diff"), default="p0")
     p_cmp.add_argument("--html", default="", help="Write dual-lane single-file HTML frame waterfall")
     p_cmp.add_argument("--json", action="store_true")
     p_cmp.add_argument("--no-color", action="store_true")
+    _add_probe_options(p_cmp)
+    _add_probe_options(p_cmp, "before")
+    _add_probe_options(p_cmp, "after")
     p_cmp.set_defaults(func=_cmd_compare)
 
     # export

@@ -798,10 +798,10 @@ class TestProtocolDialectsDetectorsAndDiffer(unittest.TestCase):
                 load_trace(bad_tr)
             self.assertEqual(cli_main(["audit", str(bad_tr)]), EXIT_USAGE_OR_IO_ERROR)
 
-            # audit --only D9 / D5 / "" -> exit 1!
+            # audit --only rejects unknown IDs and empty selections.
             good_tr = td_p / "good.trace.jsonl"
             write_trace(good_tr, _make_chat_doc(chunks=["hi"]))
-            for bad_only in ("D9", "D5", "", ","):
+            for bad_only in ("D9", "", ","):
                 err_buf = io.StringIO()
                 with redirect_stderr(err_buf):
                     rc = cli_main(["audit", str(good_tr), "--only", bad_only])

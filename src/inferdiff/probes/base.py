@@ -3,7 +3,7 @@
 Implements the three-point snapshot contract (T_pre -> T_ttft -> T_eof):
   - describe_topology() -> written to header.backend_probe
   - sample_pre()        -> baseline before request dispatch (HTTP /metrics + /proc/pid/io)
-  - sample_ttft()       -> microsecond local snapshot at first effective payload frame
+  - sample_ttft()       -> schedule a local snapshot at the first effective payload frame
   - sample_eof()        -> post-EOF snapshot & delta payload for summary.backend_probe
 """
 
@@ -26,7 +26,7 @@ class BackendProbe(Protocol):
         ...
 
     def sample_ttft(self) -> None:
-        """T_ttft: capture microsecond local snapshot on first effective payload frame."""
+        """T_ttft: schedule a local snapshot after the first effective frame is recorded."""
         ...
 
     def sample_eof(self) -> Optional[Dict[str, Any]]:

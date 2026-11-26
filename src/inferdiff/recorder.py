@@ -15,10 +15,15 @@ import time
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple, Union
 
+from ._probe_data import PROBE_URL_FIELDS, probe_url
+from ._urls import RecorderError, validate_url
 from .dialects import detect_dialect, normalize_payload
-from .probes.base import BackendProbe
+from .probes import (
+    BackendProbe, CompositeBackendProbe, LinuxProcIoProbe, LmcacheMpProbe, MooncakeStoreProbe, NullProbe,
+)
+from .probes._task import TTFT_HOOK_BUDGET, ProbeTask, run_ttft_hook
 from .redact import (
     extract_header_secret_values,
     has_control_chars,
@@ -40,6 +45,7 @@ from .schema import (
     frame_has_effective_payload,
     has_lone_surrogate,
     strict_json_loads,
+    validate_backend_probe,
 )
 
 # RFC 9110 HTTP field-name token characters
@@ -47,29 +53,15 @@ _HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 _MANAGED_HEADERS = frozenset({"content-length", "transfer-encoding", "host"})
 _MAX_CHUNK_LINE_BYTES = 16384
 _MAX_TRAILER_BYTES = 65536
-
-
-class RecorderError(RuntimeError):
-    """Raised on network connection refusal, invalid URL/headers, or non-200 HTTP error."""
-
-
-def validate_url(url: str) -> urllib.parse.SplitResult:
-    """Validate an HTTP(S) target URL before connection (rejects control chars & embedded credentials)."""
-    if not isinstance(url, str) or not url or has_control_chars(url):
-        raise RecorderError("Invalid URL: empty or contains control characters.")
-    try:
-        parsed = urllib.parse.urlsplit(url)
-    except ValueError as exc:
-        raise RecorderError(f"Invalid URL syntax: {exc}") from exc
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise RecorderError(f"Unsupported or invalid URL scheme/host: {sanitize_url_for_error(url)}")
-    if parsed.username or parsed.password:
-        raise RecorderError("URL must not contain embedded credentials; use --header instead.")
-    try:
-        _ = parsed.port
-    except ValueError as exc:
-        raise RecorderError(f"Invalid URL port: {exc}") from exc
-    return parsed
+# One EOF phase can make five default HTTP calls plus a local snapshot.
+_PROBE_HOOK_BUDGET = 12.0
+# The built-in TTFT hooks only schedule work or return immediately.
+_NONBLOCKING_TTFT_HOOKS = frozenset({
+    CompositeBackendProbe.sample_ttft, LinuxProcIoProbe.sample_ttft,
+    LmcacheMpProbe.sample_ttft, MooncakeStoreProbe.sample_ttft,
+})
+# Only the built-ins accept the recorder's monotonic EOF time.
+_EOF_CUTOFF_HOOKS = frozenset({CompositeBackendProbe.sample_eof, LinuxProcIoProbe.sample_eof})
 
 
 def validate_and_merge_headers(
@@ -675,6 +667,31 @@ def build_frame_from_chunk(
     )
 
 
+def _probe_payload(hook: Callable[[], Any]) -> dict[str, Any] | None:
+    def sanitize(value: Any) -> Any:
+        if isinstance(value, dict):
+            result = {}
+            for key, item in value.items():
+                if key in PROBE_URL_FIELDS:
+                    if isinstance(item, str) and (url := probe_url(item)) is not None:
+                        result[key] = url
+                else:
+                    result[key] = sanitize(item)
+            return result
+        if isinstance(value, list):
+            return [sanitize(item) for item in value]
+        return value
+
+    def collect() -> tuple[dict[str, Any] | None]:
+        value = hook()
+        validate_backend_probe(value, "recording")
+        return (sanitize(value),)
+
+    deadline = time.monotonic() + _PROBE_HOOK_BUDGET
+    data = ProbeTask(collect, "inferdiff-probe-metadata").wait_until(deadline)
+    return data[0] if data is not None else {"status": "probe_error"}
+
+
 def record_stream(
     *,
     url: str,
@@ -731,9 +748,19 @@ def record_stream(
     trace_id = f"tr_{now_utc.strftime('%Y%m%dT%H%M%SZ')}_{secrets.token_hex(3)}"
     recorded_at = now_utc.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
-    probe_topology = probe.describe_topology() if probe is not None else None
+    if type(probe) is NullProbe:
+        probe = None
+    probe_topology = None
+    probe_pre_ok = False
     if probe is not None:
-        probe.sample_pre()
+        probe_topology = _probe_payload(lambda: probe.describe_topology())
+
+        def sample_pre() -> bool:
+            probe.sample_pre()
+            return True
+
+        deadline = time.monotonic() + _PROBE_HOOK_BUDGET
+        probe_pre_ok = ProbeTask(sample_pre, "inferdiff-probe-pre").wait_until(deadline) is True
 
     try:
         conn.connect()
@@ -804,11 +831,13 @@ def record_stream(
     bytes_read = 0
     socket_eof_clean = True
     probe_ttft_sampled = False
+    ttft_task: ProbeTask[bool] | None = None
+    ttft_deadline = 0.0
     summary = None
     interrupted_exc: Optional[BaseException] = None
 
     def _emit_chunk(wc: WireChunk) -> None:
-        nonlocal prev_rel_ms, sglang_prev, probe_ttft_sampled
+        nonlocal prev_rel_ms, sglang_prev, probe_ttft_sampled, ttft_task, ttft_deadline
         # Scrub any reflected outgoing credential (e.g. echoed API key) BEFORE normalization or persistence
         if outgoing_secrets:
             wc = WireChunk(
@@ -828,14 +857,22 @@ def record_stream(
             t0_ns=t0_ns,
             sglang_prev_text=sglang_prev,
         )
-        if probe is not None and not probe_ttft_sampled and frame_has_effective_payload(tf.norm):
-            probe.sample_ttft()
-            probe_ttft_sampled = True
         prev_rel_ms = tf.t_rel_ms
         frames.append(tf)
         if fh is not None:
             fh.write(canonical_json_line(tf.to_dict()) + "\n")
             fh.flush()
+        if probe is not None and probe_pre_ok and not probe_ttft_sampled and frame_has_effective_payload(tf.norm):
+            probe_ttft_sampled = True
+            try:
+                hook = probe.sample_ttft
+                if getattr(hook, "__func__", None) in _NONBLOCKING_TTFT_HOOKS:
+                    hook()
+                else:
+                    ttft_deadline = time.monotonic() + TTFT_HOOK_BUDGET
+                    ttft_task = ProbeTask(lambda: run_ttft_hook(hook), "inferdiff-probe-ttft")
+            except Exception:
+                pass  # The frame has already been captured and flushed.
 
     try:
         if not resp.chunked:
@@ -890,7 +927,20 @@ def record_stream(
         for wc in framer.finish(t_end_ns):
             _emit_chunk(wc)
 
-        probe_summary = probe.sample_eof() if probe is not None else None
+        probe_summary = None
+        if probe is not None:
+            if not probe_pre_ok:
+                probe_summary = {"status": "probe_error"}
+            elif ttft_task is not None and ttft_task.wait_until(ttft_deadline) is None:
+                probe_summary = {"status": "ttft_unavailable"}
+            else:
+                def sample_eof() -> Any:
+                    hook = probe.sample_eof
+                    if getattr(hook, "__func__", None) in _EOF_CUTOFF_HOOKS:
+                        return hook(cutoff=t_end_ns / 1_000_000_000)
+                    return hook()
+
+                probe_summary = _probe_payload(sample_eof)
         total_ms = round((t_end_ns - t0_ns) / 1_000_000.0, 3)
         summary = assemble_summary(
             header,

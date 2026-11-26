@@ -10,11 +10,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import __version__
 from .canary import DoctorReport
-from .detectors import Finding
+from .detectors import D6, D7, D8, Finding
 from .differ import DiffReport
 from .exporter import _safe_frame_summary, _sanitized_curl_lines, _strip_controls_and_newlines
 from .redact import redact_secret_text
-from .schema import TraceDocument, TraceFrame, frame_has_effective_payload
+from .schema import TraceDocument, TraceFrame, frame_has_effective_payload, is_finite_number
 
 MAX_HTML_BYTES = 81_920
 STALL_GAP_MS = 250.0
@@ -381,16 +381,41 @@ def _kpi_card(title: str, value: str, sub: str, accent: str = "") -> str:
     )
 
 
-def _backend_probe_kpi(doc: TraceDocument) -> str:
+def _probe_metric(value: Any, *, size: bool = False) -> str:
+    if not is_finite_number(value) or value < 0:
+        return "n/a"
+    if size:
+        if value >= 1024 * 1024:
+            return f"{value / (1024 * 1024):.3g} MiB"
+        if value >= 1024:
+            return f"{value / 1024:.3g} KiB"
+        return f"{value:.3g} B"
+    return f"{value:.4g}"
+
+
+def _backend_probe_kpi(doc: TraceDocument, findings: List[Finding]) -> str:
     bp = doc.summary.backend_probe
     if not isinstance(bp, dict):
         return _kpi_card("Backend Probe (v0.2)", "idle", "slot ready (LMCache/Mooncake/io)")
     pio = bp.get("proc_io") if isinstance(bp.get("proc_io"), dict) else {}
     pref = pio.get("prefill_window") if isinstance(pio.get("prefill_window"), dict) else {}
-    rbytes = pref.get("delta_read_bytes", "n/a")
     lmc = bp.get("lmcache_mp") if isinstance(bp.get("lmcache_mp"), dict) else {}
-    l2_keys = lmc.get("delta_hit_l2_keys", "n/a")
-    return _kpi_card("Backend Probe", f"Δread={rbytes} B", f"L2 keys={l2_keys}", "kpi-lit")
+    moon = bp.get("mooncake") if isinstance(bp.get("mooncake"), dict) else {}
+    active_ids = sorted({f.detector_id for f in findings if f.detector_id in (D6, D7, D8)})
+    status = ", ".join(active_ids) if active_ids else "no D6–D8 findings"
+    metrics = []
+    keys = _probe_metric(lmc.get("delta_hit_l2_keys"))
+    tokens = _probe_metric(lmc.get("delta_hit_l2_tokens"))
+    if keys != "n/a" or tokens != "n/a":
+        metrics.append(f"L2 hits {keys} keys" if keys != "n/a" else f"L2 hits {tokens} tok")
+    rchar = _probe_metric(pref.get("delta_rchar_bytes"), size=True)
+    physical = _probe_metric(pref.get("delta_read_bytes"), size=True)
+    if rchar != "n/a" or physical != "n/a":
+        metrics.append(f"rchar {rchar} / read_bytes {physical}")
+    if not metrics and (quota := _probe_metric(moon.get("delta_quota_rejects"))) != "n/a":
+        metrics.append(f"Quota rejects {quota}")
+    return _kpi_card("Backend Probe (v0.2)", f"active · {status}",
+                     " · ".join(metrics) or "No counters available", "kpi-lit")
 
 
 def _wrap_html_document(title: str, body_html: str) -> str:
@@ -440,6 +465,8 @@ def _fit_within_budget(
     title: str,
     summary_line: str,
     builder: Callable[[int, int, int], str],
+    *,
+    fallback_kpi: str = "",
 ) -> str:
     """Adaptively tighten folding and per-lane segment caps; fallback guarantees <80 KiB strictly."""
     tiers = (
@@ -451,12 +478,12 @@ def _fit_within_budget(
     )
     for thresh, max_segs, wcap in tiers:
         candidate = builder(thresh, max_segs, wcap)
-        if len(candidate.encode("utf-8")) <= MAX_HTML_BYTES:
+        if len(candidate.encode("utf-8")) < MAX_HTML_BYTES:
             return candidate
     # Guaranteed compact fallback (< 6 KiB) for extreme pathological traces
     fallback_body = (
         f'<div class="hero"><div class="top"><span class="badge b-amb">{_esc(title, 80)}</span></div>'
-        f'<pre class="code">{_esc(summary_line, 600)}</pre></div>'
+        f'<pre class="code">{_esc(summary_line, 600)}</pre></div>{fallback_kpi}'
     )
     return _wrap_html_document(title, fallback_body)
 
@@ -508,6 +535,7 @@ def render_diff_html(
     tools = a_asm.get("tool_calls") or []
     json_ok = all(tc.get("json_valid") is True for tc in tools) if tools else True
     has_fffd = "\ufffd" in (a_asm.get("content_text") or "")
+    probe_kpi = _backend_probe_kpi(after, all_f)
 
     kpis = "".join(
         [
@@ -531,7 +559,7 @@ def render_diff_html(
                 "FAIL" if (not json_ok or has_fffd) else "OK",
                 f"tools={len(tools)} json_valid={json_ok} fffd={has_fffd}",
             ),
-            _backend_probe_kpi(after),
+            probe_kpi,
         ]
     )
 
@@ -610,7 +638,10 @@ def render_diff_html(
         )
         return _wrap_html_document(title, body)
 
-    return _fit_within_budget(title, f"{verdict} | frames {st['before_frames']} -> {st['after_frames']}", _assemble)
+    return _fit_within_budget(
+        title, f"{verdict} | frames {st['before_frames']} -> {st['after_frames']}", _assemble,
+        fallback_kpi=probe_kpi if after.summary.backend_probe is not None else "",
+    )
 
 
 def render_audit_html(
@@ -633,6 +664,7 @@ def render_audit_html(
     tools = asm.get("tool_calls") or []
     json_ok = all(tc.get("json_valid") is True for tc in tools) if tools else True
     has_fffd = "\ufffd" in (asm.get("content_text") or "")
+    probe_kpi = _backend_probe_kpi(doc, findings)
 
     kpis = "".join(
         [
@@ -640,7 +672,7 @@ def render_audit_html(
             _kpi_card("Total / Clean EOF", f"{t.get('total_ms')} ms", f"eof_clean={doc.summary.eof_clean}"),
             _kpi_card("Tokens vs Frames", f"{u.get('completion_tokens')} tok", f"{doc.summary.total_frames} frames ({asm.get('content_utf8_bytes')} B)"),
             _kpi_card("JSON / UTF-8", "FAIL" if (not json_ok or has_fffd) else "OK", f"finish={_strip_controls_and_newlines(asm.get('finish_reason'))[:24]}/{_strip_controls_and_newlines(asm.get('terminal_status'))[:24]}"),
-            _backend_probe_kpi(doc),
+            probe_kpi,
         ]
     )
 
@@ -679,7 +711,10 @@ def render_audit_html(
         )
         return _wrap_html_document(title, body)
 
-    return _fit_within_budget(title, f"{verdict} | {doc.summary.total_frames} frames", _assemble)
+    return _fit_within_budget(
+        title, f"{verdict} | {doc.summary.total_frames} frames", _assemble,
+        fallback_kpi=probe_kpi if doc.summary.backend_probe is not None else "",
+    )
 
 
 def render_doctor_html(report: DoctorReport, *, include_wire: bool = False) -> str:

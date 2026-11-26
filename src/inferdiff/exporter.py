@@ -6,8 +6,13 @@ import json
 import shlex
 import sys
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 from . import __version__
+from ._probe_data import (
+    MOONCAKE_CLIENT_COUNTERS, NUMBER, PROBE_FIELDS, PROBE_SOURCES, PROBE_STATUSES, PROBE_URL_FIELDS,
+    probe_query_secrets, probe_url, safe_client_version, safe_failure_reason,
+)
 from .detectors import Finding
 from .differ import DiffReport
 from .redact import (
@@ -17,7 +22,7 @@ from .redact import (
     sanitize_body_for_export,
     sanitize_url_for_export,
 )
-from .schema import TraceDocument
+from .schema import TraceDocument, is_finite_number, is_strict_int
 
 MAX_ISSUE_LINES = 25
 
@@ -91,7 +96,9 @@ def _sanitized_curl_lines(doc: TraceDocument, *, include_body: bool = False) -> 
 
     if include_body:
         payload = sanitize_body_for_export(body)
-        compact_body = _strip_controls_and_newlines(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))
+        compact_body = _strip_controls_and_newlines(
+            json.dumps(payload, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
+        )
         if len(compact_body) <= 420:
             return [
                 f"curl -sS -N --globoff --url {quoted_url} -H 'Content-Type: application/json' -d {shlex.quote(compact_body)}"
@@ -104,7 +111,9 @@ def _sanitized_curl_lines(doc: TraceDocument, *, include_body: bool = False) -> 
     # Default shareable mode: never echo arbitrary user prompts or custom body fields
     safe_proto, omitted_arbitrary = extract_safe_repro_body(body)
     if not omitted_arbitrary:
-        compact_body = _strip_controls_and_newlines(json.dumps(safe_proto, ensure_ascii=True, separators=(",", ":")))
+        compact_body = _strip_controls_and_newlines(
+            json.dumps(safe_proto, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
+        )
         if len(compact_body) <= 420:
             return [
                 f"curl -sS -N --globoff --url {quoted_url} -H 'Content-Type: application/json' -d {shlex.quote(compact_body)}"
@@ -115,6 +124,7 @@ def _sanitized_curl_lines(doc: TraceDocument, *, include_body: bool = False) -> 
             {k: safe_proto[k] for k in ("model", "stream", "temperature", "seed") if k in safe_proto},
             ensure_ascii=True,
             separators=(",", ":"),
+            allow_nan=False,
         )
     )
     return [
@@ -138,6 +148,74 @@ def _md_code_span(text: str) -> str:
     fence = "`" * (max_run + 1)
     pad = " " if (text.startswith("`") or text.endswith("`")) else ""
     return f"{fence}{pad}{text}{pad}{fence}"
+
+
+def _probe_export_secrets(*records: Any) -> set[str]:
+    urls = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        for section in (record, *(record.get(source) for source in PROBE_SOURCES)):
+            if isinstance(section, dict):
+                for field in PROBE_URL_FIELDS:
+                    value = section.get(field)
+                    if isinstance(value, str):
+                        try:
+                            urls.append(urlsplit(value))
+                        except ValueError:
+                            pass
+    return probe_query_secrets(*urls)
+
+
+def _sanitize_probe_for_json_export(
+    value: Any, secrets: set[str], fields: dict = PROBE_FIELDS,
+) -> dict[str, Any] | None:
+    """Project probe data onto the public trace fields, including nested fields."""
+    if not isinstance(value, dict):
+        return None
+    result: dict[str, Any] = {}
+    for key, expected in fields.items():
+        raw = value.get(key)
+        if key in PROBE_URL_FIELDS:
+            if isinstance(raw, str) and (url := probe_url(raw)) is not None:
+                result[key] = url
+        elif key == "client_version":
+            if (version := safe_client_version(raw, secrets)) is not None:
+                result[key] = version
+        elif key == "sources" and isinstance(raw, list):
+            result[key] = [name for name in PROBE_SOURCES if name in raw]
+        elif key in ("status", "master_status", "client_status"):
+            if isinstance(raw, str) and raw in PROBE_STATUSES:
+                result[key] = raw
+        elif key == "probe_version" and raw == "0.2.0":
+            result[key] = raw
+        elif key == "comm" and isinstance(raw, str):
+            if not any(secret in raw for secret in secrets):
+                result[key] = _strip_controls_and_newlines(redact_secret_text(raw))[:64]
+        elif key in ("delta_l2_prefetch_failures", "client_deltas") and isinstance(raw, dict):
+            metrics: dict[str, Any] = {}
+            for name, number in raw.items():
+                if not isinstance(name, str) or not is_finite_number(number) or number < 0:
+                    continue
+                if key == "client_deltas":
+                    if name in MOONCAKE_CLIENT_COUNTERS and not any(secret in name for secret in secrets):
+                        metrics[name] = number
+                else:
+                    reason = safe_failure_reason(name, secrets)
+                    total = metrics.get(reason, 0) + number
+                    if is_finite_number(total):
+                        metrics[reason] = total
+            result[key] = metrics
+        elif isinstance(expected, dict):
+            if (section := _sanitize_probe_for_json_export(raw, secrets, expected)) is not None:
+                result[key] = section
+        elif expected is NUMBER and is_finite_number(raw):
+            result[key] = raw
+        elif expected is int and is_strict_int(raw) and is_finite_number(raw):
+            result[key] = raw
+        elif expected is bool and isinstance(raw, bool):
+            result[key] = raw
+    return result
 
 
 def sanitize_trace_for_json_export(
@@ -192,6 +270,7 @@ def sanitize_trace_for_json_export(
         "t_headers_ms": rm.get("t_headers_ms"),
     }
 
+    probe_secrets = _probe_export_secrets(doc.header.backend_probe, doc.summary.backend_probe)
     hdr = {
         "type": "header",
         "schema_version": doc.header.schema_version,
@@ -201,7 +280,7 @@ def sanitize_trace_for_json_export(
         "dialect": doc.header.dialect,
         "request": safe_req,
         "response_meta": safe_rm,
-        "backend_probe": sanitize_body_for_export(doc.header.backend_probe) if doc.header.backend_probe is not None else None,
+        "backend_probe": _sanitize_probe_for_json_export(doc.header.backend_probe, probe_secrets),
     }
 
     raw_asm = doc.summary.assembled if isinstance(doc.summary.assembled, dict) else {}
@@ -247,7 +326,7 @@ def sanitize_trace_for_json_export(
         "assembled": safe_asm,
     }
     if doc.summary.backend_probe is not None:
-        summary["backend_probe"] = sanitize_body_for_export(doc.summary.backend_probe)
+        summary["backend_probe"] = _sanitize_probe_for_json_export(doc.summary.backend_probe, probe_secrets)
     return {"header": hdr, "summary": summary}
 
 

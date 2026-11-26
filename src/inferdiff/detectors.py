@@ -1,19 +1,22 @@
-"""Pure deterministic silent-failure detectors (D1..D5) with zero-false-positive guards."""
+"""Deterministic silent-failure and storage/inference detectors (D1..D8)."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any, Dict, List, Optional, Set
 
-from .schema import TraceDocument, is_strict_int, safe_utf8_len
+from ._probe_data import MOONCAKE_STORAGE_READ_COUNTERS
+from .schema import TraceDocument, frame_has_effective_payload, is_finite_number, is_strict_int, safe_utf8_len
 
 D1 = "D1"
 D2 = "D2"
 D3 = "D3"
 D4 = "D4"
 D5 = "D5"
-
-VALID_AUDIT_DETECTORS = frozenset({D1, D2, D3, D4})
+D6 = "D6"
+D7 = "D7"
+D8 = "D8"
 
 DETECTOR_NAMES = {
     D1: "UNCLOSED_TOOL_CALL_SUCCESS",
@@ -21,14 +24,21 @@ DETECTOR_NAMES = {
     D3: "SILENT_SHORT_GENERATION",
     D4: "STREAM_PREMATURE_EOF",
     D5: "BENCHMARK_ILLUSION_ALERT",
+    D6: "PAGE_CACHE_WARM_ILLUSION",
+    D7: "LOOKUP_HIT_PREFETCH_DROP",
+    D8: "OFFLOAD_SLOWER_THAN_RECOMPUTE",
 }
+
+VALID_AUDIT_DETECTORS = frozenset(DETECTOR_NAMES) - {D5}
+AUDIT_RULE_LIST = ", ".join(sorted(VALID_AUDIT_DETECTORS))
+_MIB = 1024 * 1024
 
 
 @dataclass
 class Finding:
     detector_id: str
     code: str
-    severity: str  # "P0" | "P1"
+    severity: str  # "P0" | "P1" | "P2"
     message: str
     frame_seq: Optional[int] = None
     evidence: Dict[str, Any] = field(default_factory=dict)
@@ -397,27 +407,189 @@ def detect_d5(
     ]
 
 
+def _section(parent: Dict[str, Any], key: str) -> Dict[str, Any]:
+    value = parent.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def _count(section: Dict[str, Any], key: str, default: Any = None) -> int | None:
+    value = section.get(key)
+    return value if is_strict_int(value) and is_finite_number(value) and value >= 0 else default
+
+
+def _number(section: Dict[str, Any], key: str, default: Any = None) -> int | float | None:
+    value = section.get(key)
+    return value if is_finite_number(value) and value >= 0 else default
+
+
+def _usable_prefill(backend: Dict[str, Any]) -> Dict[str, Any]:
+    proc = _section(backend, "proc_io")
+    prefill = _section(proc, "prefill_window")
+    if proc.get("status") == "process_changed" or prefill.get("status", "ok") != "ok":
+        return {}
+    return prefill
+
+
+def _l2_hit(lmcache: Dict[str, Any]) -> bool:
+    return any(_count(lmcache, key, 0) > 0 for key in ("delta_hit_l2_tokens", "delta_hit_l2_keys"))
+
+
+def _storage_load_seen(backend: Dict[str, Any]) -> bool:
+    lmcache = _section(backend, "lmcache_mp")
+    client = _section(_section(backend, "mooncake"), "client_deltas")
+    return _l2_hit(lmcache) or _count(lmcache, "delta_l2_load_completed", 0) > 0 or any(
+        _count(client, name, 0) > 0 for name in MOONCAKE_STORAGE_READ_COUNTERS
+    )
+
+
+def _first_effective_seq(doc: TraceDocument) -> Optional[int]:
+    return next((f.seq for f in doc.frames if frame_has_effective_payload(f.norm)), None)
+
+
+def detect_d6(doc: TraceDocument) -> List[Finding]:
+    """D6 (P1): large logical reads with no evidence of physical reads during prefill."""
+    backend = doc.summary.backend_probe or {}
+    prefill = _usable_prefill(backend)
+    rchar = _count(prefill, "delta_rchar_bytes", 0)
+    if rchar < 32 * _MIB or _count(prefill, "delta_read_bytes") != 0:
+        return []
+
+    l2_active = _storage_load_seen(backend)
+    if not l2_active and rchar < 64 * _MIB:
+        return []
+    message = (
+        "Backend cache activity coincided with large process-wide logical reads and zero physical reads "
+        "during prefill, consistent with a warm page cache or buffered I/O fallback."
+        if l2_active else
+        "Process-wide correlation during prefill: large logical reads and zero physical reads. "
+        "The source of the reads is unverified."
+    )
+    return [Finding(
+        D6, DETECTOR_NAMES[D6], "P1" if l2_active else "P2", message + " See LMCache#4364.",
+        frame_seq=_first_effective_seq(doc),
+        evidence={"delta_rchar_bytes": rchar, "delta_read_bytes": 0, "l2_active": l2_active,
+                  "reference": "https://github.com/LMCache/LMCache/issues/4364"},
+    )]
+
+
+def detect_d7(doc: TraceDocument) -> List[Finding]:
+    """D7 (P1): direct delivery failures or indirect failures with L2 hit evidence."""
+    backend = doc.summary.backend_probe or {}
+    lmcache = _section(backend, "lmcache_mp")
+    tokens = _count(lmcache, "delta_hit_l2_tokens", 0)
+    keys = _count(lmcache, "delta_hit_l2_keys", 0)
+
+    failures = _section(lmcache, "delta_l2_prefetch_failures")
+    prefetch_failed = any(_count(failures, reason, 0) > 0 for reason in failures)
+    l1 = _count(lmcache, "delta_l1_read_failures", 0)
+    quota = _count(_section(backend, "mooncake"), "delta_quota_rejects", 0)
+    dropped = max(_count(lmcache, "delta_event_bus_dropped", 0), _count(lmcache, "event_bus_dropped", 0))
+    if not (prefetch_failed or l1 or ((tokens or keys) and (quota or dropped))):
+        return []
+    message = (
+        "Backend counters recorded failures in the cache delivery path."
+        if prefetch_failed or l1 else "L2 hits coincided with backend quota rejects or event bus drops."
+    )
+    return [Finding(
+        D7, DETECTOR_NAMES[D7], "P1",
+        message,
+        evidence={"delta_hit_l2_tokens": tokens, "delta_hit_l2_keys": keys, "l2_prefetch_failed": prefetch_failed,
+                  "delta_l1_read_failures": l1, "delta_quota_rejects": quota, "delta_event_bus_dropped": dropped},
+    )]
+
+
+def _small_reads(prefill: Dict[str, Any], min_syscalls: int) -> bool:
+    return _number(prefill, "avg_syscall_read_kb", float("inf")) <= 8.0 and (
+        _count(prefill, "delta_syscr", 0) >= min_syscalls
+    )
+
+
+def detect_d8(doc: TraceDocument) -> List[Finding]:
+    """D8 (P1): severe fragmented physical reads during a single prefill."""
+    backend = doc.summary.backend_probe or {}
+    prefill = _usable_prefill(backend)
+    if (_count(prefill, "delta_read_bytes", 0) < 16 * _MIB
+            or not _small_reads(prefill, 2048) or not _storage_load_seen(backend)):
+        return []
+    return [Finding(
+        D8, DETECTOR_NAMES[D8], "P1",
+        "Backend cache activity coincided with at least 16 MiB of process-wide physical reads "
+        "and thousands of small read syscalls during prefill, consistent with fragmented offload I/O.",
+        frame_seq=_first_effective_seq(doc),
+        evidence={key: prefill[key] for key in ("delta_read_bytes", "delta_syscr", "avg_syscall_read_kb")},
+    )]
+
+
+def detect_d8_pair(
+    before: TraceDocument,
+    after: TraceDocument,
+    *,
+    ignore_timing: bool = False,
+    min_delta_ms: float = 0.0,
+) -> List[Finding]:
+    """D8 (P1): a >=30% effective TTFT regression with target storage evidence."""
+    backend = after.summary.backend_probe
+    if ignore_timing or not backend:
+        return []
+    before_ttft = _number(before.summary.timing, "ttft_effective_ms", 0)
+    after_ttft = _number(after.summary.timing, "ttft_effective_ms", 0)
+    if before_ttft <= 0 or not is_finite_number(min_delta_ms):
+        return []
+    start, end = Decimal(str(before_ttft)), Decimal(str(after_ttft))
+    if end - start < Decimal(str(min_delta_ms)) or end < start * Decimal("1.30"):
+        return []
+
+    if not _storage_load_seen(backend):
+        return []
+    prefill = _usable_prefill(backend)
+    rchar = _count(prefill, "delta_rchar_bytes", 0)
+    reads = _count(prefill, "delta_read_bytes", 0)
+    writes = _count(prefill, "delta_write_bytes_net", 0)
+    reasons = []
+    if reads >= _MIB and _small_reads(prefill, 1024):
+        reasons.append("many small read syscalls and at least 1 MiB of physical reads")
+    if writes >= 64 * _MIB:
+        reasons.append("heavy writes consistent with disk contention")
+    if rchar >= _MIB and reads >= 2 * rchar:
+        reasons.append("physical read amplification of at least 2x")
+    if not reasons:
+        return []
+    return [Finding(
+        D8, DETECTOR_NAMES[D8], "P1",
+        "Effective TTFT regressed by at least 30% with backend cache activity and "
+        "process-wide prefill I/O: " + ", ".join(reasons) + ".",
+        frame_seq=_first_effective_seq(after),
+        evidence={"before_ttft_effective_ms": before_ttft, "after_ttft_effective_ms": after_ttft,
+                  "delta_rchar_bytes": _count(prefill, "delta_rchar_bytes"),
+                  "delta_read_bytes": _count(prefill, "delta_read_bytes"),
+                  "delta_write_bytes_net": _count(prefill, "delta_write_bytes_net"),
+                  "delta_syscr": _count(prefill, "delta_syscr"),
+                  "avg_syscall_read_kb": _number(prefill, "avg_syscall_read_kb"), "sub_reasons": reasons},
+    )]
+
+
+_SINGLE_TRACE_DETECTORS = {
+    D1: detect_d1, D2: detect_d2, D3: detect_d3, D4: detect_d4,
+    D6: detect_d6, D7: detect_d7, D8: detect_d8,
+}
+
+
 def audit_trace(doc: TraceDocument, *, only: Optional[Set[str]] = None) -> List[Finding]:
-    """Run D1..D4 (or validated subset via `only`) on a single TraceDocument."""
+    """Run single-trace detectors."""
     if only is not None:
         normalized = {d.strip().upper() for d in only if d.strip()}
         unknown = sorted(normalized - VALID_AUDIT_DETECTORS)
         if not normalized or unknown:
             raise ValueError(
-                f"Invalid --only detector selection: {sorted(only)!r} (valid for audit: D1, D2, D3, D4)"
+                f"Invalid --only detector selection: {sorted(only)!r} (valid for audit: {AUDIT_RULE_LIST})"
             )
         active = normalized
     else:
         active = set(VALID_AUDIT_DETECTORS)
 
     findings: List[Finding] = []
-    if D1 in active:
-        findings.extend(detect_d1(doc))
-    if D2 in active:
-        findings.extend(detect_d2(doc))
-    if D3 in active:
-        findings.extend(detect_d3(doc))
-    if D4 in active:
-        findings.extend(detect_d4(doc))
-    findings.sort(key=lambda f: (0 if f.severity == "P0" else 1, f.detector_id))
+    for detector_id, detect in _SINGLE_TRACE_DETECTORS.items():
+        if detector_id in active:
+            findings.extend(detect(doc))
+    findings.sort(key=lambda f: (f.severity, f.detector_id))
     return findings

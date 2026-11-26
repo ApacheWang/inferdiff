@@ -13,6 +13,10 @@
 
 [English Documentation (README.md)](README.md) · [PyPI (`inferdiff`)](https://pypi.org/project/inferdiff/) · [Releases](https://github.com/ApacheWang/inferdiff/releases)
 
+`v0.1.0` 提供 OpenAI Chat 和 Responses 探针（`C1`–`C8`）、轨迹录制、离线差异检查和 HTML 瀑布图。`v0.1.1` 改进了思考模型与中转网关的检查，并加入 GitHub Action。`v0.2.0` 增加 Anthropic 和 Gemini 探针、KV 与存储探针、A/B 探针对比、持续监测，以及带 CI 报告的离线回放。详见[变更日志](CHANGELOG.md)。
+
+下文的 v0.2 功能尚未发布。检出此分支后运行 `python -m pip install .`，即可安装开发版 `0.2.0.dev0`。
+
 ![inferdiff 实时中转体检与 25 行 GitHub Issue 导出演示](assets/hero-demo.gif)
 
 ## 为什么需要 `inferdiff`？（专治四类监控全绿的“假正常”痛点）
@@ -33,7 +37,7 @@
 uvx inferdiff doctor http://127.0.0.1:8080/v1 --html doctor.html
 
 # 2. 专检第三方 OpenAI 兼容中转站（密钥自动脱敏），生成可截图分享的 HTML 评分卡
-OPENAI_API_KEY=sk-... uvx inferdiff doctor https://api.your-relay.example/v1 \
+OPENAI_API_KEY="$RELAY_API_KEY" uvx inferdiff doctor https://api.your-relay.example/v1 \
   --model qwen3-32b --profile relay --html relay-report.html
 
 # 3. 或通过 PyPI 安装一次
@@ -61,6 +65,44 @@ inferdiff export \
 
 > GitHub Markdown 会过滤页面内联交互脚本；前往 [`v0.1.0` Release 下载 `case1-waterfall.html` 附件](https://github.com/ApacheWang/inferdiff/releases/tag/v0.1.0)，即可离线悬停查看单帧耗时、切换绝对毫秒 / 归一化比例并点击任意帧检查详情。
 
+## Anthropic 与 Gemini 流式探针
+
+```bash
+inferdiff doctor https://api.anthropic.com/v1 --model "$CLAUDE_MODEL" \
+  --protocol anthropic --anthropic-version 2023-06-01 --json
+inferdiff doctor https://generativelanguage.googleapis.com --model "$GEMINI_MODEL" \
+  --protocol gemini --save-dir ./gemini-traces
+```
+
+- `C9` 检查 Anthropic `/v1/messages` 的事件顺序、`max_tokens` 终止原因和输出 Token 统计。默认读取 `ANTHROPIC_API_KEY`，通过 `x-api-key` 发送。
+- `C10` 检查 Gemini SSE 的 `MAX_TOKENS` 终止原因、Token 统计和 UTF-8 完整性。默认读取 `GEMINI_API_KEY` 或 `GOOGLE_API_KEY`，通过 `x-goog-api-key` 发送。
+
+## 对比、持续监测与离线回放
+
+```bash
+inferdiff compare \
+  --a-url https://api.example.com/v1 --a-key '$KEY_A' --a-model model-id \
+  --b-url https://relay.example.com/v1 --b-key '$KEY_B' --b-model model-id \
+  --only C1,C4,C7 --out-json compare.json --out-md compare.md --out-html compare.html
+
+inferdiff watch --base-url https://relay.example.com/v1 --model "$MODEL" \
+  --profile relay --interval 60 --max-runs 10 --out-jsonl watch.jsonl \
+  --fail-on-breach
+
+inferdiff replay ./after --baseline ./before --out-json replay.json \
+  --out-sarif replay.sarif --out-junit replay.xml --out-html replay.html
+```
+
+`compare` 并排展示两端的探针结果、终止原因和延迟。也可用 `--before-url`、`--after-url` 和 `--request` 向两端重放同一请求。
+
+`watch` 定时执行体检，省略 `--max-runs` 时持续运行。用 `--webhook-url "$INFERDIFF_WEBHOOK"` 可通过通用 JSON、飞书或 Lark Webhook 接收故障和恢复通知。`--cooldown` 控制重复故障通知的间隔。
+
+`replay` 可检查单个 `.trace.jsonl` 文件或整个目录。`--baseline` 按相对路径匹配轨迹，兼容 Windows 和 POSIX 路径分隔符，并区分新增、修复与未变化的问题。输入缺失、目录为空或轨迹格式有误时，退出码为 `1`。新增 P0 问题退出码为 `2`。使用 `--strict` 时，新增 P1 问题退出码为 `3`。
+
+## 非侵入式 KV 与存储探针
+
+`record` 和请求重放模式的 `compare` 可在发出请求前、首个有效 Token 到达时和流结束时采样。通过 `--probe-lmcache`、`--probe-mooncake-master`、`--probe-mooncake-client` 或 `--probe-pid` 读取 LMCache MP、Mooncake Store 或 Linux `/proc/<pid>/io` 指标。`D6` 检查页缓存预热，`D7` 检查查找命中后数据未交付，`D8` 检查碎片化物理读取或有存储指标佐证的首 Token 延迟回归。
+
 ## GitHub Action 集成（CI 门禁 + 自动上传 HTML 瀑布图）
 
 在工作流中直接引用 `ApacheWang/inferdiff@v0.1.1`，即可对在线推理端点或离线双轨迹跑回归门禁并自动归档 `<80 KiB` 单文件 HTML 瀑布图：
@@ -74,6 +116,22 @@ inferdiff export \
     strict: "true"
     html-out: inferdiff-report.html
 ```
+
+v0.2 的 Action 在 `doctor` 和 `diff` 模式下均可通过 `sarif-output`、`junit-output` 写入 CI 报告。工作流检出 v0.2 源码后，可使用本地 Action。
+
+```yaml
+- name: Run inferdiff wire gate with CI reports
+  uses: ./
+  with:
+    before-trace: traces/baseline.trace.jsonl
+    after-trace: traces/target.trace.jsonl
+    sarif-output: reports/inferdiff.sarif
+    junit-output: reports/inferdiff.xml
+```
+
+使用默认的 `version: "0.1.1"` 并设置任一报告路径时，Action 会安装随源码提供的版本。若指定 PyPI 上的其他版本，请选择支持报告参数的版本。`upload-artifact` 上传 HTML 瀑布图，SARIF 和 JUnit 文件可由工作流另行上传。
+
+命令行也支持报告导出。`doctor`、`audit`、`diff` 和 `replay` 可使用 `--out-sarif`（SARIF 2.1.0）和 `--out-junit`（JUnit XML），`compare` 支持 `--out-junit`。
 
 ## 健康评级与确定性 CI 退出码
 

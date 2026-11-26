@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath
 from typing import Any, Iterable, Sequence
 
 from . import __version__
@@ -85,13 +85,37 @@ class ReplayReport:
         return result
 
 
-def _trace_paths(path: Path, *, directory_only: bool = False) -> dict[str, Path]:
+def _trace_name(path: PurePath) -> str:
+    # A bundle created on POSIX may contain literal Windows separators.
+    relative = PurePosixPath(path.as_posix().replace("\\", "/"))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("Replay requires trace names with relative, non-traversing paths.")
+    return relative.as_posix()
+
+
+def _trace_paths(value: str | Path, *, directory_only: bool = False) -> dict[str, Path]:
+    path = Path(value)
+    spelling = path.as_posix()
+    if "\\" in spelling and not path.is_absolute() and not path.exists():
+        # Honor a native path with literal backslashes before trying the alternate spelling.
+        alternate = Path(spelling.replace("\\", "/"))
+        if not alternate.is_absolute():
+            path = alternate
     if path.is_dir():
-        traces = {file.relative_to(path).as_posix(): file for file in path.rglob(f"*{_TRACE_SUFFIX}")
-                  if file.name.endswith(_TRACE_SUFFIX) and file.is_file()}
+        traces = {}
+        for file in path.rglob(f"*{_TRACE_SUFFIX}"):
+            if not file.name.endswith(_TRACE_SUFFIX) or not file.is_file():
+                continue
+            name = _trace_name(file.relative_to(path))
+            if name in traces:
+                raise ValueError(f"Duplicate normalized replay trace name: {name!r}.")
+            traces[name] = file
+        if not traces:
+            bundle = "the --baseline directory" if directory_only else "the replay input directory"
+            raise ValueError(f"No .trace.jsonl files found in {bundle}.")
         return dict(sorted(traces.items()))
     if not directory_only and path.is_file() and path.name.endswith(_TRACE_SUFFIX):
-        return {path.name: path}
+        return {_trace_name(Path(path.name)): path}
     if directory_only:
         raise ValueError("--baseline must be a directory of .trace.jsonl files.")
     raise ValueError("Replay input must be a .trace.jsonl file or a directory of traces.")
@@ -134,18 +158,15 @@ def _compare_trace_findings(
 
 def run_replay(path: str | Path, *, baseline: str | Path | None = None, strict: bool = False) -> ReplayReport:
     """Audit saved traces and optionally compare matching relative filenames."""
-    paths = _trace_paths(Path(path))
-    baseline_paths = _trace_paths(Path(baseline), directory_only=True) if baseline is not None else {}
-    if not paths and not baseline_paths:
-        raise ValueError("No .trace.jsonl files found for replay.")
-
+    paths = _trace_paths(path)
+    baseline_paths = _trace_paths(baseline, directory_only=True) if baseline is not None else {}
     baseline_traces = {}
     for name, file in baseline_paths.items():
-        doc = load_trace(file)
+        doc = load_trace(file, source=f"Replay baseline trace {name!r}")
         baseline_traces[name] = ReplayTrace(file, name, doc, audit_trace(doc))
     traces = {}
     for name, file in paths.items():
-        doc = load_trace(file)
+        doc = load_trace(file, source=f"Replay input trace {name!r}")
         prior = baseline_traces.get(name)
         pair_findings = detect_d5(prior.doc, doc) + detect_d8_pair(prior.doc, doc) if prior else None
         traces[name] = ReplayTrace(file, name, doc, audit_trace(doc), pair_findings)

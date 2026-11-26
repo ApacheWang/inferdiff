@@ -796,7 +796,10 @@ class TestProtocolDialectsDetectorsAndDiffer(unittest.TestCase):
             )
             with self.assertRaises(TraceSchemaError):
                 load_trace(bad_tr)
-            self.assertEqual(cli_main(["audit", str(bad_tr)]), EXIT_USAGE_OR_IO_ERROR)
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                self.assertEqual(cli_main(["audit", str(bad_tr)]), EXIT_USAGE_OR_IO_ERROR)
+            self.assertIn("missing required field 'request'", stderr.getvalue())
 
             # audit --only rejects unknown IDs and empty selections.
             good_tr = td_p / "good.trace.jsonl"

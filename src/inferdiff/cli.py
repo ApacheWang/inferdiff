@@ -498,7 +498,8 @@ def _cmd_compare_canaries(args: argparse.Namespace) -> int:
     if args.out_junit:
         _write_ci_reports(args, comparison_cases(report), known_secrets)
     if args.out_json or stdout_json:
-        payload = _render_json(report.to_dict(), known_secrets, indent=2)
+        # compare_reports already sanitizes display values and preserves validated protocol enums.
+        payload = json.dumps(report.to_dict(), ensure_ascii=True, indent=2, allow_nan=False) + "\n"
         if args.out_json and args.out_json != "-":
             _write_text_file(args.out_json, payload)
         if stdout_json:

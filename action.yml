@@ -43,6 +43,14 @@ inputs:
     description: "Output path for the single-file offline HTML frame waterfall (<80 KiB)"
     required: false
     default: "inferdiff-report.html"
+  sarif-output:
+    description: "Optional path for a SARIF 2.1.0 report from doctor or diff"
+    required: false
+    default: ""
+  junit-output:
+    description: "Optional path for a JUnit XML report from doctor or diff"
+    required: false
+    default: ""
   upload-artifact:
     description: "Upload the generated HTML waterfall as a workflow artifact (`true` or `false`)"
     required: false
@@ -52,7 +60,7 @@ inputs:
     required: false
     default: "inferdiff-waterfall"
   version:
-    description: "inferdiff PyPI version to install (empty installs latest)"
+    description: "inferdiff PyPI version to install (empty installs latest). With report paths, the 0.1.1 default uses the Action's bundled package."
     required: false
     default: "0.1.1"
 
@@ -76,8 +84,12 @@ runs:
       shell: bash
       env:
         INFERDIFF_VERSION: ${{ inputs.version }}
+        INPUT_SARIF: ${{ inputs.sarif-output }}
+        INPUT_JUNIT: ${{ inputs.junit-output }}
       run: |
-        if [[ -n "${INFERDIFF_VERSION}" ]]; then
+        if [[ "${INFERDIFF_VERSION}" == "0.1.1" && ( -n "${INPUT_SARIF}" || -n "${INPUT_JUNIT}" ) ]]; then
+          python -m pip install --quiet "${GITHUB_ACTION_PATH}"
+        elif [[ -n "${INFERDIFF_VERSION}" ]]; then
           python -m pip install --quiet "inferdiff==${INFERDIFF_VERSION}"
         else
           python -m pip install --quiet inferdiff
@@ -96,10 +108,15 @@ runs:
         INPUT_AFTER: ${{ inputs.after-trace }}
         INPUT_FAIL_ON: ${{ inputs.fail-on }}
         INPUT_HTML_OUT: ${{ inputs.html-out }}
+        INPUT_SARIF: ${{ inputs.sarif-output }}
+        INPUT_JUNIT: ${{ inputs.junit-output }}
       run: |
         set +e
+        report_args=()
+        [[ -n "${INPUT_SARIF}" ]] && report_args+=(--out-sarif "${INPUT_SARIF}")
+        [[ -n "${INPUT_JUNIT}" ]] && report_args+=(--out-junit "${INPUT_JUNIT}")
         if [[ -n "${INPUT_URL}" ]]; then
-          args=(doctor "${INPUT_URL}" --profile "${INPUT_PROFILE}" --html "${INPUT_HTML_OUT}" --no-color)
+          args=(doctor "${INPUT_URL}" --profile "${INPUT_PROFILE}" --html "${INPUT_HTML_OUT}" --no-color "${report_args[@]}")
           [[ -n "${INPUT_MODEL}" ]] && args+=(--model "${INPUT_MODEL}")
           [[ "${INPUT_STRICT}" == "true" ]] && args+=(--strict)
           if [[ -n "${INPUT_API_KEY}" ]]; then
@@ -109,8 +126,13 @@ runs:
           fi
           rc=$?
         elif [[ -n "${INPUT_BEFORE}" && -n "${INPUT_AFTER}" ]]; then
-          inferdiff diff "${INPUT_BEFORE}" "${INPUT_AFTER}" --fail-on "${INPUT_FAIL_ON}" --html "${INPUT_HTML_OUT}" --no-color
+          threshold="${INPUT_FAIL_ON}"
+          [[ "${threshold}" == "never" ]] && threshold=p0
+          inferdiff diff "${INPUT_BEFORE}" "${INPUT_AFTER}" --fail-on "${threshold}" --html "${INPUT_HTML_OUT}" --no-color "${report_args[@]}"
           rc=$?
+          if [[ "${INPUT_FAIL_ON}" == "never" && ( "${rc}" == "2" || "${rc}" == "3" ) ]]; then
+            rc=0
+          fi
         else
           echo "::error::Provide either 'url' (doctor mode) or both 'before-trace' and 'after-trace' (diff mode)."
           rc=1

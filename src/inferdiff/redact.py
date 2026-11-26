@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 import urllib.parse
-from typing import Any, Dict, Mapping, Sequence, Tuple
+from typing import Any, Callable, Dict, Mapping, Sequence, Tuple
 
 SENSITIVE_HEADER_NAMES = frozenset(
     {
@@ -105,6 +105,87 @@ _GEMINI_HEADER_KEY_RE = re.compile(
     r"(\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s\"'&,;}{<>]+)"
 )
 _PATH_CREDENTIAL_NAMES = {"key", "token", "sig", "signature", "bearer"}
+_JSON_STRING_RE = re.compile(r'"(?:\\[^\r\n]|[^"\\\r\n])*"')
+
+_CHAT_FINISH_REASONS = frozenset({"stop", "length", "tool_calls", "content_filter", "function_call"})
+# https://aistudio.google.com/api-reference/generate-content#Resource:Candidate
+_GEMINI_FINISH_REASONS = frozenset({
+    "FINISH_REASON_UNSPECIFIED", "STOP", "MAX_TOKENS", "SAFETY", "RECITATION", "LANGUAGE", "OTHER",
+    "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "MALFORMED_FUNCTION_CALL", "IMAGE_SAFETY",
+    "IMAGE_PROHIBITED_CONTENT", "IMAGE_OTHER", "NO_IMAGE", "IMAGE_RECITATION", "UNEXPECTED_TOOL_CALL",
+    "TOO_MANY_TOOL_CALLS", "MISSING_THOUGHT_SIGNATURE", "MALFORMED_RESPONSE", "ESCALATION",
+    "PUP_LIMITED_DISABLED", "CONTINUATION",
+})
+_ANTHROPIC_STOP_REASONS = frozenset({
+    "end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn", "refusal", "model_context_window_exceeded",
+})
+_RESPONSES_STATUSES = frozenset({"completed", "incomplete", "failed", "in_progress", "cancelled", "queued"})
+_RESPONSES_INCOMPLETE_REASONS = frozenset({"max_output_tokens", "content_filter"})
+_SSE_EVENTS = {
+    "anthropic-messages": frozenset({
+        "message_start", "message_delta", "message_stop", "content_block_start", "content_block_delta",
+        "content_block_stop", "ping", "error",
+    }),
+    "openai-responses": frozenset({
+        "response.created", "response.in_progress", "response.completed", "response.incomplete", "response.failed",
+        "response.output_text.delta", "response.refusal.delta", "response.reasoning_summary_text.delta",
+        "response.reasoning_text.delta", "response.output_item.added", "response.output_item.done",
+        "response.function_call_arguments.delta", "response.function_call_arguments.done", "error",
+    }),
+    "ollama-ndjson": frozenset({"ollama.done"}),
+}
+_FINISH_REASONS = {
+    "gemini-sse": _GEMINI_FINISH_REASONS,
+    "anthropic-messages": _ANTHROPIC_STOP_REASONS,
+    "openai-chat": _CHAT_FINISH_REASONS,
+    "openai-responses": _RESPONSES_INCOMPLETE_REASONS,
+    "sglang-native": _CHAT_FINISH_REASONS,
+    "ollama-ndjson": _CHAT_FINISH_REASONS,
+}
+_WIRE_ENUMS = {
+    "gemini-sse": {("candidates", None, "finishReason"): _GEMINI_FINISH_REASONS},
+    "anthropic-messages": {
+        ("type",): _SSE_EVENTS["anthropic-messages"],
+        ("delta", "stop_reason"): _ANTHROPIC_STOP_REASONS,
+        ("message", "stop_reason"): _ANTHROPIC_STOP_REASONS,
+        ("delta", "type"): frozenset({"text_delta", "thinking_delta", "signature_delta", "input_json_delta"}),
+        ("content_block", "type"): frozenset({"text", "thinking", "tool_use", "server_tool_use"}),
+    },
+    "openai-chat": {("choices", None, "finish_reason"): _CHAT_FINISH_REASONS},
+    "openai-responses": {
+        ("type",): _SSE_EVENTS["openai-responses"],
+        ("response", "status"): _RESPONSES_STATUSES,
+        ("response", "incomplete_details", "reason"): _RESPONSES_INCOMPLETE_REASONS,
+        ("response", "output", None, "type"): frozenset({"function_call"}),
+        ("item", "type"): frozenset({"function_call"}),
+    },
+    "ollama-ndjson": {("done_reason",): _CHAT_FINISH_REASONS},
+    "sglang-native": {
+        ("meta_info", "finish_reason"): _CHAT_FINISH_REASONS,
+        ("meta_info", "finish_reason", "type"): _CHAT_FINISH_REASONS,
+    },
+}
+_WIRE_KEYS = {
+    "anthropic-messages": {("delta", "stop_sequence"), ("content_block", "input")},
+    "openai-chat": {("choices", None, "delta", "tool_calls"), ("choices", None, "stop_reason")},
+    "ollama-ndjson": {("done",), ("message", "tool_calls")},
+    "sglang-native": {("meta_info", "finish_reason", "matched")},
+}
+
+
+def is_protocol_event(dialect: str, value: str) -> bool:
+    return value in _SSE_EVENTS.get(dialect, ())
+
+
+def is_protocol_enum(dialect: str, field: str, value: object) -> bool:
+    """Identify public protocol values in a normalized control field."""
+    if not isinstance(value, str):
+        return False
+    if field == "terminal_status":
+        return value in (_RESPONSES_STATUSES if dialect == "openai-responses" else {"completed", "incomplete"})
+    if field in {"finish_reason", "stop_reason"}:
+        return value in _FINISH_REASONS.get(dialect, ())
+    return False
 
 SAFE_REPRO_PROTOCOL_KEYS = frozenset(
     {
@@ -136,7 +217,11 @@ SAFE_REPRO_PROTOCOL_KEYS = frozenset(
 
 def fingerprint8(value: str) -> str:
     """Return the first 8 hex characters of SHA-256(value) for equality checks."""
-    return hashlib.sha256(value.encode("utf-8", errors="surrogateescape")).hexdigest()[:8]
+    try:
+        encoded = value.encode("utf-8", errors="surrogateescape")
+    except UnicodeEncodeError:
+        encoded = value.encode("utf-8", errors="surrogatepass")
+    return hashlib.sha256(encoded).hexdigest()[:8]
 
 
 def is_sensitive_header(name: str) -> bool:
@@ -332,12 +417,84 @@ def scrub_known_secrets(text: str, known_secrets: Sequence[str] = (), *, min_len
     """Scrub exact known outgoing secret strings plus standard secret patterns from text."""
     if not text:
         return text
+    scrub = _known_secret_scrubber(known_secrets, min_length)
+    return scrub(text)
+
+
+def _known_secret_scrubber(known_secrets: Sequence[str], min_length: int) -> Callable[[str], str]:
     variants = _secret_variants(known_secrets, min_length)
-    if variants:
-        text = _secret_pattern(variants).sub(
-            lambda match: f"$REDACTED_sha256:{fingerprint8(variants[match.group()])}", text,
-        )
-    return redact_secret_text(text)
+    if not variants:
+        return redact_secret_text
+    pattern = _secret_pattern(variants)
+
+    def scrub(value: str) -> str:
+        return redact_secret_text(pattern.sub(
+            lambda match: f"$REDACTED_sha256:{fingerprint8(variants[match.group()])}", value,
+        ))
+
+    return scrub
+
+
+class _JSONMembers(list):
+    """Object pairs in lexical order, including repeated keys."""
+
+
+def scrub_protocol_payload(text: str, dialect: str, known_secrets: Sequence[str]) -> str:
+    """Scrub JSON strings while preserving public enums in their actual wire fields."""
+    if text == "[DONE]" and dialect not in {"anthropic-messages", "gemini-sse", "ollama-ndjson"}:
+        return text
+    scrub = _known_secret_scrubber(known_secrets, 1)
+    try:
+        # Walk decoded paths and replace original string spans to retain wire whitespace and framing.
+        payload = json.loads(text, object_pairs_hook=_JSONMembers)
+        wire_enums = _WIRE_ENUMS.get(dialect, {})
+        control_paths = (*wire_enums, *_WIRE_KEYS.get(dialect, ()))
+        control_keys = {path[:size] for path in control_paths for size in range(1, len(path) + 1)}
+        literals = iter(_JSON_STRING_RE.finditer(text))
+        pieces: list[str] = []
+        end = 0
+
+        def redact_literal(value: str, *, preserve: bool, credential: str | None = None) -> None:
+            nonlocal end
+            literal = next(literals)
+            if preserve:
+                return
+            if credential and value and value != "[redacted]" and not _REDACTED_HEADER_RE.fullmatch(value):
+                safe = redact_header_value(credential, value) if is_sensitive_header(credential) else "[redacted]"
+            else:
+                safe = scrub(value)
+            if safe != value:
+                pieces.extend((text[end:literal.start()], json.dumps(safe, ensure_ascii=True)))
+                end = literal.end()
+
+        def walk(node: Any, path: tuple[str | None, ...]) -> None:
+            if isinstance(node, _JSONMembers):
+                for key, value in node:
+                    member_path = (*path, key)
+                    redact_literal(key, preserve=member_path in control_keys)
+                    walk(value, member_path)
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item, (*path, None))
+            elif isinstance(node, str):
+                name = path[-1] if path else None
+                credential = name if name and _is_report_credential(name) else None
+                redact_literal(node, preserve=node in wire_enums.get(path, ()), credential=credential)
+
+        walk(payload, ())
+    except (ValueError, RecursionError):
+        # A broken envelope may still contain complete JSON string literals.
+        def scrub_literal(match: re.Match[str]) -> str:
+            literal = match[0]
+            try:
+                value = json.loads(literal)
+            except ValueError:
+                return literal
+            safe = scrub(value)
+            return json.dumps(safe, ensure_ascii=True) if safe != value else literal
+
+        return scrub(_JSON_STRING_RE.sub(scrub_literal, text))
+    return "".join((*pieces, text[end:]))
 
 
 def redact_secret_text(text: str) -> str:

@@ -31,9 +31,9 @@ class _ReportCase:
     rule_id: str | None
     code: str
     scope: str
-    endpoint: str = ""
-    outcomes: tuple[tuple[str, str], ...] = ()
-    duration_seconds: float = 0.0
+    endpoint: str | None = None
+    outcomes: tuple[tuple[str, str | None], ...] = ()
+    duration_seconds: float | None = None
     executed: bool = True
     trace_path: str = ""
 
@@ -132,17 +132,17 @@ def comparison_cases(report: ComparisonReport) -> list[_ReportCase]:
     return cases
 
 
-def _clean_text(value: str, known_secrets: Sequence[str]) -> str:
-    value = scrub_report_text(value, known_secrets)
+def _clean_text(value: str | None, known_secrets: Sequence[str]) -> str:
+    value = scrub_report_text(value or "", known_secrets)
     # XML 1.0 excludes most ASCII controls, surrogates, and the terminal BMP noncharacters.
     return "".join(ch if ch in "\t\n\r" or 0x20 <= ord(ch) <= 0xD7FF
                    or 0xE000 <= ord(ch) <= 0xFFFD or ord(ch) >= 0x10000 else " " for ch in value)
 
 
-def _endpoint_uri(endpoint: str, rule_id: str, known_secrets: Sequence[str]) -> str:
+def _endpoint_uri(endpoint: str | None, rule_id: str, known_secrets: Sequence[str]) -> str:
     """Build a synthetic artifact path with neither URL authority nor query data."""
     try:
-        parsed = urlsplit(endpoint)
+        parsed = urlsplit(endpoint or "")
         path = parsed.path if parsed.scheme in ("http", "https") and parsed.hostname else ""
     except ValueError:
         path = ""
@@ -207,7 +207,11 @@ def render_sarif(cases: Sequence[_ReportCase], *, known_secrets: Sequence[str] =
 
 
 def _seconds(milliseconds: float | None) -> float:
-    return milliseconds / 1000.0 if is_finite_number(milliseconds) and milliseconds > 0 else 0.0
+    return _positive_finite(milliseconds) / 1000.0
+
+
+def _positive_finite(value: float | None) -> float:
+    return value if is_finite_number(value) and value > 0 else 0.0
 
 
 def render_junit(cases: Sequence[_ReportCase], *, known_secrets: Sequence[str] = ()) -> str:
@@ -217,7 +221,7 @@ def render_junit(cases: Sequence[_ReportCase], *, known_secrets: Sequence[str] =
     counts = dict.fromkeys(_JUNIT_TAGS, 0)
     total_seconds = 0.0
     for case in cases:
-        seconds = case.duration_seconds
+        seconds = _positive_finite(case.duration_seconds)
         total_seconds += seconds
         name = f"{case.rule_id} {case.code}" if case.rule_id else case.code
         testcase = ET.SubElement(suite, "testcase", classname=_clean_text(f"inferdiff.{case.scope}", known_secrets),
@@ -235,6 +239,6 @@ def render_junit(cases: Sequence[_ReportCase], *, known_secrets: Sequence[str] =
             if status != "SKIP":
                 element.text = message
     suite.attrib.update(failures=str(counts["FAIL"]), skipped=str(counts["SKIP"]),
-                        errors=str(counts["ERROR"]), time=f"{total_seconds:.6f}")
+                        errors=str(counts["ERROR"]), time=f"{_positive_finite(total_seconds):.6f}")
     ET.indent(root)
     return ET.tostring(root, encoding="unicode", xml_declaration=True) + "\n"

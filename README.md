@@ -11,6 +11,10 @@ Catch silent `HTTP 200 OK` failures — truncated tool JSON, ghost thinking star
 
 [中文文档 (README.zh-CN.md)](https://github.com/ApacheWang/inferdiff/blob/main/README.zh-CN.md) · [PyPI (`inferdiff`)](https://pypi.org/project/inferdiff/) · [Releases](https://github.com/ApacheWang/inferdiff/releases)
 
+`v0.1.0` introduced OpenAI Chat and Responses canaries (`C1`–`C8`), trace recording, offline diffs, and HTML waterfalls. `v0.1.1` improved checks for thinking models and relays and added a GitHub Action. `v0.2.0` adds Anthropic and Gemini canaries, KV and storage probes, A/B canary comparison, continuous monitoring, and offline replay with CI reports. See the [changelog](CHANGELOG.md).
+
+The v0.2 features below are unreleased. From a checkout of this branch, run `python -m pip install .` to use `0.2.0.dev0`.
+
 ![inferdiff live relay doctor and GitHub Issue export demo](https://raw.githubusercontent.com/ApacheWang/inferdiff/main/assets/hero-demo.gif)
 
 ## Why `inferdiff`? (`HTTP 200 OK` != Your Stream Worked)
@@ -33,7 +37,7 @@ Zero-install via [`uvx`](https://docs.astral.sh/uv/guides/tools/) directly from 
 uvx inferdiff doctor http://127.0.0.1:8080/v1 --html doctor.html
 
 # 2. Audit an OpenAI-compatible relay API + generate shareable single-file HTML scorecard
-OPENAI_API_KEY=sk-... uvx inferdiff doctor https://api.your-relay.example/v1 \
+OPENAI_API_KEY="$RELAY_API_KEY" uvx inferdiff doctor https://api.your-relay.example/v1 \
   --model qwen3-32b --profile relay --html relay-report.html
 
 # 3. Or install once from PyPI
@@ -98,7 +102,17 @@ inferdiff replay ./after --baseline ./before --out-json replay.json \
   --out-sarif replay.sarif --out-junit replay.xml --out-html replay.html
 ```
 
-Replay runs the current detectors over saved `.trace.jsonl` files locally. With a baseline, it matches traces by relative path, runs pair checks on matches, and reports `NEW_BREACHES`, `FIXED_BREACHES`, and `UNCHANGED`. New P0 findings exit `2`. `--strict` also gates P1 findings with exit `3`.
+Replay runs the current detectors over saved `.trace.jsonl` files locally. With `--baseline`, it matches traces by relative path across Windows and POSIX separators, runs pair checks on matches, and reports `NEW_BREACHES`, `FIXED_BREACHES`, and `UNCHANGED`. Missing, empty, or malformed input bundles exit `1`. New P0 findings exit `2`. `--strict` also gates P1 findings with exit `3`.
+
+## Continuous Canary Monitoring
+
+```bash
+inferdiff watch --base-url https://relay.example.com/v1 --model "$MODEL" \
+  --profile relay --interval 60 --max-runs 10 --out-jsonl watch.jsonl \
+  --fail-on-breach
+```
+
+`watch` runs `doctor` on a schedule. Add `--webhook-url "$INFERDIFF_WEBHOOK"` to send failure and recovery notifications to a generic JSON, Feishu, or Lark webhook. `--cooldown` controls how often it repeats failure alerts. Leave out `--max-runs` for continuous monitoring.
 
 ## Recording, Side-by-Side Comparison & Bundled Examples
 
@@ -146,6 +160,22 @@ Use `ApacheWang/inferdiff@v0.1.1` directly in GitHub Actions to run a live `doct
     html-out: inferdiff-report.html
 ```
 
+The v0.2 Action also accepts the optional `sarif-output` and `junit-output` paths in both `doctor` and `diff` mode. For example, after checking out the v0.2 source in a workflow, use its local Action:
+
+```yaml
+- name: Run inferdiff wire gate with CI reports
+  uses: ./
+  with:
+    before-trace: traces/baseline.trace.jsonl
+    after-trace: traces/target.trace.jsonl
+    sarif-output: reports/inferdiff.sarif
+    junit-output: reports/inferdiff.xml
+```
+
+At the default `version: "0.1.1"`, setting either report path installs the package bundled with the Action. An explicit PyPI version for report generation should support `--out-sarif` and `--out-junit`. The `upload-artifact` input uploads the HTML waterfall. Upload the SARIF and JUnit files separately if your workflow needs them.
+
+The CLI accepts `--out-sarif` (SARIF 2.1.0) and `--out-junit` (JUnit XML) on `doctor`, `audit`, `diff`, and `replay`. `compare` also accepts `--out-junit`.
+
 ## Wire Health Grades & Deterministic CI Exit Codes
 
 - **Doctor grades**: `A+` (all executed probes pass with zero skips/warnings), `A` (zero P0/P1 issues, advisory P2 warning or inconclusive/skipped probe), `B` (1 P1 warning), `C` (2+ P1 warnings), `F` (any P0 silent protocol breach or transport/HTTP error).
@@ -178,9 +208,11 @@ Use `ApacheWang/inferdiff@v0.1.1` directly in GitHub Actions to run a live `doct
 - **No LLM-as-a-Judge or capability leaderboards**: `inferdiff` never grades prose quality, math/coding intelligence, or jailbreak resistance. Every verdict is a deterministic function of raw wire bytes, JSON syntax trees, and monotonic frame timestamps.
 - **No heavy runtime stack**: Core CLI and HTML/SVG waterfall rendering stay 100% Python 3.10+ standard library (`0` mandatory `pip` packages, `0` Node.js runtime, `0` external CDN requests).
 
-## Roadmap (v0.2: Non-Intrusive KV & Storage Probes)
+## Non-Invasive KV and Storage Probes
 
-`inferdiff.trace.v1` and `inferdiff.probes.base.BackendProbe` already expose the three-point snapshot lifecycle (`T_pre -> T_ttft -> T_eof`) for optional v0.2 plugins (`LmcacheMpProbe`, `MooncakeStoreProbe`, `LinuxProcIoProbe`) and storage x inference rules `D6`–`D8`.
+`record` and request-mode `compare` can sample LMCache MP metrics, Mooncake Store master and client endpoints, and Linux `/proc/<pid>/io`. The probes read existing metrics before the request, at the first effective token, and at stream end. Use `--probe-lmcache`, `--probe-mooncake-master`, `--probe-mooncake-client`, or `--probe-pid` to opt in. `compare` accepts `--before-probe-*` and `--after-probe-*` for separate targets.
+
+`D6` flags evidence of page-cache-warmed reads. `D7` flags evidence of lookup hits whose data is dropped before delivery. `D8` flags fragmented physical reads or a TTFT regression with storage evidence. These checks use telemetry stored in `inferdiff.trace.v1`, so `audit`, `diff`, and `replay` can run them offline.
 
 ## License
 

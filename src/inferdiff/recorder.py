@@ -27,14 +27,17 @@ from .probes._task import TTFT_HOOK_BUDGET, ProbeTask, run_ttft_hook
 from .redact import (
     extract_body_secret_values,
     extract_header_secret_values,
-    extract_query_secret_values,
     extract_url_secret_values,
     has_control_chars,
+    is_protocol_enum,
+    is_protocol_event,
     redact_headers,
     sanitize_url_for_error,
     sanitize_url_for_export,
     scrub_known_secrets,
+    scrub_protocol_payload,
     scrub_report_data,
+    scrub_report_text,
 )
 from .schema import (
     TraceDocument,
@@ -58,8 +61,7 @@ _HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 _MANAGED_HEADERS = frozenset({"content-length", "transfer-encoding", "host"})
 _MAX_CHUNK_LINE_BYTES = 16384
 _MAX_TRAILER_BYTES = 65536
-_JSON_STRING_RE = re.compile(r'"(?:\\[^\r\n]|[^"\\\r\n])*"')
-_SSE_NON_DATA_LINE_RE = re.compile(r"(?:^|(?<=[\r\n]))(?!data(?=[:\r\n]|$))[^\r\n]+")
+_SSE_LINE_RE = re.compile(r"[^\r\n]+")
 # One EOF phase can make five default HTTP calls plus a local snapshot.
 _PROBE_HOOK_BUDGET = 12.0
 # The built-in TTFT hooks only schedule work or return immediately.
@@ -74,10 +76,11 @@ _EOF_CUTOFF_HOOKS = frozenset({CompositeBackendProbe.sample_eof, LinuxProcIoProb
 class RecorderHTTPError(RecorderError):
     """A non-200 HTTP response received before recording could begin."""
 
-    def __init__(self, status_code: int, url: str) -> None:
+    def __init__(self, status_code: int, url: str, known_secrets: Sequence[str] = ()) -> None:
         self.status_code = status_code
+        endpoint = scrub_report_text(sanitize_url_for_error(url), known_secrets)
         super().__init__(
-            f"HTTP {status_code} from {sanitize_url_for_error(url)} (expected HTTP 200 for streaming capture)"
+            f"HTTP {status_code} from {endpoint} (expected HTTP 200 for streaming capture)"
         )
 
 
@@ -116,35 +119,6 @@ def _decode_safe(data: bytes) -> Tuple[str, bool]:
         return data.decode("utf-8", errors="surrogateescape"), True
 
 
-def _scrub_gemini_wire(text: str, known_secrets: Sequence[str], *, sse_block: bool = False) -> str:
-    text = scrub_known_secrets(text, known_secrets)
-    has_short_keys = any(len(secret) < 6 for secret in known_secrets)
-    if not has_short_keys and "\\" not in text:
-        return text
-
-    def scrub_line(match: re.Match[str]) -> str:
-        field, separator, value = match[0].partition(":")
-        if separator and field in ("", "event", "id", "retry"):
-            return field + separator + scrub_known_secrets(value, known_secrets, min_length=1)
-        return scrub_known_secrets(match[0], known_secrets, min_length=1)
-
-    def scrub_string(match: re.Match[str]) -> str:
-        literal = match[0]
-        if not has_short_keys and "\\" not in literal:
-            return literal
-        try:
-            value = strict_json_loads(literal)
-        except ValueError:
-            return literal
-        safe = scrub_known_secrets(value, known_secrets, min_length=1)
-        return canonical_json_line(safe) if safe != value else literal
-
-    if sse_block and has_short_keys:
-        text = _SSE_NON_DATA_LINE_RE.sub(scrub_line, text)
-    # Scrub JSON-escaped credential contexts and keep numeric fields unchanged when a key is short.
-    return _JSON_STRING_RE.sub(scrub_string, text)
-
-
 @dataclass
 class WireChunk:
     """One framed raw wire record (either an SSE block or an NDJSON line)."""
@@ -156,6 +130,51 @@ class WireChunk:
     is_incomplete: bool = False
     invalid_utf8: bool = False
     framing_error: Optional[str] = None
+
+
+def _scrub_wire_chunk(wc: WireChunk, dialect: str, known_secrets: Sequence[str]) -> WireChunk:
+    payload = scrub_protocol_payload(wc.payload_text, dialect, known_secrets)
+    if dialect == "ollama-ndjson":
+        wire = payload + wc.raw_wire[len(wc.payload_text):] if wc.payload_text else scrub_known_secrets(
+            wc.raw_wire, known_secrets, min_length=1,
+        )
+        return dataclasses.replace(wc, raw_wire=wire, payload_text=payload)
+
+    lines = iter(payload.split("\n"))
+
+    def scrub_line(match: re.Match[str]) -> str:
+        line = match[0]
+        field, separator, value = line.partition(":")
+        if field == "data":
+            safe = next(lines, "")
+            return field + separator + (" " if value.startswith(" ") else "") + safe
+        if field == "event" and is_protocol_event(dialect, value.removeprefix(" ")):
+            return line
+        if separator and field in {"", "event", "id", "retry"}:
+            return field + separator + scrub_known_secrets(value, known_secrets, min_length=1)
+        return scrub_known_secrets(line, known_secrets, min_length=1)
+
+    event = wc.sse_event
+    if event and not is_protocol_event(dialect, event):
+        event = scrub_known_secrets(event, known_secrets, min_length=1)
+    wire = _SSE_LINE_RE.sub(scrub_line, wc.raw_wire)
+    return dataclasses.replace(wc, sse_event=event, raw_wire=wire, payload_text=payload)
+
+
+def _scrub_normalized_data(data: dict[str, Any], dialect: str, known_secrets: Sequence[str]) -> dict[str, Any]:
+    """Scrub freely supplied strings, including reflections split across events."""
+    clean = {}
+    for key, value in data.items():
+        if key in {"phase", "usage", "reported_usage"} or is_protocol_enum(dialect, key, value):
+            clean[key] = value
+        elif key == "closed_events":
+            clean[key] = [
+                event if event == "[DONE]" or is_protocol_event(dialect, event) else scrub_report_text(event, known_secrets)
+                for event in value
+            ]
+        else:
+            clean[key] = scrub_report_data(value, known_secrets)
+    return clean
 
 
 class SSEFramer:
@@ -759,10 +778,9 @@ def record_stream(
         raise RecorderError("Request body must be a JSON object.")
 
     is_gemini = dialect == "gemini-sse" or (dialect == "auto" and detect_dialect(parsed.path) == "gemini-sse")
-    gemini_secrets = []
+    outgoing_secrets = [*known_secrets, *extract_url_secret_values(url), *extract_body_secret_values(request_body)]
     query_key = None
     if is_gemini:
-        gemini_secrets = extract_url_secret_values(url) + extract_body_secret_values(request_body) + list(known_secrets)
         url, query_key = gemini_request_url(url)
         parsed = urlsplit(url)
         query_fields = [field for field in parsed.query.split("&")
@@ -789,6 +807,7 @@ def record_stream(
         "Content-Type": "application/json",
         "Accept": "text/event-stream, application/x-ndjson",
         "Accept-Encoding": "identity",
+        "Connection": "close",
     }
     send_headers = validate_and_merge_headers(default_headers, headers)
     if query_key and not any(name.lower() == "x-goog-api-key" for name in send_headers):
@@ -797,9 +816,7 @@ def record_stream(
                          for name, value in send_headers.items()):
         raise RecorderError("Gemini API keys must contain only ASCII characters.")
 
-    outgoing_secrets = extract_header_secret_values(send_headers, min_length=1 if is_gemini else 6)
-    outgoing_secrets.extend(extract_query_secret_values(parsed.query))
-    outgoing_secrets.extend(gemini_secrets if is_gemini else known_secrets)
+    outgoing_secrets.extend(extract_header_secret_values(send_headers, min_length=1))
 
     conn: http.client.HTTPConnection
     if parsed.scheme == "https":
@@ -840,11 +857,12 @@ def record_stream(
         conn.request("POST", req_path, body=body_bytes, headers=send_headers)
         resp = conn.getresponse()
         t_headers_ns = time.monotonic_ns()
-    except (OSError, http.client.HTTPException) as exc:
+    except (OSError, http.client.HTTPException, UnicodeError) as exc:
         conn.close()
+        endpoint = scrub_report_text(sanitize_url_for_error(url), outgoing_secrets)
         raise RecorderError(
-            f"HTTP connection/request failed for {sanitize_url_for_error(url)} ({type(exc).__name__})"
-        ) from exc
+            f"HTTP connection/request failed for {endpoint} ({type(exc).__name__})"
+        ) from None
 
     status_code = resp.status
     content_type = resp.getheader("Content-Type") or ""
@@ -853,8 +871,11 @@ def record_stream(
 
     # Streaming capture strictly requires HTTP 200; never expose raw query or response body in errors
     if status_code != 200:
-        conn.close()
-        raise RecorderHTTPError(status_code, url)
+        try:
+            resp.close()
+        finally:
+            conn.close()
+        raise RecorderHTTPError(status_code, url, outgoing_secrets)
 
     redacted_req_headers = redact_headers(send_headers)
     safe_stored_url = sanitize_url_for_export(url)
@@ -878,10 +899,14 @@ def record_stream(
         },
         backend_probe=probe_topology,
     )
-    if is_gemini:
+    if outgoing_secrets or is_gemini:
         header.label = scrub_known_secrets(header.label, outgoing_secrets, min_length=1)
-        header.request = scrub_report_data(header.request, outgoing_secrets)
-        header.response_meta = scrub_report_data(header.response_meta, outgoing_secrets)
+        header.request = {key: scrub_report_data(value, outgoing_secrets) for key, value in header.request.items()}
+        media_type, separator, parameters = content_type.partition(";")
+        if media_type.strip().lower() in {"text/event-stream", "application/x-ndjson"}:
+            header.response_meta["content_type"] = media_type + separator + scrub_report_text(parameters, outgoing_secrets)
+        else:
+            header.response_meta["content_type"] = scrub_report_text(content_type, outgoing_secrets)
         header.backend_probe = scrub_report_data(header.backend_probe, outgoing_secrets)
 
     framer: Union[SSEFramer, NDJSONFramer] = (
@@ -905,23 +930,9 @@ def record_stream(
 
     def _emit_chunk(wc: WireChunk) -> None:
         nonlocal prev_rel_ms, sglang_prev, probe_ttft_sampled, ttft_task, ttft_deadline
-        # Scrub any reflected outgoing credential (e.g. echoed API key) BEFORE normalization or persistence
+        # Keep protocol control values intact for offline as well as live detection.
         if outgoing_secrets or is_gemini:
-            scrub_wire = _scrub_gemini_wire if is_gemini else scrub_known_secrets
-            sse_event = wc.sse_event
-            if sse_event:
-                sse_event = scrub_known_secrets(sse_event, outgoing_secrets, min_length=1 if is_gemini else 6)
-            raw_wire = (_scrub_gemini_wire(wc.raw_wire, outgoing_secrets, sse_block=True) if is_gemini
-                        else scrub_known_secrets(wc.raw_wire, outgoing_secrets))
-            wc = WireChunk(
-                t_mono_ns=wc.t_mono_ns,
-                sse_event=sse_event,
-                payload_text=scrub_wire(wc.payload_text, outgoing_secrets),
-                raw_wire=raw_wire,
-                is_incomplete=wc.is_incomplete,
-                invalid_utf8=wc.invalid_utf8,
-                framing_error=wc.framing_error,
-            )
+            wc = _scrub_wire_chunk(wc, resolved_dialect, outgoing_secrets)
         tf, sglang_prev = build_frame_from_chunk(
             wc,
             seq=len(frames),
@@ -931,11 +942,12 @@ def record_stream(
             sglang_prev_text=sglang_prev,
         )
         prev_rel_ms = tf.t_rel_ms
-        if is_gemini:
+        if outgoing_secrets or is_gemini:
             if tf.parse_error:
-                tf.raw_wire = scrub_known_secrets(tf.raw_wire, outgoing_secrets, min_length=1)
+                code, separator, detail = tf.parse_error.partition(": ")
+                tf.parse_error = code + separator + scrub_report_text(detail, outgoing_secrets)
             # Normalized values may decode escaping beyond the wire value's encoding.
-            tf.norm = scrub_report_data(tf.norm, outgoing_secrets)
+            tf.norm = _scrub_normalized_data(tf.norm, resolved_dialect, outgoing_secrets)
         frames.append(tf)
         if fh is not None:
             fh.write(canonical_json_line(tf.to_dict()) + "\n")
@@ -1027,9 +1039,9 @@ def record_stream(
             socket_eof_clean=socket_eof_clean,
             backend_probe_summary=probe_summary,
         )
-        if is_gemini:
+        if outgoing_secrets or is_gemini:
             # Reassembled text can recreate a reflected key split over multiple events.
-            summary.assembled = scrub_report_data(summary.assembled, outgoing_secrets)
+            summary.assembled = _scrub_normalized_data(summary.assembled, resolved_dialect, outgoing_secrets)
             summary.assembled["content_utf8_bytes"] = safe_utf8_len(summary.assembled["content_text"])
             summary.backend_probe = scrub_report_data(summary.backend_probe, outgoing_secrets)
         if fh is not None:

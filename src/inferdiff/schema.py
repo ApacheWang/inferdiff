@@ -862,17 +862,20 @@ def validate_backend_probe(value: Any, ctx: str) -> None:
     visit(value, PROBE_FIELDS, 0)
 
 
-def load_trace(path: Union[str, Path]) -> TraceDocument:
+def load_trace(path: Union[str, Path], *, source: str | None = None) -> TraceDocument:
     """Load and strictly validate an inferdiff.trace.v1 JSONL file."""
-    src = Path(path)
-    if not src.exists():
-        raise TraceSchemaError(f"Trace file not found: {src}")
+    trace_file = Path(path)
+    src = str(trace_file) if source is None else source
     try:
-        lines = src.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError) as exc:
-        raise TraceSchemaError(f"{src}: failed to read UTF-8 trace: {exc}") from exc
-    if len(lines) < 2:
-        raise TraceSchemaError(f"Trace file too short (expected header + summary): {src}")
+        # JSONL uses LF or CRLF. Other Unicode separators can appear inside a valid string.
+        with trace_file.open(encoding="utf-8", newline="\n") as fh:
+            lines = fh.readlines()
+    except FileNotFoundError as exc:
+        raise TraceSchemaError(f"Trace file not found: {src}") from exc
+    except OSError as exc:
+        raise TraceSchemaError(f"{src}: failed to read trace ({exc.strerror or type(exc).__name__})") from exc
+    except UnicodeDecodeError as exc:
+        raise TraceSchemaError(f"{src}: trace is not valid UTF-8") from exc
 
     records: List[Dict[str, Any]] = []
     for lineno, line in enumerate(lines, start=1):
@@ -887,16 +890,16 @@ def load_trace(path: Union[str, Path]) -> TraceDocument:
         records.append(obj)
 
     if len(records) < 2:
-        raise TraceSchemaError(f"{src}: missing header or summary record")
+        raise TraceSchemaError(f"{src}: trace file too short (expected header + summary)")
 
     hdr_obj = records[0]
     if hdr_obj.get("type") != "header":
         raise TraceSchemaError(f"{src}: first record must have type='header'")
     if hdr_obj.get("schema_version") != SCHEMA_VERSION:
-        raise TraceSchemaError(f"{src}: unsupported schema_version={hdr_obj.get('schema_version')!r}")
+        raise TraceSchemaError(f"{src}: unsupported schema_version")
     dialect = _require_type(hdr_obj, "dialect", str, f"{src}:header")
     if dialect not in VALID_DIALECTS:
-        raise TraceSchemaError(f"{src}: unsupported dialect={dialect!r}")
+        raise TraceSchemaError(f"{src}: unsupported trace dialect")
     trace_id = _require_type(hdr_obj, "trace_id", str, f"{src}:header")
     recorded_at = _require_type(hdr_obj, "recorded_at_utc", str, f"{src}:header")
     label = hdr_obj.get("label", "")
@@ -916,6 +919,9 @@ def load_trace(path: Union[str, Path]) -> TraceDocument:
     # Recover effective_params using the same dialect precedence rules if absent
     if not req_copy.get("effective_params") and isinstance(req_copy.get("body"), dict):
         req_copy["effective_params"] = extract_effective_params(req_copy["body"], dialect)
+    effective = req_copy.get("effective_params") or {}
+    if effective.get("stop_conditions") is not None:
+        _require_type(effective, "stop_conditions", list, f"{src}:header.request.effective_params")
 
     bp_hdr = hdr_obj.get("backend_probe")
     validate_backend_probe(bp_hdr, f"{src}:header")
@@ -926,27 +932,33 @@ def load_trace(path: Union[str, Path]) -> TraceDocument:
     eof_clean = _require_type(sum_obj, "eof_clean", bool, f"{src}:summary")
     total_frames = _require_type(sum_obj, "total_frames", int, f"{src}:summary")
     timing = _require_type(sum_obj, "timing", dict, f"{src}:summary")
-    for tk, tv in timing.items():
-        if tv is not None and not is_finite_number(tv):
-            raise TraceSchemaError(f"{src}:summary.timing: field {tk!r} must be finite number or null")
+    if any(value is not None and not is_finite_number(value) for value in timing.values()):
+        raise TraceSchemaError(f"{src}:summary.timing: values must be finite numbers or null")
     assembled = _require_type(sum_obj, "assembled", dict, f"{src}:summary")
+    assembly_location = f"{src}:summary.assembled"
+    if assembled.get("protocol_violations") is not None:
+        _require_type(assembled, "protocol_violations", list, assembly_location)
+    for key in ("content_utf8_bytes", "observed_delta_frames"):
+        value = assembled.get(key)
+        if value is not None and (not is_strict_int(value) or not is_finite_number(value) or value < 0):
+            raise TraceSchemaError(f"{assembly_location}: field {key!r} must be a nonnegative integer or null")
     for s_key in ("content_text", "reasoning_text", "finish_reason", "terminal_status"):
         if s_key in assembled and assembled[s_key] is not None and not isinstance(assembled[s_key], str):
-            raise TraceSchemaError(f"{src}:summary.assembled: field {s_key!r} must be str")
+            raise TraceSchemaError(f"{assembly_location}: field {s_key!r} must be str")
     if "tool_calls" in assembled and assembled["tool_calls"] is not None:
         if not isinstance(assembled["tool_calls"], list):
-            raise TraceSchemaError(f"{src}:summary.assembled: field 'tool_calls' must be list")
+            raise TraceSchemaError(f"{assembly_location}: field 'tool_calls' must be list")
         for ti, tc in enumerate(assembled["tool_calls"]):
             if not isinstance(tc, dict):
-                raise TraceSchemaError(f"{src}:summary.assembled.tool_calls[{ti}] must be object")
+                raise TraceSchemaError(f"{assembly_location}.tool_calls[{ti}] must be object")
             if "raw_arguments" in tc and tc["raw_arguments"] is not None and not isinstance(tc["raw_arguments"], str):
-                raise TraceSchemaError(f"{src}:summary.assembled.tool_calls[{ti}].raw_arguments must be str")
+                raise TraceSchemaError(f"{assembly_location}.tool_calls[{ti}].raw_arguments must be str")
             if "name" in tc and tc["name"] is not None and not isinstance(tc["name"], str):
-                raise TraceSchemaError(f"{src}:summary.assembled.tool_calls[{ti}].name must be str")
+                raise TraceSchemaError(f"{assembly_location}.tool_calls[{ti}].name must be str")
             if "json_valid" in tc and tc["json_valid"] is not None and not isinstance(tc["json_valid"], bool):
-                raise TraceSchemaError(f"{src}:summary.assembled.tool_calls[{ti}].json_valid must be bool")
+                raise TraceSchemaError(f"{assembly_location}.tool_calls[{ti}].json_valid must be bool")
     if "reported_usage" in assembled and assembled["reported_usage"] is not None and not isinstance(assembled["reported_usage"], dict):
-        raise TraceSchemaError(f"{src}:summary.assembled: field 'reported_usage' must be object")
+        raise TraceSchemaError(f"{assembly_location}: field 'reported_usage' must be object")
     bp_sum = sum_obj.get("backend_probe")
     validate_backend_probe(bp_sum, f"{src}:summary")
 

@@ -378,8 +378,8 @@ def detect_d5(
     # (b) After output volume collapsed below 50% of before
     b_comp = b_usage.get("completion_tokens")
     a_comp = a_usage.get("completion_tokens")
-    b_bytes = before.summary.assembled.get("content_utf8_bytes", 0)
-    a_bytes = after.summary.assembled.get("content_utf8_bytes", 0)
+    b_bytes = before.summary.assembled.get("content_utf8_bytes") or 0
+    a_bytes = after.summary.assembled.get("content_utf8_bytes") or 0
     if is_strict_int(b_comp) and is_strict_int(a_comp) and b_comp > 0 and a_comp < 0.5 * b_comp:
         sub_reasons.append(f"D5b output token collapse ({a_comp}/{b_comp} tokens)")
     elif b_bytes > 0 and a_bytes < 0.5 * b_bytes:

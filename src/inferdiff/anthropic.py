@@ -2,16 +2,13 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
-from urllib.parse import quote, quote_plus, urlsplit
+from typing import Any, Mapping
 
 from .dialects.anthropic_messages import DELTA_FIELDS, TOOL_TYPES
 from .recorder import SSEFramer, record_stream, validate_and_merge_headers
-from .redact import extract_header_secret_values, extract_query_secret_values, scrub_known_secrets
-from .schema import TraceDocument, TraceFrame, has_lone_surrogate, is_strict_int, strict_json_loads, write_trace
+from .schema import TraceDocument, TraceFrame, has_lone_surrogate, is_strict_int, strict_json_loads
 
 ANTHROPIC_VERSION = "2023-06-01"
 
@@ -37,32 +34,6 @@ class _Block:
     stopped: bool = False
 
 
-def _scrub_trace_values(value: Any, secrets: Sequence[str]) -> Any:
-    if isinstance(value, str):
-        return scrub_known_secrets(value, secrets)
-    if isinstance(value, dict):
-        return {key: _scrub_trace_values(item, secrets) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_scrub_trace_values(item, secrets) for item in value]
-    return value
-
-
-def _scrub_credential_reflections(doc: TraceDocument, secrets: Sequence[str]) -> None:
-    # Credentials may be JSON-escaped on the wire or recreated by joining multiple deltas.
-    variants = sorted({form for secret in secrets for form in (
-        secret, json.dumps(secret, ensure_ascii=True)[1:-1], json.dumps(secret, ensure_ascii=False)[1:-1],
-        quote(secret, safe="", errors="replace"), quote_plus(secret, errors="replace"),
-    )}, key=len, reverse=True)
-    doc.header.label = scrub_known_secrets(doc.header.label, variants)
-    doc.header.request = _scrub_trace_values(doc.header.request, variants)
-    doc.header.response_meta = _scrub_trace_values(doc.header.response_meta, variants)
-    for frame in doc.frames:
-        frame.raw_wire = scrub_known_secrets(frame.raw_wire, variants)
-        frame.sse_event = _scrub_trace_values(frame.sse_event, variants)
-        frame.norm = _scrub_trace_values(frame.norm, variants)
-    doc.summary.assembled = _scrub_trace_values(doc.summary.assembled, variants)
-
-
 def record_anthropic_stream(
     *,
     url: str,
@@ -76,17 +47,10 @@ def record_anthropic_stream(
     request_headers = validate_and_merge_headers(
         {"Accept": "text/event-stream", "anthropic-version": ANTHROPIC_VERSION}, headers,
     )
-    doc = record_stream(
-        url=url, request_body=request_body, headers=request_headers,
+    return record_stream(
+        url=url, request_body=request_body, out_path=out_path, headers=request_headers,
         dialect="anthropic-messages", label=label, timeout=timeout,
     )
-    secrets = extract_header_secret_values(request_headers)
-    secrets.extend(extract_query_secret_values(urlsplit(url).query))
-    if secrets:
-        _scrub_credential_reflections(doc, secrets)
-    if out_path is not None:
-        write_trace(out_path, doc)
-    return doc
 
 
 def _payload(frame: TraceFrame) -> dict[str, Any] | None:

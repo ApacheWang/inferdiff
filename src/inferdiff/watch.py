@@ -44,6 +44,8 @@ def _send_webhook(
     try:
         request = urllib.request.Request(url, data=body.encode("utf-8"), headers={"Content-Type": "application/json"})
         with opener.open(request, timeout=timeout) as response:
+            if not 200 <= response.status < 300:
+                return False
             if not feishu:
                 return True
             raw = response.read(4097)
@@ -55,7 +57,7 @@ def _send_webhook(
     except urllib.error.HTTPError as exc:
         exc.close()
     except (OSError, ValueError, OverflowError, RecursionError, http.client.HTTPException):
-        pass
+        return False
     return False
 
 

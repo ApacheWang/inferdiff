@@ -276,6 +276,7 @@ def _resolve_anthropic_urls(base_url: str) -> Tuple[str, str]:
 
 
 def _http_get_json(url: str, headers: Mapping[str, str], timeout: float) -> Tuple[int, Optional[Dict[str, Any]]]:
+    max_bytes = 256 * 1024
     parsed = validate_url(url)
     path = parsed.path or "/"
     if parsed.query:
@@ -292,17 +293,21 @@ def _http_get_json(url: str, headers: Mapping[str, str], timeout: float) -> Tupl
         conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=timeout)
     try:
         conn.request("GET", path, headers=dict(headers))
-        resp = conn.getresponse()
-        status = resp.status
-        raw = resp.read(262144)
-        if status != 200:
-            return status, None
-        obj = strict_json_loads(raw.decode("utf-8", errors="replace"))
-        return status, obj if isinstance(obj, dict) else None
-    except (OSError, http.client.HTTPException, ValueError, json.JSONDecodeError):
+        with conn.getresponse() as response:
+            if response.status != 200:
+                return response.status, None
+            raw = response.read(max_bytes + 1)
+    except (OSError, http.client.HTTPException, ValueError):
         return 0, None
     finally:
         conn.close()
+    if len(raw) > max_bytes:
+        return 200, None
+    try:
+        obj = strict_json_loads(raw.decode("utf-8"))
+    except (ValueError, RecursionError):
+        return 200, None
+    return 200, obj if isinstance(obj, dict) else None
 
 
 def _pick_preferred_model(ids: List[str]) -> Optional[str]:
@@ -441,10 +446,13 @@ def resolve_endpoints_and_model(
             return _build_url(parsed, f"{ol_prefix}/api/chat"), None, "ollama-ndjson", request_model(picked)
 
     auth_hint = " and --api-key <KEY>" if (st_models in (401, 403) or st_tags in (401, 403)) else ""
-    raise RecorderError(
+    message = (
         f"Could not auto-discover model from {sanitize_url_for_error(models_url)} (HTTP {st_models}) "
         f"or {sanitize_url_for_error(tags_url)} (HTTP {st_tags}); specify --model <MODEL_ID>{auth_hint}."
     )
+    secrets = [*known_secrets, *extract_url_secret_values(base_url),
+               *extract_header_secret_values(headers, min_length=1)]
+    raise RecorderError(scrub_report_text(message, secrets))
 
 
 def _doc_tokens(doc: TraceDocument) -> Optional[int]:

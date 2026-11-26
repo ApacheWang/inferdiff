@@ -3,18 +3,15 @@
 from __future__ import annotations
 
 import html
-import json
-import re
 import unicodedata
 from dataclasses import asdict, dataclass
 from statistics import median
 from typing import Any, Callable, Optional, Sequence
-from urllib.parse import quote, quote_plus
 
 from . import __version__
 from .canary import DoctorReport, ProbeResult
 from .exporter import _c, _supports_color
-from .redact import redact_secret_text, sanitize_url_for_export
+from .redact import is_protocol_enum, sanitize_url_for_export, scrub_report_text
 from .schema import (
     EXIT_OK,
     EXIT_SEMANTIC_REGRESSION,
@@ -156,16 +153,8 @@ class ComparisonReport:
 
 
 def _sanitize_display(known_secrets: Sequence[str]) -> Callable[[str], str]:
-    variants = {variant for secret in known_secrets if secret for variant in (
-        secret, quote(secret, errors="replace"), quote_plus(secret, errors="replace"),
-        json.dumps(secret, ensure_ascii=True)[1:-1],
-    )}
-    pattern = re.compile("|".join(re.escape(secret) for secret in sorted(variants, key=len, reverse=True))) if variants else None
-
     def clean(value: str) -> str:
-        if pattern is not None:
-            value = pattern.sub("[redacted]", value)
-        value = redact_secret_text(value)
+        value = scrub_report_text(value, known_secrets)
         value = "".join(" " if unicodedata.category(ch) in {"Cc", "Cf", "Cs", "Zl", "Zp"} else ch for ch in value)
         return value.strip()[:240]
 
@@ -235,12 +224,16 @@ def _stream_contract(doc: TraceDocument, name: str, fallback_model: str, clean: 
         if end is not None:
             timeline.append((min(start or 0.0, end), end, _frame_category(last)))
 
-    finish, terminal = summary.get("finish_reason"), summary.get("terminal_status")
+    def protocol_value(field: str) -> str | None:
+        value = summary.get(field)
+        if not isinstance(value, str) or value == "unknown":
+            return None
+        return value if is_protocol_enum(doc.header.dialect, field, value) else clean(value)
+
     return StreamContract(
         clean(name), clean(doc.header.dialect), clean(model) if isinstance(model, str) else fallback_model,
         models, fingerprints, _number(timing.get("ttft_effective_ms")), _number(timing.get("total_ms")),
-        clean(finish) if isinstance(finish, str) and finish != "unknown" else None,
-        clean(terminal) if isinstance(terminal, str) and terminal != "unknown" else None,
+        protocol_value("finish_reason"), protocol_value("terminal_status"),
         doc.summary.eof_clean, tools, thinking, timeline,
     )
 
@@ -300,7 +293,10 @@ def _timing(checks: list[CheckComparison]) -> ComparisonTiming:
 
 
 def _ratio(a: Optional[float], b: Optional[float]) -> Optional[float]:
-    return _number(b / a) if a and b is not None else None
+    # A zero baseline has no relative ratio. A zero candidate still has a ratio of zero.
+    if a is None or a <= 0.0 or b is None:
+        return None
+    return _number(b / a)
 
 
 def _regressed(a: Optional[float], b: Optional[float], percent: float) -> bool:
@@ -335,24 +331,25 @@ def compare_reports(
     checks: list[CheckComparison] = []
     model_mismatch = contract_drift = False
     for probe_id in dict.fromkeys((*a_results, *b_results)):
+        report_id = clean(probe_id)
         a_result, b_result = a_results.get(probe_id), b_results.get(probe_id)
         a, b = _check_side(a_result, clean(a_report.model), clean), _check_side(b_result, clean(b_report.model), clean)
         divergences: list[Divergence] = []
         if a.status != b.status:
-            divergences.append(Divergence(probe_id, "status", None, a.status, b.status))
+            divergences.append(Divergence(report_id, "status", None, a.status, b.status))
             contract_drift = True
         for name in dict.fromkeys((*a.samples, *b.samples)):
             if (name in a.samples) != (name in b.samples):
-                divergences.append(Divergence(probe_id, "sample_availability", clean(name),
+                divergences.append(Divergence(report_id, "sample_availability", clean(name),
                                               name in a.samples, name in b.samples))
                 contract_drift = True
         for a_stream, b_stream in _pairs(a, b):
-            diff, suspect, contract_changed = _compare_streams(probe_id, a_stream, b_stream)
+            diff, suspect, contract_changed = _compare_streams(report_id, a_stream, b_stream)
             divergences.extend(diff)
             model_mismatch |= suspect
             contract_drift |= contract_changed
         result = a_results[probe_id] if a_result is not None else b_results[probe_id]
-        checks.append(CheckComparison(clean(probe_id), clean(result.code), a, b, divergences))
+        checks.append(CheckComparison(report_id, clean(result.code), a, b, divergences))
 
     timing = _timing(checks)
     latency_regression = not ignore_timing and any(

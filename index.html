@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
+  <meta http-equiv="Content-Security-Policy" content="connect-src 'none'; form-action 'none'; object-src 'none'; base-uri 'none'">
   <meta name="description" content="Inspect streaming LLM API failures frame by frame with inferdiff, the zero-dependency contract verifier.">
   <title>inferdiff | Streaming LLM contract verifier</title>
   <script>
@@ -18,6 +19,8 @@
   </script>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='10' fill='%23132a30'/%3E%3Cpath d='M7 20h7l6-10 7 20 5-10h3' fill='none' stroke='%235ee7ca' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="styles.css">
+  <script src="stream-inspector.js" defer></script>
+  <script src="inspector-ui.js" defer></script>
   <script src="app.js" defer></script>
 </head>
 <body>
@@ -31,6 +34,9 @@
     <symbol id="icon-terminal" viewBox="0 0 24 24"><path d="m5 7 5 5-5 5m8 0h6"/></symbol>
     <symbol id="icon-cloud" viewBox="0 0 24 24"><path d="M7 18a4 4 0 1 1 .9-7.9 5 5 0 0 1 9.6.8 3.6 3.6 0 0 1-.1 7.1H7Z"/></symbol>
     <symbol id="icon-check" viewBox="0 0 24 24"><path d="m5 12 4 4 10-10"/></symbol>
+    <symbol id="icon-file" viewBox="0 0 24 24"><path d="M7 3h7l4 4v14H6V3h1Zm7 0v5h4M9 13h6m-3-3v6"/></symbol>
+    <symbol id="icon-lock" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3m-4 4v3"/></symbol>
+    <symbol id="icon-agent" viewBox="0 0 24 24"><path d="M5 5h14a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-8l-5 3v-3H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Z"/><path d="m10 9-2 2 2 2m4-4 2 2-2 2"/></symbol>
   </svg>
   <a class="skip-link" href="#main" data-i18n="skip">Skip to content</a>
   <header class="site-header">
@@ -41,6 +47,7 @@
       </a>
       <nav class="site-nav" aria-label="Main navigation" data-i18n-aria="navLabel">
         <a href="#replay" data-i18n="navReplay">Waterfall</a>
+        <a href="#inspect" data-i18n="navInspect">Inspect</a>
         <a href="#probes" data-i18n="navProbes">Probes</a>
         <a href="#cloud" data-i18n="navCloud">Cloud</a>
       </nav>
@@ -122,7 +129,7 @@
       </div>
       <div id="replay-app"><noscript>Enable JavaScript to replay SSE frames. / 请启用 JavaScript 以回放 SSE 帧。</noscript></div>
       <div class="live-run">
-        <div class="live-run-label"><span class="live-run-dot"></span><span><span data-i18n="liveRun">Reported live run</span><code>inferdiff v0.1.1</code></span></div>
+        <div class="live-run-label"><span class="live-run-dot"></span><span><span data-i18n="liveRun">Upstream live run</span><code>inferdiff v0.1.1</code></span></div>
         <div class="live-run-system"><span>llama-server 1.1.0-dev</span><code>Qwen3-0.6B-Q8_0.gguf</code></div>
         <dl class="live-run-stats">
           <div><dt data-i18n="checksRan">Checks run</dt><dd>8/8</dd></div>
@@ -130,6 +137,85 @@
           <div><dt data-i18n="skips">Skips</dt><dd>0</dd></div>
         </dl>
       </div>
+    </section>
+
+    <section class="section shell" id="inspect" aria-labelledby="inspect-heading">
+      <div class="section-header stream-header">
+        <div>
+          <h2 id="inspect-heading" data-i18n="streamTitle">Inspect Your Own Stream</h2>
+          <p data-i18n="streamIntro">Paste SSE or open a recorded trace to check what your endpoint actually sent.</p>
+        </div>
+        <span class="stream-privacy"><svg class="icon" aria-hidden="true"><use href="#icon-lock"/></svg><span data-i18n="streamPrivacy">100% Browser Local · Zero Upload</span></span>
+      </div>
+      <div class="stream-panel">
+        <div class="stream-editor" id="stream-editor">
+          <div class="stream-paste">
+            <div class="stream-input-heading">
+              <label for="stream-input" data-i18n="streamPaste">Paste raw SSE</label>
+              <button type="button" class="stream-clear" id="stream-clear" data-i18n="streamClear" disabled>Clear</button>
+            </div>
+            <textarea id="stream-input" spellcheck="false" autocomplete="off" autocapitalize="off" aria-describedby="stream-input-hint" placeholder="event: response.output_text.delta&#10;data: {&quot;delta&quot;:&quot;Hello&quot;}"></textarea>
+            <p class="stream-hint" id="stream-input-hint" data-i18n="streamHint">OpenAI Chat Completions, Responses, Anthropic Messages, and Gemini SSE. API keys and Bearer tokens are masked automatically.</p>
+          </div>
+          <div class="stream-import">
+            <div class="stream-drop">
+              <span class="stream-drop-icon"><svg class="icon" aria-hidden="true"><use href="#icon-file"/></svg></span>
+              <div><strong data-i18n="streamDrop">Drop a trace file</strong><code>.trace.jsonl</code></div>
+              <input id="stream-file" type="file" accept=".jsonl,application/x-ndjson" hidden>
+              <button type="button" class="copy-button" id="stream-choose" data-i18n="streamChoose">Choose file</button>
+            </div>
+            <div class="stream-samples">
+              <button type="button" class="copy-button" data-stream-sample="breach" data-i18n="streamBreachSample">Sample Truncated Tool Breach</button>
+              <button type="button" class="copy-button" data-stream-sample="healthy" data-i18n="streamHealthySample">Sample Healthy Stream</button>
+            </div>
+          </div>
+          <p id="stream-message" class="stream-message" role="status" hidden></p>
+        </div>
+        <div id="stream-results" hidden>
+          <div class="replay-finding stream-finding" id="stream-finding" data-tone="slate" role="status">
+            <span class="finding-badge" id="stream-verdict"></span><span class="finding-copy" id="stream-finding-copy"></span>
+          </div>
+          <dl class="stream-metrics">
+            <div><dt data-i18n="streamProtocol">Detected protocol</dt><dd id="stream-protocol"></dd></div>
+            <div><dt data-i18n="streamFrames">Frames</dt><dd id="stream-count"></dd></div>
+            <div><dt data-i18n="streamToolJson">Tool-call JSON</dt><dd id="stream-json"></dd></div>
+            <div><dt data-i18n="streamTerminal">Finish reason / status</dt><dd id="stream-terminal"></dd></div>
+          </dl>
+          <div class="stream-workspace">
+            <section class="timeline" aria-labelledby="stream-timeline-heading">
+              <div class="timeline-heading">
+                <strong id="stream-timeline-heading" data-i18n="streamTimeline">Frame timeline</strong>
+                <span id="stream-timing"></span>
+              </div>
+              <div class="stream-timeline" id="stream-timeline"></div>
+              <div class="stream-page" id="stream-page" hidden>
+                <span id="stream-frame-range"></span>
+                <div class="inspector-controls">
+                  <button type="button" id="stream-prev-page" aria-label="Previous group of frames" data-i18n-aria="streamPrevPage">‹</button>
+                  <button type="button" id="stream-next-page" aria-label="Next group of frames" data-i18n-aria="streamNextPage">›</button>
+                </div>
+              </div>
+            </section>
+            <section class="frame-inspector" aria-labelledby="stream-frame-heading">
+              <div class="inspector-heading">
+                <strong id="stream-frame-heading" data-i18n="streamFrameHeading">Frame inspector</strong>
+                <div class="inspector-controls">
+                  <button type="button" id="stream-prev" aria-label="Previous frame" data-i18n-aria="streamPrev">‹</button>
+                  <button type="button" id="stream-next" aria-label="Next frame" data-i18n-aria="streamNext">›</button>
+                </div>
+              </div>
+              <div class="inspector-meta" id="stream-frame-meta"></div>
+              <div class="inspector-event" id="stream-frame-event"></div>
+              <pre class="inspector-code" tabindex="0"><code id="stream-frame-code"></code></pre>
+            </section>
+          </div>
+          <details class="stream-assembled">
+            <summary data-i18n="streamAssembled">Assembled text and tool-call JSON</summary>
+            <div id="stream-output" class="stream-output"></div>
+          </details>
+        </div>
+      </div>
+      <noscript><p class="stream-hint">Enable JavaScript to inspect a local stream. / 请启用 JavaScript 以离线解析日志。</p></noscript>
     </section>
 
     <section class="section shell" id="probes" aria-labelledby="probes-heading">
@@ -146,15 +232,15 @@
     <section class="section shell cloud-section" id="cloud" aria-labelledby="cloud-heading">
       <div class="section-header">
         <div>
-          <h2 id="cloud-heading" data-i18n="cloudHeading">CLI or Cloud Watchdog</h2>
-          <p data-i18n="cloudIntro">Run a check on demand or watch your relay continuously.</p>
+          <h2 id="cloud-heading" data-i18n="cloudHeading">The inferdiff ecosystem</h2>
+          <p data-i18n="cloudIntro">Run a check from your terminal, from agent chat, or on a schedule.</p>
         </div>
       </div>
       <div class="product-grid">
         <article class="product-card">
           <div class="product-top"><span class="product-icon"><svg class="icon" aria-hidden="true"><use href="#icon-terminal"/></svg></span><span class="product-tag">MIT</span></div>
-          <h3 data-i18n="cliTitle">Open-source CLI</h3>
-          <p><span data-i18n="cliDescription">Free to run locally and in CI with </span><code>uvx inferdiff</code><span data-i18n="sentenceEnd">.</span></p>
+          <h3 data-i18n="cliTitle">Open-Source CLI</h3>
+          <p><span data-i18n="cliDescription">Run locally or in CI with zero runtime dependencies.</span> <code>uvx inferdiff doctor</code></p>
           <ul class="product-features">
             <li data-i18n="cliFeatureOne">Check a live endpoint with canary probes.</li>
             <li data-i18n="cliFeatureTwo">Record SSE traces and compare them frame by frame.</li>
@@ -162,13 +248,25 @@
           </ul>
           <a class="product-cta primary-cta" href="https://github.com/ApacheWang/inferdiff"><svg class="icon" aria-hidden="true"><use href="#icon-github"/></svg><span data-i18n="github">View on GitHub</span></a>
         </article>
+        <article class="product-card product-mcp">
+          <div class="product-top"><span class="product-icon"><svg class="icon" aria-hidden="true"><use href="#icon-agent"/></svg></span><span class="product-tag"><code>inferdiff-mcp</code></span></div>
+          <h3 data-i18n="mcpTitle">MCP Server for AI Agents</h3>
+          <p data-i18n="mcpDescription">Check endpoints in Claude Code, Cursor, Windsurf, or Antigravity chat.</p>
+          <ul class="product-features mcp-features">
+            <li><code>doctor_endpoint</code></li>
+            <li><code>compare_endpoints</code></li>
+            <li><code>rank_endpoints</code></li>
+          </ul>
+          <button type="button" class="product-cta copy-button" id="mcp-copy"><svg class="icon" aria-hidden="true"><use href="#icon-copy"/></svg><span data-copy-label data-i18n="mcpCopy">Copy MCP config</span></button>
+          <small class="cloud-note" data-i18n="mcpNote">Install inferdiff-mcp before adding it to your client.</small>
+        </article>
         <article class="product-card product-cloud">
           <div class="product-top"><span class="product-icon"><svg class="icon" aria-hidden="true"><use href="#icon-cloud"/></svg></span><span class="product-tag" data-i18n="hosting">Hosted / Self-hosted</span></div>
           <h3>inferdiff Cloud</h3>
           <p data-i18n="cloudDescription">Check and compare relays from a browser.</p>
           <ul class="product-features cloud-features">
-            <li><span class="tier tier-free" data-i18n="free">Free</span><span data-i18n="freeFeatures">Instant Web Check and side-by-side Relay PK</span></li>
-            <li><span class="tier tier-pro" data-i18n="pro">Pro</span><span data-i18n="proFeatures">24/7 Watchdog with Feishu, Telegram, and WeChat alerts</span></li>
+            <li><span class="tier tier-free" data-i18n="free">Free</span><span data-i18n="freeFeatures">Web Check, Relay PK, Multi-Relay Ranker, and shareable links</span></li>
+            <li><span class="tier tier-pro" data-i18n="pro">Pro</span><span data-i18n="proFeatures">24/7 Watchdog, Feishu, Telegram, and WeChat alerts, and live SVG badges</span></li>
           </ul>
           <div class="cloud-actions">
             <a class="product-cta primary-cta" data-cloud="cloudCheckUrl" data-i18n="webCheck" role="link" aria-disabled="true">Web Check</a>

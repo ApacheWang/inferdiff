@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="Inspect streaming LLM API failures frame by frame with inferdiff, the zero-dependency contract verifier.">
+  <title>inferdiff | Streaming LLM contract verifier</title>
+  <script>
+    // Public launch URLs. Leave blank to display a disabled CTA.
+    const SITE_CONFIG = Object.freeze({
+      cloudCheckUrl: "",
+      relayPkUrl: "",
+      watchdogUrl: "",
+      selfHostUrl: "",
+      githubStars: 1 // Offline snapshot from GitHub
+    });
+  </script>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='10' fill='%23132a30'/%3E%3Cpath d='M7 20h7l6-10 7 20 5-10h3' fill='none' stroke='%235ee7ca' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="styles.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <svg class="icon-library" aria-hidden="true" width="0" height="0" xmlns="http://www.w3.org/2000/svg">
+    <symbol id="icon-wave" viewBox="0 0 24 24"><path d="M2 12h4l4-7 4 14 4-7h4"/></symbol>
+    <symbol id="icon-github" viewBox="0 0 24 24"><path fill="currentColor" stroke="none" d="M12 1.4a10.6 10.6 0 0 0-3.35 20.65c.53.1.72-.23.72-.51v-1.97c-2.95.64-3.57-1.25-3.57-1.25-.48-1.23-1.18-1.56-1.18-1.56-.96-.66.07-.65.07-.65 1.06.07 1.62 1.09 1.62 1.09.95 1.62 2.48 1.15 3.08.88.1-.69.37-1.15.67-1.41-2.36-.27-4.83-1.18-4.83-5.24 0-1.16.41-2.1 1.09-2.85-.11-.27-.47-1.35.1-2.82 0 0 .89-.29 2.92 1.09a10.13 10.13 0 0 1 5.32 0c2.03-1.38 2.91-1.09 2.91-1.09.58 1.47.22 2.55.11 2.82.67.75 1.08 1.69 1.08 2.85 0 4.07-2.48 4.97-4.85 5.23.38.33.72.97.72 1.96v2.92c0 .29.19.62.73.51A10.6 10.6 0 0 0 12 1.4Z"/></symbol>
+    <symbol id="icon-star" viewBox="0 0 24 24"><path d="m12 3 2.7 5.5 6.1.9-4.4 4.3 1 6.1-5.4-2.9-5.4 2.9 1-6.1-4.4-4.3 6.1-.9Z"/></symbol>
+    <symbol id="icon-package" viewBox="0 0 24 24"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9L12 3Zm0 9 8-4.5M12 12 4 7.5m8 4.5v9m4-11.3L8 5.2"/></symbol>
+    <symbol id="icon-bolt" viewBox="0 0 24 24"><path d="m13 2-8 12h6l-1 8 9-12h-6l1-8Z"/></symbol>
+    <symbol id="icon-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></symbol>
+    <symbol id="icon-terminal" viewBox="0 0 24 24"><path d="m5 7 5 5-5 5m8 0h6"/></symbol>
+    <symbol id="icon-cloud" viewBox="0 0 24 24"><path d="M7 18a4 4 0 1 1 .9-7.9 5 5 0 0 1 9.6.8 3.6 3.6 0 0 1-.1 7.1H7Z"/></symbol>
+    <symbol id="icon-check" viewBox="0 0 24 24"><path d="m5 12 4 4 10-10"/></symbol>
+  </svg>
+  <a class="skip-link" href="#main" data-i18n="skip">Skip to content</a>
+  <header class="site-header">
+    <div class="shell header-inner">
+      <a class="brand" href="#top" aria-label="inferdiff">
+        <span class="brand-mark"><svg class="icon" aria-hidden="true"><use href="#icon-wave"/></svg></span>
+        <span>inferdiff<span class="brand-period">.</span></span>
+      </a>
+      <nav class="site-nav" aria-label="Main navigation" data-i18n-aria="navLabel">
+        <a href="#replay" data-i18n="navReplay">Waterfall</a>
+        <a href="#probes" data-i18n="navProbes">Probes</a>
+        <a href="#cloud" data-i18n="navCloud">Cloud</a>
+      </nav>
+      <div class="header-actions">
+        <div class="language-toggle" role="group" aria-label="Language" data-i18n-aria="language">
+          <button type="button" data-language="en" lang="en" aria-pressed="true">EN</button>
+          <button type="button" data-language="zh" lang="zh-CN" aria-pressed="false">中文</button>
+        </div>
+        <a class="github-link" href="https://github.com/ApacheWang/inferdiff" aria-label="View on GitHub" data-i18n-aria="github"><svg class="icon" aria-hidden="true"><use href="#icon-github"/></svg></a>
+      </div>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="hero" id="top" aria-labelledby="hero-heading">
+      <div class="shell hero-shell">
+        <div class="hero-grid">
+          <div class="hero-copy">
+            <p class="eyebrow"><svg class="icon" aria-hidden="true"><use href="#icon-wave"/></svg><span data-i18n="heroLabel">Streaming LLM API contract verifier</span></p>
+            <h1 id="hero-heading"><span data-i18n="heroLineOne">See where your</span><span class="hero-accent" data-i18n="heroLineTwo">LLM stream breaks.</span></h1>
+            <p class="hero-description" data-i18n="heroDescription">Find truncated tool calls, buffered SSE, and other protocol failures hiding behind HTTP 200. Inspect the exact frame where the stream went wrong.</p>
+            <div class="badges" aria-label="Project details" data-i18n-aria="projectDetails">
+              <a class="badge" href="https://github.com/ApacheWang/inferdiff/stargazers"><svg class="icon badge-star" aria-hidden="true"><use href="#icon-star"/></svg><span data-i18n="stars">GitHub Stars</span><span class="badge-value" id="github-stars">1</span></a>
+              <a class="badge" href="https://pypi.org/project/inferdiff/0.1.1/"><svg class="icon badge-pypi" aria-hidden="true"><use href="#icon-package"/></svg><span>PyPI</span><span class="badge-value">0.1.1</span></a>
+              <span class="badge"><svg class="icon badge-deps" aria-hidden="true"><use href="#icon-bolt"/></svg><span data-i18n="zeroDeps">Zero-Deps</span></span>
+            </div>
+          </div>
+
+          <a class="hero-trace" href="#replay" data-replay-link="C1" aria-label="Inspect the C1 waterfall" data-i18n-aria="inspectC1">
+            <div class="trace-head">
+              <div><span class="trace-id">C1</span><strong data-i18n="failureSignature">Live breach</strong></div>
+              <span class="trace-http"><i></i>HTTP 200</span>
+            </div>
+            <div class="trace-lanes">
+              <div class="trace-lane">
+                <div class="trace-caption"><code>/v1/responses</code><span class="trace-breach">P0 <span data-i18n="breach">BREACH</span></span></div>
+                <div class="trace-plot">
+                  <svg viewBox="0 0 420 38" preserveAspectRatio="none" aria-hidden="true">
+                    <path class="plot-base" d="M0 20H420"/>
+                    <path class="plot-amber" d="M2 20H37l8-6 7 12 7-12 7 6h43"/>
+                    <path class="plot-violet" d="M109 20h28l9-9 9 18 9-18 9 9h29l9-9 9 18 9-18 9 9h43"/>
+                    <path class="plot-red" d="M281 20h57"/><path class="plot-red-faint" d="M338 7v26"/><circle class="plot-red-mark" cx="338" cy="20" r="4.5"/>
+                  </svg>
+                </div>
+                <div class="trace-result"><span class="trace-result-bad">status: "completed"</span><span data-i18n="doneMissing">arguments.done missing</span></div>
+              </div>
+              <div class="trace-lane">
+                <div class="trace-caption"><code>/v1/chat/completions</code><span class="trace-pass" data-i18n="pass">PASS</span></div>
+                <div class="trace-plot">
+                  <svg viewBox="0 0 420 38" preserveAspectRatio="none" aria-hidden="true">
+                    <path class="plot-base" d="M0 20H420"/>
+                    <path class="plot-amber" d="M2 20H25l8-6 7 12 7-12 7 6h29"/>
+                    <path class="plot-violet" d="M83 20h32l9-9 9 18 9-18 9 9h34l9-9 9 18 9-18 9 9h36"/>
+                    <path class="plot-green" d="M257 20h33"/><path class="plot-green-faint" d="M290 7v26"/><circle class="plot-green-mark" cx="290" cy="20" r="4.5"/>
+                  </svg>
+                </div>
+                <div class="trace-result"><span class="trace-result-good">finish_reason: "length"</span><span data-i18n="truncationReported">truncation reported</span></div>
+              </div>
+            </div>
+            <div class="trace-foot"><span><i></i><span data-i18n="openReplay">Open frame replay</span></span></div>
+          </a>
+        </div>
+
+        <div class="quickstart">
+          <span class="quickstart-label"><svg class="icon" aria-hidden="true"><use href="#icon-terminal"/></svg><span data-i18n="quickstart">Quickstart</span></span>
+          <code id="quick-command"><span class="command-exec">uvx inferdiff doctor</span> http://127.0.0.1:8080/v1 --model Qwen3-0.6B-Q8_0.gguf --profile full</code>
+          <button type="button" class="copy-button quick-copy" id="quick-copy"><svg class="icon" aria-hidden="true"><use href="#icon-copy"/></svg><span data-copy-label data-i18n="copy">Copy</span></button>
+        </div>
+      </div>
+    </section>
+
+    <section class="section shell" id="replay" aria-labelledby="replay-heading">
+      <div class="section-header">
+        <div>
+          <h2 id="replay-heading" data-i18n="replayHeading">Frame-level waterfall</h2>
+          <p data-i18n="replayIntro">Play a trace or step through it. Select any received frame to inspect its SSE payload.</p>
+        </div>
+        <span class="section-pill"><span></span><span data-i18n="localReplay">Offline replay</span></span>
+      </div>
+      <div id="replay-app"><noscript>Enable JavaScript to replay SSE frames. / 请启用 JavaScript 以回放 SSE 帧。</noscript></div>
+      <div class="live-run">
+        <div class="live-run-label"><span class="live-run-dot"></span><span><span data-i18n="liveRun">Reported live run</span><code>inferdiff v0.1.1</code></span></div>
+        <div class="live-run-system"><span>llama-server 1.1.0-dev</span><code>Qwen3-0.6B-Q8_0.gguf</code></div>
+        <dl class="live-run-stats">
+          <div><dt data-i18n="checksRan">Checks run</dt><dd>8/8</dd></div>
+          <div><dt data-i18n="elapsed">Elapsed</dt><dd>19.86 s</dd></div>
+          <div><dt data-i18n="skips">Skips</dt><dd>0</dd></div>
+        </dl>
+      </div>
+    </section>
+
+    <section class="section shell" id="probes" aria-labelledby="probes-heading">
+      <div class="section-header">
+        <div>
+          <h2 id="probes-heading" data-i18n="probesHeading">Probe matrix</h2>
+          <p data-i18n="probesIntro">Find the check for a silent failure and copy the command to investigate it.</p>
+        </div>
+      </div>
+      <div id="probe-filters"></div>
+      <div id="probe-grid"></div>
+    </section>
+
+    <section class="section shell cloud-section" id="cloud" aria-labelledby="cloud-heading">
+      <div class="section-header">
+        <div>
+          <h2 id="cloud-heading" data-i18n="cloudHeading">CLI or Cloud Watchdog</h2>
+          <p data-i18n="cloudIntro">Run a check on demand or watch your relay continuously.</p>
+        </div>
+      </div>
+      <div class="product-grid">
+        <article class="product-card">
+          <div class="product-top"><span class="product-icon"><svg class="icon" aria-hidden="true"><use href="#icon-terminal"/></svg></span><span class="product-tag">MIT</span></div>
+          <h3 data-i18n="cliTitle">Open-source CLI</h3>
+          <p><span data-i18n="cliDescription">Free to run locally and in CI with </span><code>uvx inferdiff</code><span data-i18n="sentenceEnd">.</span></p>
+          <ul class="product-features">
+            <li data-i18n="cliFeatureOne">Check a live endpoint with canary probes.</li>
+            <li data-i18n="cliFeatureTwo">Record SSE traces and compare them frame by frame.</li>
+            <li data-i18n="cliFeatureThree">Export an offline HTML waterfall for a regression report.</li>
+          </ul>
+          <a class="product-cta primary-cta" href="https://github.com/ApacheWang/inferdiff"><svg class="icon" aria-hidden="true"><use href="#icon-github"/></svg><span data-i18n="github">View on GitHub</span></a>
+        </article>
+        <article class="product-card product-cloud">
+          <div class="product-top"><span class="product-icon"><svg class="icon" aria-hidden="true"><use href="#icon-cloud"/></svg></span><span class="product-tag" data-i18n="hosting">Hosted / Self-hosted</span></div>
+          <h3>inferdiff Cloud</h3>
+          <p data-i18n="cloudDescription">Check and compare relays from a browser.</p>
+          <ul class="product-features cloud-features">
+            <li><span class="tier tier-free" data-i18n="free">Free</span><span data-i18n="freeFeatures">Instant Web Check and side-by-side Relay PK</span></li>
+            <li><span class="tier tier-pro" data-i18n="pro">Pro</span><span data-i18n="proFeatures">24/7 Watchdog with Feishu, Telegram, and WeChat alerts</span></li>
+          </ul>
+          <div class="cloud-actions">
+            <a class="product-cta primary-cta" data-cloud="cloudCheckUrl" data-i18n="webCheck" role="link" aria-disabled="true">Web Check</a>
+            <a class="product-cta" data-cloud="relayPkUrl" data-i18n="relayPk" role="link" aria-disabled="true">Relay PK</a>
+            <a class="product-cta" data-cloud="watchdogUrl" data-i18n="watchdog" role="link" aria-disabled="true">Watchdog</a>
+            <a class="product-cta" data-cloud="selfHostUrl" data-i18n="selfHost" role="link" aria-disabled="true">Self-host</a>
+          </div>
+          <small class="cloud-note" id="cloud-note" data-i18n="cloudNote">Cloud links are configurable in this showcase.</small>
+        </article>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="shell footer-inner">
+      <a class="brand" href="#top" aria-label="inferdiff"><span class="brand-mark"><svg class="icon" aria-hidden="true"><use href="#icon-wave"/></svg></span><span>inferdiff<span class="brand-period">.</span></span></a>
+      <span data-i18n="footerCopy">Streaming LLM contract verification</span>
+      <div><a href="https://github.com/ApacheWang/inferdiff">GitHub</a><a href="https://github.com/ApacheWang/inferdiff/blob/main/LICENSE" data-i18n="license">MIT License</a></div>
+    </div>
+  </footer>
+  <div class="sr-only" id="copy-status" role="status"></div>
+</body>
+</html>

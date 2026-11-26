@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from . import __version__
+from .badge import render_badge_svg
 from .canary import (
     PROBE_CATALOG,
     DoctorReport,
@@ -258,6 +259,31 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         if args.html:
             sys.stdout.write(f"Saved HTML waterfall report: {args.html}\n")
     return report.exit_code
+
+
+def _cmd_badge(args: argparse.Namespace) -> int:
+    try:
+        if args.summary != "-":
+            raw = Path(args.summary).read_text(encoding="utf-8")
+        elif hasattr(sys.stdin, "buffer"):
+            raw = sys.stdin.buffer.read().decode("utf-8")
+        else:
+            raw = sys.stdin.read()
+        summary = strict_json_loads(raw.removeprefix("\ufeff"))
+    except (OSError, RecursionError, ValueError):
+        raise ValueError("Badge input must be readable UTF-8 doctor summary JSON.") from None
+
+    svg = render_badge_svg(summary, label=args.label)
+    if args.out:
+        try:
+            protected = () if args.summary == "-" else (args.summary,)
+            _assert_distinct_output_path(args.out, protected)
+            _write_text_file(args.out, svg)
+        except (OSError, RuntimeError, ValueError):
+            raise ValueError("Could not write the SVG badge to a separate output file.") from None
+    else:
+        sys.stdout.write(svg)
+    return EXIT_OK
 
 
 def _cmd_watch(args: argparse.Namespace) -> int:
@@ -746,6 +772,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_doc.add_argument("--no-color", action="store_true")
     _add_ci_report_options(p_doc)
     p_doc.set_defaults(func=_cmd_doctor)
+
+    p_badge = sub.add_parser("badge", help="Render an offline SVG badge from a doctor summary")
+    p_badge.add_argument("summary", metavar="SUMMARY", help="Doctor summary JSON file or '-' for stdin")
+    p_badge.add_argument("--out", metavar="PATH", help="Write the badge to a file (default: stdout)")
+    p_badge.add_argument("--label", default="inferdiff", help="Public badge label (default: inferdiff)")
+    p_badge.set_defaults(func=_cmd_badge)
 
     p_watch = sub.add_parser("watch", help="Run canaries continuously and alert on health transitions")
     p_watch.add_argument("--base-url", required=True, help="Inference endpoint base URL")

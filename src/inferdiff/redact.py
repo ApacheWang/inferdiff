@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import urllib.parse
 from typing import Any, Dict, Mapping, Sequence, Tuple
@@ -83,6 +84,21 @@ _SECRET_VALUE_PATTERNS = (
     ),
 )
 
+_REPORT_URL_RE = re.compile(r"https?://[^\s<>\"'\\]+", re.IGNORECASE)
+_REPORT_HEADER_NAMES = "|".join(re.escape(name) for name in sorted(SENSITIVE_HEADER_NAMES))
+_REPORT_X_HEADER_NAMES = "|".join(re.escape(part) for part in _SENSITIVE_HEADER_SUBSTRINGS)
+_REPORT_HEADER_NAME = rf"(?:{_REPORT_HEADER_NAMES}|x-[\w-]*(?:{_REPORT_X_HEADER_NAMES})[\w-]*)"
+_REPORT_HEADER_RE = re.compile(
+    rf"(?i)(?<![\w-])({_REPORT_HEADER_NAME}[ \t]*[:=][ \t]*)[^\r\n]+"
+)
+_REPORT_QUOTED_HEADER_RE = re.compile(
+    rf"(?i)([\"'])(?P<name>{_REPORT_HEADER_NAME})\1[ \t]*:[ \t]*"
+    r"(\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')"
+)
+_REDACTED_QUERY_RE = re.compile(r"REDACTED_sha256:[a-f0-9]{8}\Z")
+_REDACTED_HEADER_RE = re.compile(r"(?:[\w-]+ )?\$REDACTED_sha256:[a-f0-9]{8}\Z")
+_PATH_CREDENTIAL_NAMES = {"key", "token", "sig", "signature", "bearer"}
+
 SAFE_REPRO_PROTOCOL_KEYS = frozenset(
     {
         "model",
@@ -155,11 +171,20 @@ def extract_header_secret_values(headers: Mapping[str, str], *, min_length: int 
         if not is_sensitive_header(k) or not isinstance(v, str):
             continue
         raw = v.strip()
+        if _REDACTED_HEADER_RE.fullmatch(raw):
+            continue
         if len(raw) >= min_length:
             secrets_out.append(raw)
         parts = raw.split(None, 1)
         if len(parts) == 2 and parts[0].lower() in RECOGNIZED_AUTH_SCHEMES and len(parts[1].strip()) >= min_length:
             secrets_out.append(parts[1].strip())
+        if k.lower() in {"cookie", "set-cookie"}:
+            cookies = raw.split(";") if k.lower() == "cookie" else [raw.split(";", 1)[0]]
+            for cookie in cookies:
+                _, _, value = cookie.partition("=")
+                value = value.strip().strip('"')
+                if len(value) >= min_length:
+                    secrets_out.append(value)
     return sorted(set(secrets_out), key=len, reverse=True)
 
 
@@ -167,6 +192,116 @@ def extract_query_secret_values(query: str) -> list[str]:
     """Return non-allowlisted query values that can be echoed by a target."""
     return [value for name, value in urllib.parse.parse_qsl(query)
             if len(value) >= 6 and name.lower() not in SAFE_EXPORT_QUERY_KEYS]
+
+
+def extract_url_secret_values(url: str) -> list[str]:
+    """Collect URL credentials that might be reflected outside the URL itself."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return []
+    bare_query = [part for part in parts.query.split("&") if part and "=" not in part]
+    _, path_secrets = _sanitize_url_path(parts.path)
+    return [urllib.parse.unquote(value) for value in (parts.username, parts.password, parts.fragment, *bare_query)
+            if value] + [
+        value for name, value in urllib.parse.parse_qsl(parts.query)
+        if name.lower() not in SAFE_EXPORT_QUERY_KEYS and not _REDACTED_QUERY_RE.fullmatch(value)
+    ] + path_secrets
+
+
+def _is_report_credential(key: str) -> bool:
+    name = key.lower()
+    return (name in SENSITIVE_HEADER_NAMES or name == "token" or bool(_SENSITIVE_BODY_KEY_RE.search(name))
+            or (name.startswith("x-") and is_sensitive_header(name)))
+
+
+def _sanitize_url_path(path: str) -> tuple[str, list[str]]:
+    segments = []
+    secrets = []
+    secret_next = False
+    for encoded in path.split("/"):
+        part = urllib.parse.unquote(encoded)
+        name, sep, value = part.partition("=") if "=" in part else part.partition("/")
+        credential = name.lower() in _PATH_CREDENTIAL_NAMES or _is_report_credential(name)
+        secret = part if secret_next else value if credential and sep else ""
+        if secret and not _REDACTED_QUERY_RE.fullmatch(secret):
+            secrets.append(secret)
+            prefix = name + sep if not secret_next else ""
+            cleaned = f"{prefix}REDACTED_sha256:{fingerprint8(secret)}"
+        else:
+            cleaned = redact_secret_text(part)
+        segments.append(encoded if cleaned == part else urllib.parse.quote(cleaned, safe=":@$=", errors="replace"))
+        secret_next = (not secret and credential and not sep) or (secret_next and not part)
+    return "/".join(segments), secrets
+
+
+def sanitize_url_path(path: str) -> str:
+    """Redact recognizable credentials in an endpoint path."""
+    return _sanitize_url_path(path)[0]
+
+
+def scrub_report_text(text: str, known_secrets: Sequence[str] = ()) -> str:
+    """Redact credentials and their common encodings in user-visible report fields."""
+    if not text:
+        return text
+
+    variants = {
+        variant for secret in known_secrets if secret for variant in (
+            secret, urllib.parse.quote(secret, safe="", errors="replace"), urllib.parse.quote(secret, errors="replace"),
+            urllib.parse.quote_plus(secret, errors="replace"), json.dumps(secret, ensure_ascii=True)[1:-1],
+        )
+    }
+    if variants:
+        alternatives = []
+        for value in sorted(variants, key=len, reverse=True):
+            literal = re.escape(value)
+            if len(value) < 4 and value.isalnum():
+                literal = rf"(?<!\w){literal}(?!\w)"
+            alternatives.append(literal)
+        pattern = re.compile("|".join(alternatives))
+        text = pattern.sub("[redacted]", text)
+        # Proxies may percent-encode characters that urllib.quote leaves unescaped.
+        decoded = urllib.parse.unquote(text)
+        if decoded != text:
+            clean_decoded = pattern.sub("[redacted]", decoded)
+            if clean_decoded != decoded:
+                text = clean_decoded
+
+    def clean_url(match: re.Match[str]) -> str:
+        try:
+            return sanitize_url_for_export(match.group())
+        except ValueError:
+            return "[redacted URL]"
+
+    def clean_quoted_header(match: re.Match[str]) -> str:
+        value = match.group(3)
+        return match.group()[:-len(value)] + f"{value[0]}[redacted]{value[0]}"
+
+    text = _REPORT_URL_RE.sub(clean_url, text)
+    text = _REPORT_QUOTED_HEADER_RE.sub(clean_quoted_header, text)
+    return redact_secret_text(_REPORT_HEADER_RE.sub(r"\1[redacted]", text))
+
+
+def scrub_report_data(value: Any, known_secrets: Sequence[str] = ()) -> Any:
+    """Scrub JSON report values and dynamic keys before encoding the document."""
+    # Short credentials can coincide with fixed schema keys such as 'id'.
+    key_secrets = [secret for secret in known_secrets if len(secret) >= 6]
+
+    def scrub(item: Any) -> Any:
+        if isinstance(item, dict):
+            clean = {}
+            for key, child in item.items():
+                key = str(key)
+                if _is_report_credential(key):
+                    if not isinstance(child, str) or not _REDACTED_HEADER_RE.fullmatch(child):
+                        child = "[redacted]"
+                clean[scrub_report_text(key, key_secrets)] = scrub(child)
+            return clean
+        if isinstance(item, (list, tuple)):
+            return [scrub(child) for child in item]
+        return scrub_report_text(item, known_secrets) if isinstance(item, str) else item
+
+    return scrub(value)
 
 
 def scrub_known_secrets(text: str, known_secrets: Sequence[str] = ()) -> str:
@@ -220,7 +355,7 @@ def sanitize_url_for_error(url: str) -> str:
     except ValueError:
         return "<invalid-url>"
     netloc = f"{host}:{port}" if port is not None else host
-    path = redact_secret_text(parsed.path or "/")
+    path = sanitize_url_path(parsed.path or "/")
     suffix = "?<redacted>" if parsed.query else ""
     return f"{parsed.scheme}://{netloc}{path}{suffix}"
 
@@ -237,13 +372,15 @@ def sanitize_url_for_export(url: str) -> str:
         host = f"[{host}]"
     port = parsed.port  # raises ValueError if invalid
     netloc = f"{host}:{port}" if port is not None else host
-    path = redact_secret_text(parsed.path or "/")
+    path = sanitize_url_path(parsed.path or "/")
 
     if parsed.query:
-        pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        # A query component without '=' may itself be a credential, with no public parameter name.
+        query_fields = [part if "=" in part else f"redacted={part}" for part in parsed.query.split("&") if part]
+        pairs = urllib.parse.parse_qsl("&".join(query_fields), keep_blank_values=True)
         safe_pairs = []
         for k, v in pairs:
-            if k.lower() in SAFE_EXPORT_QUERY_KEYS and not _looks_like_secret(v):
+            if _REDACTED_QUERY_RE.fullmatch(v) or (k.lower() in SAFE_EXPORT_QUERY_KEYS and not _looks_like_secret(v)):
                 safe_pairs.append((k, v))
             else:
                 safe_pairs.append((k, f"REDACTED_sha256:{fingerprint8(v)}"))
@@ -270,12 +407,17 @@ def _collect_sensitive_values(obj: Any, out: list[str]) -> None:
             _collect_sensitive_values(item, out)
 
 
+def extract_body_secret_values(body: Any) -> list[str]:
+    """Collect sensitive credential values from a structured request body."""
+    values: list[str] = []
+    _collect_sensitive_values(body, values)
+    return values
+
+
 def sanitize_body_for_export(obj: Any, *, key_name: str = "") -> Any:
     """Recursively redact sensitive fields, known secret values, and credential-shaped strings."""
-    known_secrets: list[str] = []
-    _collect_sensitive_values(obj, known_secrets)
     # Longest first to avoid partial overlap
-    known_secrets = sorted(set(known_secrets), key=len, reverse=True)
+    known_secrets = sorted(set(extract_body_secret_values(obj)), key=len, reverse=True)
 
     def _scrub_str(text: str) -> str:
         s = redact_secret_text(text)

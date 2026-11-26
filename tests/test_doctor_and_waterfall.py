@@ -218,7 +218,7 @@ def _start_api_mock(mode: str):
 
             if "01 through 25" in user_txt:  # C7
                 if mode in ("faulty_relay", "p1_only"):
-                    # Buffered fake streaming: 280ms wait (>=250ms anti-FP threshold) then dump all text in 1 frame!
+                    # Leave room for a Windows clock tick in the 96% TTFT ratio.
                     full_seq = ",".join(f"{i:02d}" for i in range(1, 26))
                     self._send_sse(
                         [
@@ -226,7 +226,7 @@ def _start_api_mock(mode: str):
                             'data: {"model":"qwen3-32b","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
                             "data: [DONE]\n\n",
                         ],
-                        delay_before_first=0.28,
+                        delay_before_first=0.6,
                     )
                 else:
                     # True incremental streaming across 5 frames

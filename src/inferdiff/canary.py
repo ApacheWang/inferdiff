@@ -21,9 +21,12 @@ from .detectors import D1, D2, D3, D4, Finding, audit_trace
 from .recorder import RecorderError, RecorderHTTPError, record_stream, validate_and_merge_headers, validate_url
 from .redact import (
     extract_header_secret_values,
+    extract_url_secret_values,
     sanitize_url_for_error,
     sanitize_url_for_export,
     scrub_known_secrets,
+    scrub_report_data,
+    scrub_report_text,
 )
 from .schema import (
     EXIT_OK,
@@ -60,9 +63,12 @@ C9_MAX_TOKENS = 32
 
 def _clean_display(text: Any, secrets_list: Sequence[str] = (), max_chars: int = 180) -> str:
     """Strip terminal control characters and scrub known/pattern secrets before display or JSON export."""
-    scrubbed = scrub_known_secrets(str(text), secrets_list)
+    return _bounded_display(scrub_report_text(str(text), secrets_list), max_chars)
+
+
+def _bounded_display(text: str, max_chars: int) -> str:
     out: List[str] = []
-    for ch in scrubbed:
+    for ch in text:
         code = ord(ch)
         if ch in ("\r", "\n", "\u0085", "\u2028", "\u2029"):
             out.append(" ")
@@ -229,7 +235,7 @@ def _build_url(parsed: urllib.parse.SplitResult, new_path: str) -> str:
 
 def _report_url(url: str, known_secrets: Sequence[str]) -> str:
     safe = sanitize_url_for_export(url)
-    display = scrub_known_secrets(safe, known_secrets)
+    display = scrub_report_text(safe, known_secrets)
     if display != safe:
         try:
             validate_url(display)
@@ -300,6 +306,9 @@ def resolve_endpoints_and_model(
     known_secrets: Sequence[str] = (),
 ) -> Tuple[str, Optional[str], str, str]:
     """Return (chat_url, responses_url, dialect, resolved_model) using safe parsed URL components."""
+    def request_model(value: str) -> str:
+        return _bounded_display(scrub_known_secrets(value, known_secrets), 128)
+
     parsed = validate_url(base_url)
     base_path = (parsed.path or "").rstrip("/")
     path_low = base_path.lower()
@@ -347,7 +356,7 @@ def resolve_endpoints_and_model(
         dialect = "openai-chat"
 
     if model and model.strip():
-        return chat_url, responses_url, dialect, _clean_display(model.strip(), known_secrets, 128)
+        return chat_url, responses_url, dialect, request_model(model.strip())
 
     st_models = 0
     st_tags = 0
@@ -358,7 +367,7 @@ def resolve_endpoints_and_model(
             ids = [str(item["id"]) for item in obj["data"] if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"]]
             picked = _pick_preferred_model(ids)
             if picked:
-                return chat_url, responses_url, dialect, _clean_display(picked, known_secrets, 128)
+                return chat_url, responses_url, dialect, request_model(picked)
 
     st_tags, obj_ol = _http_get_json(tags_url, headers, min(timeout, 15.0))
     if st_tags == 200 and isinstance(obj_ol, dict) and isinstance(obj_ol.get("models"), list):
@@ -366,7 +375,7 @@ def resolve_endpoints_and_model(
         picked = _pick_preferred_model(ids)
         if picked:
             ol_prefix = base_path[: -len("/api")] if path_low.endswith("/api") else (base_path[: -len("/v1")] if path_low.endswith("/v1") else base_path)
-            return _build_url(parsed, f"{ol_prefix}/api/chat"), None, "ollama-ndjson", _clean_display(picked, known_secrets, 128)
+            return _build_url(parsed, f"{ol_prefix}/api/chat"), None, "ollama-ndjson", request_model(picked)
 
     auth_hint = " and --api-key <KEY>" if (st_models in (401, 403) or st_tags in (401, 403)) else ""
     raise RecorderError(
@@ -1613,6 +1622,7 @@ def run_doctor(
         raise ValueError("--timeout must be a finite number greater than zero.")
     extra_headers = validate_and_merge_headers({}, headers)
     key = resolve_api_key(api_key)
+    url_secrets = extract_url_secret_values(base_url)
     if "C9" in probes:
         messages_url, models_url = _resolve_anthropic_urls(base_url)
         messages_headers = _doctor_headers(extra_headers, key, anthropic=True)
@@ -1620,7 +1630,7 @@ def run_doctor(
             messages_headers = validate_and_merge_headers(messages_headers, {
                 "anthropic-version": anthropic_version.strip() if anthropic_version else ANTHROPIC_VERSION,
             })
-        messages_secrets = extract_header_secret_values(messages_headers)
+        messages_secrets = extract_header_secret_values(messages_headers, min_length=1) + url_secrets
     if probes == ("C9",):
         chat_url, dialect, known_secrets = messages_url, "anthropic-messages", messages_secrets
         resolved_model = (model or "").strip()
@@ -1634,9 +1644,10 @@ def run_doctor(
         messages_model = resolved_model
     else:
         req_headers = _doctor_headers(extra_headers, key)
-        known_secrets = extract_header_secret_values(req_headers)
+        known_secrets = extract_header_secret_values(req_headers, min_length=1) + url_secrets
         chat_url, responses_url, dialect, resolved_model = resolve_endpoints_and_model(
-            base_url, model=model, headers=req_headers, timeout=timeout, known_secrets=known_secrets,
+            base_url, model=model, headers=req_headers, timeout=timeout,
+            known_secrets=extract_header_secret_values(req_headers),
         )
         messages_model = (model or "").strip() or resolved_model
 
@@ -1680,8 +1691,10 @@ def run_doctor(
         results=results,
     )
     if out_dir is not None:
+        all_secrets = known_secrets + messages_secrets if "C9" in probes else known_secrets
         (out_dir / "doctor_summary.json").write_text(
-            json.dumps(report.to_dict(), ensure_ascii=True, indent=2, allow_nan=False) + "\n",
+            json.dumps(scrub_report_data(report.to_dict(), all_secrets), ensure_ascii=True, indent=2,
+                       allow_nan=False) + "\n",
             encoding="utf-8",
             newline="\n",
         )

@@ -1,4 +1,4 @@
-"""Argparse CLI entrypoint for inferdiff (doctor, record, audit, diff, compare, export)."""
+"""Argparse CLI entrypoint for inferdiff."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import math
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from . import __version__
 from .canary import (
@@ -27,7 +27,7 @@ from .comparison import (
     render_comparison_terminal,
 )
 from .detectors import AUDIT_RULE_LIST, VALID_AUDIT_DETECTORS, audit_trace
-from .differ import diff_traces
+from .differ import DiffReport, diff_traces
 from .exporter import (
     render_audit_terminal,
     render_ci_summary,
@@ -35,19 +35,29 @@ from .exporter import (
     render_github_issue,
     sanitize_trace_for_json_export,
 )
+from .exporters import _ReportCase, audit_cases, canary_cases, comparison_cases, diff_cases, render_junit, render_sarif
 from .probes import CompositeBackendProbe, LinuxProcIoProbe, LmcacheMpProbe, MooncakeStoreProbe
 from .recorder import RecorderError, record_stream, validate_and_merge_headers, validate_url
-from .redact import extract_header_secret_values, extract_query_secret_values, sanitize_url_for_export
+from .redact import (
+    extract_body_secret_values,
+    extract_header_secret_values,
+    extract_url_secret_values,
+    sanitize_url_for_export,
+    scrub_report_data,
+    scrub_report_text,
+)
 from .schema import (
     EXIT_OK,
     EXIT_SEMANTIC_REGRESSION,
     EXIT_SILENT_PROTOCOL_BREACH,
     EXIT_USAGE_OR_IO_ERROR,
+    TraceDocument,
     TraceSchemaError,
     VALID_DIALECTS,
     load_trace,
     strict_json_loads,
 )
+from .watch import run_watch
 from .waterfall import render_audit_html, render_diff_html, render_doctor_html
 
 
@@ -79,6 +89,49 @@ def _write_text_file(path: str, content: str) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8", newline="\n")
+
+
+def _validate_output_paths(paths: Sequence[str | None], protected: Sequence[str | Path] = ()) -> None:
+    seen = set()
+    for path in paths:
+        if path:
+            _assert_distinct_output_path(path, protected)
+            key = _norm_path_key(path)
+            if key in seen:
+                raise ValueError("Use a distinct file for each report output.")
+            seen.add(key)
+
+
+def _render_json(payload: Any, known_secrets: Sequence[str], *, indent: int | None = None) -> str:
+    separators = (",", ":") if indent is None else None
+    return json.dumps(scrub_report_data(payload, known_secrets), ensure_ascii=True, indent=indent,
+                      separators=separators, allow_nan=False) + "\n"
+
+
+def _trace_report_secrets(doc: TraceDocument) -> list[str]:
+    request = doc.header.request
+    secrets = extract_url_secret_values(request.get("url") or "")
+    for metadata in (request, doc.header.response_meta):
+        for name in ("headers", "headers_redacted"):
+            headers = metadata.get(name)
+            if isinstance(headers, dict):
+                secrets.extend(extract_header_secret_values(headers, min_length=1))
+    return secrets + extract_body_secret_values(request.get("body"))
+
+
+def _live_report_secrets(url: str, headers: Mapping[str, str], api_key: str | None = None) -> list[str]:
+    secrets = extract_url_secret_values(url) + extract_header_secret_values(headers, min_length=1)
+    secrets.extend(key for key in (resolve_api_key(api_key), os.environ.get("OPENAI_API_KEY", "").strip(),
+                                   os.environ.get("ANTHROPIC_API_KEY", "").strip()) if key)
+    return secrets
+
+
+def _write_ci_reports(args: argparse.Namespace, cases: Sequence[_ReportCase], known_secrets: Sequence[str]) -> None:
+    sarif_path = getattr(args, "out_sarif", None)
+    if sarif_path:
+        _write_text_file(sarif_path, render_sarif(cases, known_secrets=known_secrets))
+    if args.out_junit:
+        _write_text_file(args.out_junit, render_junit(cases, known_secrets=known_secrets))
 
 
 def _parse_headers(raw_headers: Optional[Sequence[str]]) -> Dict[str, str]:
@@ -167,8 +220,10 @@ def _canary_selection(args: argparse.Namespace) -> Dict[str, Any]:
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
     headers = _parse_headers(args.header)
-    if args.html and args.save_dir:
-        _assert_distinct_output_path(args.html, [Path(args.save_dir) / "doctor_summary.json"])
+    paths = (args.html, args.out_sarif, args.out_junit)
+    protected = [Path(args.save_dir) / "doctor_summary.json"] if args.save_dir else []
+    _validate_output_paths(paths, protected)
+    known_secrets = _live_report_secrets(args.base_url, headers, args.api_key)
     report = run_doctor(
         base_url=args.base_url,
         model=args.model or None,
@@ -179,21 +234,36 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         strict=args.strict,
         **_canary_selection(args),
     )
+    evidence: list[str | Path] = [Path(report.save_dir) / "doctor_summary.json"] if report.save_dir else []
+    evidence.extend(path for result in report.results for path in result.trace_paths)
+    _validate_output_paths(paths, evidence)
     if args.html:
-        protected: List[str | Path] = []
-        if report.save_dir:
-            protected.append(Path(report.save_dir) / "doctor_summary.json")
-        for r in report.results:
-            protected.extend(r.trace_paths)
-        _assert_distinct_output_path(args.html, protected)
         _write_text_file(args.html, render_doctor_html(report))
+    if args.out_sarif or args.out_junit:
+        _write_ci_reports(args, canary_cases(report), known_secrets)
     if args.json:
-        sys.stdout.write(json.dumps(report.to_dict(), ensure_ascii=True, separators=(",", ":"), allow_nan=False) + "\n")
+        sys.stdout.write(_render_json(report.to_dict(), known_secrets))
     else:
         sys.stdout.write(render_doctor_terminal(report, no_color=args.no_color))
         if args.html:
             sys.stdout.write(f"Saved HTML waterfall report: {args.html}\n")
     return report.exit_code
+
+
+def _cmd_watch(args: argparse.Namespace) -> int:
+    try:
+        headers = _parse_headers(args.header)
+    except (RecorderError, ValueError):
+        raise ValueError("Invalid --header for watch. Use 'Name: value'.") from None
+    try:
+        return run_watch(
+            base_url=args.base_url, model=args.model or None, api_key=args.api_key, headers=headers,
+            timeout=args.timeout, interval=args.interval, max_runs=args.max_runs, cooldown=args.cooldown,
+            webhook_url=args.webhook_url, out_jsonl=args.out_jsonl, fail_on_breach=args.fail_on_breach,
+            **_canary_selection(args),
+        )
+    except OSError:
+        raise ValueError("Watch could not read or write local data.") from None
 
 
 _PROBE_OPTIONS = {
@@ -272,13 +342,15 @@ def _parse_only_detectors(raw_only: Optional[str]) -> Optional[set[str]]:
 
 def _cmd_audit(args: argparse.Namespace) -> int:
     only = _parse_only_detectors(args.only)
-    if args.html:
-        _assert_distinct_output_path(args.html, [args.trace_path])
+    _validate_output_paths((args.html, args.out_sarif, args.out_junit), [args.trace_path])
     doc = load_trace(args.trace_path)
     findings = audit_trace(doc, only=only)
     rc = _audit_exit_code(findings, strict=args.strict)
+    known_secrets = _trace_report_secrets(doc)
     if args.html:
         _write_text_file(args.html, render_audit_html(doc, findings))
+    if args.out_sarif or args.out_junit:
+        _write_ci_reports(args, audit_cases(doc, findings, only=only), known_secrets)
     if args.json:
         safe = sanitize_trace_for_json_export(doc, include_body=False, include_wire=False)
         payload = {
@@ -286,7 +358,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
             "findings": [f.to_dict() for f in findings],
             "exit_code": rc,
         }
-        sys.stdout.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":"), allow_nan=False) + "\n")
+        sys.stdout.write(_render_json(payload, known_secrets))
     else:
         sys.stdout.write(render_audit_terminal(doc, findings, no_color=args.no_color))
         if args.html:
@@ -295,8 +367,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
 
 
 def _cmd_diff(args: argparse.Namespace) -> int:
-    if args.html:
-        _assert_distinct_output_path(args.html, [args.before_trace, args.after_trace])
+    _validate_output_paths((args.html, args.out_sarif, args.out_junit), [args.before_trace, args.after_trace])
     before = load_trace(args.before_trace)
     after = load_trace(args.after_trace)
     report = diff_traces(
@@ -306,11 +377,20 @@ def _cmd_diff(args: argparse.Namespace) -> int:
         ttft_regress_pct=args.ttft_regress_pct,
         fail_on=args.fail_on,
     )
+    return _write_diff_outputs(args, before, after, report)
+
+
+def _write_diff_outputs(
+    args: argparse.Namespace, before: TraceDocument, after: TraceDocument, report: DiffReport,
+    known_secrets: Sequence[str] = (),
+) -> int:
+    secrets = [*known_secrets, *_trace_report_secrets(before), *_trace_report_secrets(after)]
     if args.html:
         _write_text_file(args.html, render_diff_html(before, after, report))
+    if getattr(args, "out_sarif", None) or args.out_junit:
+        _write_ci_reports(args, diff_cases(after, report, ignore_timing=args.ignore_timing), secrets)
     if args.json:
-        sys.stdout.write(json.dumps(report.to_dict(include_wire=False), ensure_ascii=True, separators=(",", ":"),
-                                    allow_nan=False) + "\n")
+        sys.stdout.write(_render_json(report.to_dict(include_wire=False), secrets))
     else:
         sys.stdout.write(render_diff_terminal(report, no_color=args.no_color))
         if args.html:
@@ -360,27 +440,17 @@ def _cmd_compare_canaries(args: argparse.Namespace) -> int:
         raise ValueError("Choose JSON or Markdown for stdout.")
 
     out_html = args.out_html or args.html
-    paths = [out_html, *(path for path in (args.out_json, args.out_md) if path != "-")]
-    outputs = [_norm_path_key(path) for path in paths if path]
-    if len(outputs) != len(set(outputs)):
-        raise ValueError("Use a distinct file for each comparison output.")
+    paths = [out_html, args.out_junit, *(path for path in (args.out_json, args.out_md) if path != "-")]
+    _validate_output_paths(paths)
     if not math.isfinite(args.ttft_regress_pct) or args.ttft_regress_pct < 0:
         raise ValueError("--ttft-regress-pct must be a finite nonnegative number.")
-    targets = (validate_url(args.a_url), validate_url(args.b_url))
+    validate_url(args.a_url)
+    validate_url(args.b_url)
     selection = _canary_selection(args)
     probes = select_doctor_probes(**selection)
     headers = _parse_headers(args.header)
-    known_secrets = extract_header_secret_values(headers, min_length=1)
-    for target in targets:
-        known_secrets.extend(extract_query_secret_values(target.query))
-    fallback_keys = []
-    if probes != ("C9",):
-        fallback_keys.append(os.environ.get("OPENAI_API_KEY", "").strip())
-    if "C9" in probes:
-        fallback_keys.append(os.environ.get("ANTHROPIC_API_KEY", "").strip())
-    for key in (resolve_api_key(args.a_key), resolve_api_key(args.b_key), *fallback_keys):
-        if key:
-            known_secrets.append(key)
+    known_secrets = _live_report_secrets(args.a_url, headers, args.a_key)
+    known_secrets.extend(_live_report_secrets(args.b_url, headers, args.b_key))
 
     a = _run_compare_target(args.a_url, args.a_model, args.a_key, headers=headers, timeout=args.timeout,
                             selection=selection, probes=probes)
@@ -392,8 +462,10 @@ def _cmd_compare_canaries(args: argparse.Namespace) -> int:
 
     if out_html:
         _write_text_file(out_html, render_comparison_html(report))
+    if args.out_junit:
+        _write_ci_reports(args, comparison_cases(report), known_secrets)
     if args.out_json or stdout_json:
-        payload = json.dumps(report.to_dict(), ensure_ascii=True, indent=2, allow_nan=False) + "\n"
+        payload = _render_json(report.to_dict(), known_secrets, indent=2)
         if args.out_json and args.out_json != "-":
             _write_text_file(args.out_json, payload)
         if stdout_json:
@@ -421,11 +493,10 @@ def _cmd_compare_replay(args: argparse.Namespace) -> int:
     save_dir = Path(args.save_dir) if args.save_dir else None
     b_out = (save_dir / "before.trace.jsonl") if save_dir else None
     a_out = (save_dir / "after.trace.jsonl") if save_dir else None
-    if args.html:
-        protected = [p for p in (b_out, a_out) if p is not None]
-        if args.request not in ("-", "@-"):
-            protected.append(args.request)
-        _assert_distinct_output_path(args.html, protected)
+    protected = [p for p in (b_out, a_out) if p is not None]
+    if args.request not in ("-", "@-"):
+        protected.append(args.request)
+    _validate_output_paths((args.html, args.out_junit), protected)
 
     shared_probe = _probe_config(args)
     before_config, after_config = _probe_config(args, "before_"), _probe_config(args, "after_")
@@ -463,16 +534,9 @@ def _cmd_compare_replay(args: argparse.Namespace) -> int:
         ttft_regress_pct=args.ttft_regress_pct,
         fail_on=args.fail_on or "p0",
     )
-    if args.html:
-        _write_text_file(args.html, render_diff_html(before, after, report))
-    if args.json:
-        sys.stdout.write(json.dumps(report.to_dict(include_wire=False), ensure_ascii=True, separators=(",", ":"),
-                                    allow_nan=False) + "\n")
-    else:
-        sys.stdout.write(render_diff_terminal(report, no_color=args.no_color))
-        if args.html:
-            sys.stdout.write(f"Saved HTML waterfall report: {args.html}\n")
-    return report.exit_code
+    known_secrets = _live_report_secrets(args.before_url, before_headers)
+    known_secrets.extend(_live_report_secrets(args.after_url, after_headers))
+    return _write_diff_outputs(args, before, after, report, known_secrets)
 
 
 def _cmd_export(args: argparse.Namespace) -> int:
@@ -499,8 +563,8 @@ def _cmd_export(args: argparse.Namespace) -> int:
         elif args.format == "html":
             rendered = render_diff_html(before, after, report, include_body=args.include_body, include_wire=args.include_wire)
         else:
-            rendered = json.dumps(report.to_dict(include_wire=args.include_wire), ensure_ascii=True, indent=2,
-                                  allow_nan=False) + "\n"
+            secrets = _trace_report_secrets(before) + _trace_report_secrets(after)
+            rendered = _render_json(report.to_dict(include_wire=args.include_wire), secrets, indent=2)
     else:
         findings = audit_trace(before)
         rc = _audit_exit_code(findings, strict=True)
@@ -523,19 +587,8 @@ def _cmd_export(args: argparse.Namespace) -> int:
                 include_body=args.include_body,
                 include_wire=args.include_wire,
             )
-            rendered = (
-                json.dumps(
-                    {
-                        **safe,
-                        "findings": [f.to_dict() for f in findings],
-                        "exit_code": rc,
-                    },
-                    ensure_ascii=True,
-                    indent=2,
-                    allow_nan=False,
-                )
-                + "\n"
-            )
+            rendered = _render_json({**safe, "findings": [f.to_dict() for f in findings], "exit_code": rc},
+                                    _trace_report_secrets(before), indent=2)
 
     if args.out:
         _write_text_file(args.out, rendered)
@@ -558,6 +611,12 @@ def _add_canary_options(parser: argparse.ArgumentParser | argparse._ArgumentGrou
     parser.add_argument("--anthropic-version", metavar="DATE", help="Anthropic version header (opts into C9 by default)")
 
 
+def _add_ci_report_options(parser: argparse.ArgumentParser, *, sarif: bool = True) -> None:
+    if sarif:
+        parser.add_argument("--out-sarif", metavar="PATH", help="Write a SARIF 2.1.0 report")
+    parser.add_argument("--out-junit", metavar="PATH", help="Write a JUnit XML report")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="inferdiff",
@@ -567,7 +626,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     # doctor (primary zero-setup entry point per Spec §2.1)
-    p_doc = sub.add_parser("doctor", help="Live C1..C9 streaming contract checks for engines and API relays")
+    p_doc = sub.add_parser("doctor", aliases=["canary"],
+                           help="Live C1..C9 streaming contract checks for engines and API relays")
     p_doc.add_argument("base_url", help="Target base URL (e.g. http://127.0.0.1:8080/v1 or https://api.example.com/v1)")
     p_doc.add_argument("--model", "-m", default="", help="Model ID (auto-discovers /models or /api/tags if omitted)")
     p_doc.add_argument("--api-key", default=None, help="API key or $ENV_VAR (default: OPENAI_API_KEY or ANTHROPIC_API_KEY)")
@@ -579,7 +639,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_doc.add_argument("--strict", action="store_true", help="Exit 3 on P1 warnings (P0 breaches always exit 2)")
     p_doc.add_argument("--json", action="store_true", help="Emit JSON canary matrix report")
     p_doc.add_argument("--no-color", action="store_true")
+    _add_ci_report_options(p_doc)
     p_doc.set_defaults(func=_cmd_doctor)
+
+    p_watch = sub.add_parser("watch", help="Run canaries continuously and alert on health transitions")
+    p_watch.add_argument("--base-url", required=True, help="Inference endpoint base URL")
+    p_watch.add_argument("--model", "-m", help="Model ID (auto-discovers if omitted)")
+    p_watch.add_argument("--api-key", help="API key or $ENV_VAR (default: OPENAI_API_KEY or ANTHROPIC_API_KEY)")
+    p_watch.add_argument("--header", "-H", action="append", default=[], help="Extra inference HTTP header (repeatable)")
+    _add_canary_options(p_watch)
+    p_watch.add_argument("--timeout", type=float, default=60.0, help="Per-probe socket timeout in seconds")
+    p_watch.add_argument("--interval", type=float, default=60.0, help="Seconds between cycle starts (default: 60)")
+    p_watch.add_argument("--max-runs", type=int, default=0, help="Stop after this many cycles (default: 0, unlimited)")
+    p_watch.add_argument("--cooldown", type=float, default=300.0, help="Seconds between repeated failure alerts (default: 300)")
+    p_watch.add_argument("--webhook-url", help="Optional generic JSON, Feishu, or Lark webhook URL")
+    p_watch.add_argument("--out-jsonl", metavar="PATH", help="Append a redacted summary for each cycle")
+    p_watch.add_argument("--fail-on-breach", action="store_true", help="Exit 2 if any cycle failed, even after recovery")
+    p_watch.set_defaults(func=_cmd_watch)
 
     # record
     p_rec = sub.add_parser("record", help="Record live streaming LLM request (or JSONL suite) to .trace.jsonl")
@@ -602,6 +678,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_aud.add_argument("--json", action="store_true", help="Emit sanitized JSON audit report")
     p_aud.add_argument("--strict", action="store_true", help="Treat P1 warnings as non-zero exit code 3")
     p_aud.add_argument("--no-color", action="store_true")
+    _add_ci_report_options(p_aud)
     p_aud.set_defaults(func=_cmd_audit)
 
     # diff
@@ -618,6 +695,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_diff.add_argument("--html", default="", help="Write dual-lane single-file HTML frame waterfall")
     p_diff.add_argument("--json", action="store_true")
     p_diff.add_argument("--no-color", action="store_true")
+    _add_ci_report_options(p_diff)
     p_diff.set_defaults(func=_cmd_diff)
 
     # compare
@@ -658,6 +736,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_cmp.add_argument("--html", default="", help="Write dual-lane single-file HTML frame waterfall")
     p_cmp.add_argument("--json", action="store_true")
     p_cmp.add_argument("--no-color", action="store_true")
+    _add_ci_report_options(p_cmp, sarif=False)
     _add_probe_options(p_cmp)
     _add_probe_options(p_cmp, "before")
     _add_probe_options(p_cmp, "after")
@@ -688,5 +767,5 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         return int(args.func(args))
     except (RecorderError, TraceSchemaError, ValueError, OSError, json.JSONDecodeError) as exc:
-        sys.stderr.write(f"inferdiff error: {exc}\n")
+        sys.stderr.write(f"inferdiff error: {scrub_report_text(str(exc))}\n")
         return EXIT_USAGE_OR_IO_ERROR

@@ -1,24 +1,23 @@
 [build-system]
-requires = ["setuptools>=68.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "inferdiff"
 version = "0.1.0"
-description = "Wire-level regression diff and silent-failure forensics CLI for LLM serving upgrades"
+description = "Wireshark for streaming LLMs: catch HTTP 200 silent truncations, broken tool JSON, fake SSE relays & usage drops."
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = []
 authors = [
     { name = "ApacheWang" },
 ]
-keywords = ["llm", "inference", "sse", "ndjson", "diff", "vllm", "llama-cpp", "sglang", "ollama", "testing"]
+keywords = ["llm", "inference", "sse", "streaming", "vllm", "llama-cpp", "sglang", "ollama", "litellm", "testing"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",

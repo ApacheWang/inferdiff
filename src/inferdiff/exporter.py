@@ -423,7 +423,7 @@ def render_github_issue(
                 lines.append(f"- Baseline #{d.before_seq}: {_safe_frame_summary(before, d.before_seq)}")
                 lines.append(f"+ Target   #{d.after_seq}: {_safe_frame_summary(after, d.after_seq)}")
             lines.append("```")
-        offline_cmd = _md_code_span(f"uvx inferdiff diff {q_before} {q_after} --fail-on p1")
+        offline_cmd = _md_code_span(f"inferdiff diff {q_before} {q_after} --fail-on p1")
         lines.append(f"Reproduce offline: {offline_cmd} (exits `{diff_report.exit_code}`).")
     else:
         findings = audit_findings or []
@@ -455,7 +455,7 @@ def render_github_issue(
                 else:
                     lines.append(f"Frame #{f0.frame_seq}: {_safe_frame_summary(before, f0.frame_seq)}")
             lines.append("```")
-        offline_cmd = _md_code_span(f"uvx inferdiff audit {q_before} --strict")
+        offline_cmd = _md_code_span(f"inferdiff audit {q_before} --strict")
         lines.append(f"Reproduce offline: {offline_cmd}.")
 
     return _enforce_line_budget(lines, MAX_ISSUE_LINES)

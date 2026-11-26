@@ -1,10 +1,17 @@
 # inferdiff
 
+[![CI](https://github.com/ApacheWang/inferdiff/actions/workflows/ci.yml/badge.svg)](https://github.com/ApacheWang/inferdiff/actions/workflows/ci.yml)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://github.com/ApacheWang/inferdiff)
+[![Zero Dependencies](https://img.shields.io/badge/dependencies-0%20(stdlib%20only)-2ea043)](https://github.com/ApacheWang/inferdiff/blob/main/pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/ApacheWang/inferdiff/blob/main/LICENSE)
+
 **Wireshark & protocol bill-checker for streaming LLM APIs.**
 
 Catch silent `HTTP 200 OK` failures — truncated tool JSON, ghost thinking starvation, buffered nonconformant SSE relays, and illusory benchmark speedups — with **zero third-party runtime dependencies** (Python 3.11+ standard library only).
 
-[中文文档 (README.zh-CN.md)](README.zh-CN.md)
+[中文文档 (README.zh-CN.md)](https://github.com/ApacheWang/inferdiff/blob/main/README.zh-CN.md)
+
+![inferdiff live relay doctor and GitHub Issue export demo](https://raw.githubusercontent.com/ApacheWang/inferdiff/main/assets/hero-demo.gif)
 
 ## Why `inferdiff`? (`HTTP 200 OK` != Your Stream Worked)
 
@@ -19,18 +26,22 @@ Standard uptime monitors and latency benchmarks only check HTTP status codes and
 
 ## Quickstart
 
-```bash
-# Install locally from source (Python 3.11+, zero third-party dependencies)
-pip install -e .
+Zero-install via [`uvx`](https://docs.astral.sh/uv/guides/tools/) directly from GitHub, or install locally with `pip` (Python 3.11+, zero runtime dependencies):
 
-# 1. Zero-setup live health check on a local engine (llama-server, vLLM, SGLang, Ollama)
-inferdiff doctor http://127.0.0.1:8080/v1 --html doctor.html
+```bash
+# 1. Zero-install live health check on a local engine (llama-server, vLLM, SGLang, Ollama)
+uvx --from git+https://github.com/ApacheWang/inferdiff inferdiff \
+  doctor http://127.0.0.1:8080/v1 --html doctor.html
 
 # 2. Audit an OpenAI-compatible relay API + generate shareable single-file HTML scorecard
-OPENAI_API_KEY=sk-... inferdiff doctor https://api.your-relay.example/v1 \
+OPENAI_API_KEY=sk-... uvx --from git+https://github.com/ApacheWang/inferdiff inferdiff \
+  doctor https://api.your-relay.example/v1 \
   --model qwen3-32b --profile relay --html relay-report.html
 
-# 3. Try offline immediately with bundled golden examples (no GPU or server needed)
+# 3. Or install once locally (or clone this repo to try bundled golden examples offline)
+pip install git+https://github.com/ApacheWang/inferdiff
+
+# Offline demo on bundled Case 1 (llama.cpp #30773, no GPU or server required)
 inferdiff diff \
   examples/case1_responses_truncated_tool/baseline.trace.jsonl \
   examples/case1_responses_truncated_tool/target.trace.jsonl \
@@ -43,6 +54,14 @@ inferdiff export \
 ```
 
 > **Auth note**: If neither `--api-key` nor `-H "Authorization: ..."` is passed, `inferdiff doctor` falls back to `OPENAI_API_KEY` from the environment and sends it to the target URL (use `https://` for production keys). Reflected secrets are scrubbed from terminal output, saved traces, JSON, and HTML exports.
+
+## Single-File Offline HTML Frame Waterfall
+
+Every `diff --html`, `audit --html`, `doctor --html`, and `export --format html` command produces a self-contained, airgap-safe HTML5 + inline SVG report strictly under `80 KiB` with zero external CDN requests:
+
+![inferdiff single-file HTML frame waterfall for llama.cpp #30773](https://raw.githubusercontent.com/ApacheWang/inferdiff/main/assets/case1-waterfall.png)
+
+> GitHub Markdown strips interactive SVG scripts; download [`case1-waterfall.html` from the `v0.1.0` Release](https://github.com/ApacheWang/inferdiff/releases/tag/v0.1.0) to hover frame timings, toggle Absolute ms / Normalized %, and click any lane segment offline.
 
 ## Canary Probe Matrix (`inferdiff doctor`)
 
@@ -94,9 +113,25 @@ inferdiff diff examples/case3_sglang_8_of_8000_short_gen/baseline.trace.jsonl \
 - Single-file HTML5 + inline SVG reports use a hash-locked CSP (`default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-...'; img-src data:;`) with zero external scripts, fonts, or stylesheets, and adaptive folding to stay strictly under `80 KiB`.
 - Shareable exports (`export --format github-issue|json|html`, `diff --html`, `audit --html`, `doctor --html`) omit arbitrary request bodies and raw wire payloads by default; pass `--include-body` or `--include-wire` to `export` only after reviewing your trace.
 
+## Positioning: How `inferdiff` Complements Existing Tools
+
+`inferdiff` is intentionally scoped as a **wire-level surgical knife** (`git diff` + protocol bill-checker for streaming frames), not an all-in-one evaluation or load-testing platform. Use it alongside — not instead of — established ecosystem tools:
+
+| Tool Category | Great Open-Source Options | Use Them When You Need To... | Use `inferdiff` When You Need To... |
+| :--- | :--- | :--- | :--- |
+| **Semantic & Agent Evals** | [promptfoo](https://github.com/promptfoo/promptfoo) | Grade prompt accuracy, RAG faithfulness, or red-team safety across models after responses are assembled. | Catch **wire-level silent corruption** under `HTTP 200 OK` (truncated tool JSON, missing `arguments.done`, `U+FFFD` chunk-split leaks) before SDKs even finish assembling text. |
+| **Load & Throughput Benchmarks** | [GuideLLM](https://github.com/vllm-project/guidellm), [LLMPerf](https://github.com/ray-project/llmperf) | Measure multi-concurrency QPS, latency percentiles, and capacity curves under sustained load. | Verify your benchmark isn't **measuring an illusion** (e.g., `8 / 8000` short generation on `ignore_eos`, empty handshake frames gaming TTFT, or unisolated prefix caches). |
+| **Broad Engine & Relay Suites** | [ddalcu/llmprobe](https://github.com/ddalcu/llmprobe), [lmspeed-audit](https://github.com/nexmoe/lmspeed-audit) | Run comprehensive Node.js capability scorecards (GPQA/AIME evals, surface coverage, or provider fingerprinting) using built-in test banks. | Run a **zero-dep Python CLI** inside GPU containers to **record & frame-diff your own failing production payloads** across `openai-chat`, `openai-responses`, `sglang-native`, and `ollama-ndjson`, and export a `<=25`-line upstream GitHub Issue. |
+| **Interactive Local Proxies** | [StreamLens](https://github.com/alexandrmotologa/streamlens), [ForkMind](https://github.com/Medhovarsh/forkmind) | Route local app traffic through a persistent reverse proxy and inspect conversations interactively in a Web UI. | Run **stateless CLI / CI regression gates** (`Exit 0/1/2/3`) and generate `<80 KiB` airgap-safe single-file HTML frame waterfalls without deploying a proxy. |
+
+### Explicit Non-Goals
+
+- **No LLM-as-a-Judge or capability leaderboards**: `inferdiff` never grades prose quality, math/coding intelligence, or jailbreak resistance. Every verdict is a deterministic function of raw wire bytes, JSON syntax trees, and monotonic frame timestamps.
+- **No heavy runtime stack**: Core CLI and HTML/SVG waterfall rendering stay 100% Python 3.11+ standard library (`0` mandatory `pip` packages, `0` Node.js runtime, `0` external CDN requests).
+
 ## Roadmap (v0.2: Non-Intrusive KV & Storage Probes)
 
-`inferdiff.trace.v1` and `inferdiff.probes.base.BackendProbe` already expose the three-point snapshot lifecycle (`T_pre -> T_ttft -> T_eof`) for optional v0.2 plugins (`LmcacheMpProbe`, `MooncakeStoreProbe`, `LinuxProcIoProbe`) and storage × inference rules `D6`–`D8`.
+`inferdiff.trace.v1` and `inferdiff.probes.base.BackendProbe` already expose the three-point snapshot lifecycle (`T_pre -> T_ttft -> T_eof`) for optional v0.2 plugins (`LmcacheMpProbe`, `MooncakeStoreProbe`, `LinuxProcIoProbe`) and storage x inference rules `D6`–`D8`.
 
 ## License
 

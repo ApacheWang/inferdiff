@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import hmac
 import http.client
 import http.server
 import ipaddress
@@ -25,6 +26,7 @@ from ._urls import RecorderError, validate_url
 from .detectors import Finding, audit_trace
 from .dialects import detect_dialect
 from .exporter import _md_code_span
+from .metrics import METRICS_PATH, PROMETHEUS_CONTENT_TYPE, ProxyMetrics
 from .recorder import (
     NDJSONFramer,
     SSEFramer,
@@ -248,7 +250,8 @@ class _Capture:
 
     def __init__(self, path: str, content_type: str, encoding: str, chunked: bool) -> None:
         self.media_type = content_type.partition(";")[0].strip().lower()
-        self.dialect = detect_dialect(path, content_type)
+        self.detected_dialect = detect_dialect(path, content_type, default="other")
+        self.dialect = "openai-chat" if self.detected_dialect == "other" else self.detected_dialect
         self.framer = None
         self.wire: list[WireChunk] = []
         self.streaming = self.media_type in _STREAM_TYPES
@@ -269,7 +272,7 @@ class _Capture:
             if self.media_type == "text/event-stream":
                 self.framer = SSEFramer()
             else:
-                self.dialect = "ollama-ndjson"
+                self.detected_dialect = self.dialect = "ollama-ndjson"
                 self.framer = NDJSONFramer()
 
     def feed(self, data: bytes, now: int) -> None:
@@ -408,6 +411,7 @@ class ProxyServer(http.server.ThreadingHTTPServer):
         self, address: tuple[str, int], upstream: SplitResult, *, save_dir: Path | None,
         only_breaches: bool, timeout: float, max_requests: int, no_color: bool, no_ui: bool = False,
         fallback: SplitResult | None = None, fallback_api_key: str | None = None,
+        no_metrics: bool = False, metrics_token: str | None = None,
     ) -> None:
         self.upstream = upstream
         self.fallback = fallback
@@ -427,6 +431,9 @@ class ProxyServer(http.server.ThreadingHTTPServer):
         self.active = 0
         self.recent_events: deque[dict] = deque(maxlen=_RECENT_EVENT_LIMIT)
         super().__init__(address, _ProxyHandler)
+        self.metrics_authorization = f"Bearer {metrics_token}".encode("ascii") if metrics_token is not None else None
+        loopback = ipaddress.ip_address(self.server_address[0]).is_loopback
+        self.metrics = ProxyMetrics() if not no_metrics and (loopback or self.metrics_authorization) else None
 
     def handle_error(self, request, client_address) -> None:
         # socketserver's default traceback can include upstream URLs or credentials.
@@ -450,8 +457,22 @@ class ProxyServer(http.server.ThreadingHTTPServer):
         with self.lock:
             self.failovers_total += 1
 
-    def complete(self, event: dict, streaming: bool, findings: list[Finding], line: str) -> None:
+    def update_active_streams(self, change: int) -> None:
+        if self.metrics is not None:
+            with self.lock:
+                self.metrics.active_streams += change
+
+    def render_metrics(self) -> bytes:
+        assert self.metrics is not None
         with self.lock:
+            return self.metrics.render(failovers_total=self.failovers_total)
+
+    def complete(
+        self, event: dict, streaming: bool, findings: list[Finding], line: str, *, dialect: str, upstream: str,
+    ) -> None:
+        with self.lock:
+            if self.metrics is not None:
+                self.metrics.record_request(dialect, upstream, streaming, findings, event["ttft_ms"])
             self.log(line)
             if self.ui_enabled:
                 event["p0_breaches"] = sum(f.severity == "P0" for f in findings)
@@ -513,15 +534,19 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
             return self._forward
         raise AttributeError(name)
 
-    def _local_response(self, status: int, data: bytes = b"", *, content_type: str = "application/json") -> None:
+    def _local_response(
+        self, status: int, data: bytes = b"", *, content_type: str = "application/json; charset=utf-8",
+    ) -> None:
         self.close_connection = True
         self.send_response_only(status)
         if status != 204:
-            self.send_header("Content-Type", f"{content_type}; charset=utf-8")
+            self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))
+        if status == 401:
+            self.send_header("WWW-Authenticate", "Bearer")
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
-        if content_type == "text/html":
+        if content_type.startswith("text/html;"):
             self.send_header("Content-Security-Policy", _DASHBOARD_CSP)
             self.send_header("X-Frame-Options", "DENY")
         self.send_header("Connection", "close")
@@ -550,12 +575,23 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
         return loopback and host_matches and "%" not in hostname and origin == f"http://{authority}"
 
     def _serve_local(self, path: str) -> None:
-        if self.server.ui_enabled:
+        if path == METRICS_PATH:
+            if self.command == "GET" and self.server.metrics is not None:
+                expected = self.server.metrics_authorization
+                authorization = self.headers.get_all("Authorization", [])
+                if expected is not None and (
+                    len(authorization) != 1 or not hmac.compare_digest(authorization[0].encode("latin-1"), expected)
+                ):
+                    self._local_response(401, b'{"error":"Unauthorized"}')
+                else:
+                    self._local_response(200, self.server.render_metrics(), content_type=PROMETHEUS_CONTENT_TYPE)
+                return
+        elif self.server.ui_enabled:
             if self.command == "GET":
                 if path in _UI_PAGES:
                     from .proxy_ui import DASHBOARD_HTML
 
-                    self._local_response(200, DASHBOARD_HTML, content_type="text/html")
+                    self._local_response(200, DASHBOARD_HTML, content_type="text/html; charset=utf-8")
                     return
                 if path == _UI_STATUS:
                     self._local_response(200, self.server.status())
@@ -579,7 +615,7 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
         # targets to a fixed upstream, so retain the original path from the request line.
         target = self.requestline.split()[1]
         path, query_sep, query = target.partition("?")
-        if path in _UI_ROUTES or path.startswith(_UI_EVENT_PREFIX):
+        if path == METRICS_PATH or path in _UI_ROUTES or path.startswith(_UI_EVENT_PREFIX):
             self._serve_local(path)
             return
         star = self.command == "OPTIONS" and target == "*"
@@ -666,6 +702,8 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
                     endpoint = upstream._replace(path="/" if star else upstream_path, query="").geturl()
                     capture = _Capture(upstream_path, response.getheader("Content-Type", ""),
                                        response.getheader("Content-Encoding", "").strip().lower(), response_chunked)
+                    if capture.streaming:
+                        self.server.update_active_streams(1)
                 downstream_chunked = has_body and response_length is None and self.request_version == "HTTP/1.1"
                 response_started = True
                 self._send_headers(response, response_length, downstream_chunked, has_body)
@@ -685,8 +723,12 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
             self._upstream_role = None
             if not clean:
                 self.close_connection = True
+            if capture is not None and capture.streaming:
+                self.server.update_active_streams(-1)
+            dialect = (capture.detected_dialect if capture is not None
+                       else detect_dialect(_upstream_path(upstream, path), default="other"))
             self._complete(capture, endpoint, path, status, start, header_time, clean, secrets, raw_body,
-                           failover_used, primary_failure_reason)
+                           failover_used, primary_failure_reason, dialect)
 
     def _read_request_body(self, chunked, length, raw_body):
         for data, clean in _body_chunks(self.rfile, chunked=chunked, length=length or 0):
@@ -754,12 +796,15 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.flush()
             finally:
                 # Retain the last bytes read if the client disconnected during the write.
+                was_streaming = capture.streaming
                 capture.feed(data, now)
+                if capture.streaming and not was_streaming:
+                    self.server.update_active_streams(1)
         return False
 
     def _complete(
         self, capture, endpoint, path, status, start, header_time, clean, secrets, raw_body,
-        failover_used, primary_failure_reason,
+        failover_used, primary_failure_reason, dialect,
     ) -> None:
         end = time.monotonic_ns()
         event = {"method": "[redacted]", "path": "[redacted]", "status": status, "ttft_ms": None,
@@ -814,7 +859,8 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
         except (ValueError, TypeError, OverflowError, RecursionError):
             line = "[CAPTURE ERROR] Could not audit request safely"
         finally:
-            self.server.complete(event, streaming, findings, line)
+            self.server.complete(event, streaming, findings, line, dialect=dialect,
+                                 upstream="fallback" if failover_used else "primary")
 
     def _summary_line(self, event: dict, findings: list[Finding], frames: int) -> str:
         subject = f"{event['method']} {event['path']}"
@@ -848,6 +894,7 @@ def create_proxy_server(
     upstream: str, *, host: str = "127.0.0.1", port: int = 8787, save_dir: str | Path | None = None,
     only_breaches: bool = False, timeout: float = 120, max_requests: int = 0, no_color: bool = False,
     no_ui: bool = False, fallback_url: str | None = None, fallback_api_key: str | None = None,
+    no_metrics: bool = False, metrics_token: str | None = None,
 ) -> ProxyServer:
     """Bind a proxy to an address. The caller owns the serving loop and cleanup."""
     target = _validate_upstream_url(upstream)
@@ -858,6 +905,10 @@ def create_proxy_server(
         if (not isinstance(fallback_api_key, str) or not fallback_api_key.strip()
                 or has_control_chars(fallback_api_key) or any(ord(char) > 255 for char in fallback_api_key)):
             raise RecorderError("Invalid fallback API key.")
+    if metrics_token is not None and (
+        not isinstance(metrics_token, str) or re.fullmatch(r"[!-~]+", metrics_token) is None
+    ):
+        raise RecorderError("Invalid --metrics-token. Use a nonempty ASCII token without whitespace.")
     if not 0 <= port <= 65535:
         raise RecorderError("Proxy port must be between 0 and 65535.")
     if not math.isfinite(timeout) or timeout <= 0:
@@ -873,6 +924,7 @@ def create_proxy_server(
     try:
         return ProxyServer((host, port), target, save_dir=directory, only_breaches=only_breaches,
                            timeout=timeout, max_requests=max_requests, no_color=no_color, no_ui=no_ui,
-                           fallback=fallback, fallback_api_key=fallback_api_key)
+                           fallback=fallback, fallback_api_key=fallback_api_key,
+                           no_metrics=no_metrics, metrics_token=metrics_token)
     except OSError:
         raise RecorderError("Could not bind proxy listener.") from None

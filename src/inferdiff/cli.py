@@ -296,6 +296,7 @@ def _cmd_watch(args: argparse.Namespace) -> int:
             base_url=args.base_url, model=args.model or None, api_key=args.api_key, headers=headers,
             timeout=args.timeout, interval=args.interval, max_runs=args.max_runs, cooldown=args.cooldown,
             webhook_url=args.webhook_url, out_jsonl=args.out_jsonl, fail_on_breach=args.fail_on_breach,
+            prom_out=args.prom_out, metrics_port=args.metrics_port,
             **_canary_selection(args),
         )
     except OSError:
@@ -333,11 +334,18 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
         fallback_api_key = resolve_api_key(raw_key)
     except ValueError:
         raise ValueError("Invalid --fallback-api-key or unavailable environment variable.") from None
+    metrics_token = args.metrics_token
+    if metrics_token is not None and metrics_token.startswith("env:"):
+        env_name = metrics_token.removeprefix("env:")
+        metrics_token = os.environ.get(env_name) if env_name and "=" not in env_name and "\0" not in env_name else None
+        if not metrics_token:
+            raise ValueError("--metrics-token environment variable is empty or unset.")
     with create_proxy_server(
         args.upstream, host=args.host, port=args.port, save_dir=args.save_dir,
         only_breaches=args.only_breaches, timeout=args.timeout, max_requests=args.max_requests,
         no_color=args.no_color, no_ui=args.no_ui,
         fallback_url=args.fallback_url, fallback_api_key=fallback_api_key,
+        no_metrics=args.no_metrics, metrics_token=metrics_token,
     ) as server:
         server.log(f"inferdiff proxy listening on port {server.server_port}")
         if server.ui_enabled:
@@ -752,6 +760,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_proxy.add_argument("--max-requests", type=int, default=0, help="Stop after this many proxied requests (default: unlimited)")
     p_proxy.add_argument("--no-color", action="store_true", help="Disable terminal colors")
     p_proxy.add_argument("--no-ui", action="store_true", help="Disable the dashboard and in-memory event history")
+    p_proxy.add_argument("--no-metrics", action="store_true",
+                         help="Disable /_inferdiff/metrics (enabled on loopback or with --metrics-token)")
+    p_proxy.add_argument("--metrics-token", help="Require a scrape Bearer token (literal token or env:NAME)")
     p_proxy.set_defaults(func=_cmd_proxy)
 
     # doctor (primary zero-setup entry point per Spec §2.1)
@@ -791,6 +802,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_watch.add_argument("--cooldown", type=float, default=300.0, help="Seconds between repeated failure alerts (default: 300)")
     p_watch.add_argument("--webhook-url", help="Optional generic JSON, Feishu, or Lark webhook URL")
     p_watch.add_argument("--out-jsonl", metavar="PATH", help="Append a redacted summary for each cycle")
+    p_watch.add_argument("--prom-out", metavar="PATH", help="Atomically replace a Prometheus .prom file after each cycle")
+    p_watch.add_argument("--metrics-port", type=int,
+                         help="Serve /metrics on a loopback HTTP port (0 for automatic)")
     p_watch.add_argument("--fail-on-breach", action="store_true", help="Exit 2 if any cycle failed, even after recovery")
     p_watch.set_defaults(func=_cmd_watch)
 

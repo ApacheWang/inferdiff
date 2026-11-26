@@ -1,0 +1,277 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus data source that scrapes inferdiff proxy or watch metrics.",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "id": null,
+  "uid": "inferdiff-observability",
+  "title": "inferdiff observability",
+  "description": "Streaming proxy performance, protocol findings, and scheduled canary health.",
+  "tags": ["inferdiff", "prometheus"],
+  "editable": true,
+  "schemaVersion": 39,
+  "version": 1,
+  "time": { "from": "now-6h", "to": "now" },
+  "refresh": "30s",
+  "timezone": "browser",
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Proxy time to first token",
+      "description": "Percentiles estimated from the cumulative TTFT histogram.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "fieldConfig": {
+        "defaults": { "unit": "ms", "min": 0 },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(inferdiff_proxy_ttft_ms_bucket[$__rate_interval])))",
+          "legendFormat": "p50",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(inferdiff_proxy_ttft_ms_bucket[$__rate_interval])))",
+          "legendFormat": "p95",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Proxy P0 breach rate",
+      "description": "P0 findings per minute across proxy instances. A request can yield multiple findings.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "fieldConfig": {
+        "defaults": { "unit": "suffix: findings/min", "min": 0 },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "60 * sum(rate(inferdiff_proxy_findings_total{severity=\"P0\"}[$__rate_interval]))",
+          "legendFormat": "P0 findings",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "bargauge",
+      "title": "Proxy findings by detector",
+      "description": "Estimated number of P0 and P1 findings from each detector over the selected time range.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 7 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "decimals": 0 },
+        "overrides": []
+      },
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "reduceOptions": { "values": false, "calcs": ["lastNotNull"], "fields": "" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (detector) (increase(inferdiff_proxy_findings_total{detector=~\"D[1-4]\"}[$__range]))",
+          "legendFormat": "{{detector}}",
+          "instant": true,
+          "range": false
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Proxy failovers",
+      "description": "Cumulative failovers since the currently scraped proxy processes started.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "x": 12, "y": 8, "w": 6, "h": 7 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "decimals": 0 },
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "none",
+        "reduceOptions": { "values": false, "calcs": ["lastNotNull"], "fields": "" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(inferdiff_proxy_failovers_total)",
+          "instant": true,
+          "range": false
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Active proxy streams",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "x": 18, "y": 8, "w": 6, "h": 7 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "decimals": 0 },
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "none",
+        "reduceOptions": { "values": false, "calcs": ["lastNotNull"], "fields": "" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(inferdiff_proxy_active_streams)",
+          "instant": true,
+          "range": false
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "gauge",
+      "title": "Watch uptime",
+      "description": "Percentage of scraped samples reporting a healthy cycle over the selected time range.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "x": 0, "y": 15, "w": 8, "h": 7 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "decimals": 1,
+          "color": { "mode": "fixed", "fixedColor": "blue" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showThresholdLabels": false,
+        "showThresholdMarkers": false,
+        "reduceOptions": { "values": false, "calcs": ["lastNotNull"], "fields": "" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 * avg_over_time(inferdiff_watch_up[$__range])",
+          "legendFormat": "{{job}} / {{instance}}",
+          "instant": true,
+          "range": false
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Watch grade score",
+      "description": "Numeric grade of the latest completed canary cycle.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "x": 8, "y": 15, "w": 8, "h": 7 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "max": 100, "decimals": 0 },
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "none",
+        "reduceOptions": { "values": false, "calcs": ["lastNotNull"], "fields": "" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "inferdiff_watch_grade_score",
+          "legendFormat": "{{job}} / {{instance}}",
+          "instant": true,
+          "range": false
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Time since last watch check",
+      "description": "Age of the last completed cycle. This increases when a watch process stops updating its textfile.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "x": 16, "y": 15, "w": 8, "h": 7 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "min": 0 },
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "none",
+        "reduceOptions": { "values": false, "calcs": ["lastNotNull"], "fields": "" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "time() - (inferdiff_watch_last_check_timestamp_seconds > 0)",
+          "legendFormat": "{{job}} / {{instance}}",
+          "instant": true,
+          "range": false
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Watch time to first token",
+      "description": "Median effective TTFT of measured streams from the latest canary cycle.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "x": 0, "y": 22, "w": 12, "h": 7 },
+      "fieldConfig": {
+        "defaults": { "unit": "ms", "min": 0 },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "inferdiff_watch_ttft_ms",
+          "legendFormat": "{{job}} / {{instance}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Watch probes and P0 breaches",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "x": 12, "y": 22, "w": 12, "h": 7 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "decimals": 0 },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "inferdiff_watch_probes_passed",
+          "legendFormat": "Passed · {{job}} / {{instance}}",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "expr": "inferdiff_watch_probes_total",
+          "legendFormat": "Total · {{job}} / {{instance}}",
+          "range": true
+        },
+        {
+          "refId": "C",
+          "expr": "inferdiff_watch_p0_breaches",
+          "legendFormat": "P0 breaches · {{job}} / {{instance}}",
+          "range": true
+        }
+      ]
+    }
+  ]
+}

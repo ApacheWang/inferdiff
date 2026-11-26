@@ -8,7 +8,7 @@ from ..schema import NormalizedDelta
 from . import anthropic_messages, gemini_sse, ollama_ndjson, openai_chat, openai_responses, sglang_native
 
 
-def detect_dialect(url_path: str, content_type: str = "") -> str:
+def detect_dialect(url_path: str, content_type: str = "", *, default: str = "openai-chat") -> str:
     """Infer dialect from URL path and Content-Type when --dialect=auto."""
     path = url_path.rstrip("/").lower()
     ct = content_type.split(";", 1)[0].strip().lower()
@@ -24,7 +24,7 @@ def detect_dialect(url_path: str, content_type: str = "") -> str:
         return "ollama-ndjson"
     if path.endswith("/generate"):
         return "sglang-native"
-    return "openai-chat"
+    return default
 
 
 def normalize_payload(

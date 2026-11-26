@@ -4,28 +4,101 @@ from __future__ import annotations
 
 import datetime
 import http.client
+import http.server
 import json
 import math
 import os
+import statistics
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import BinaryIO, ContextManager, Mapping, Sequence
+from typing import BinaryIO, ContextManager, Iterator, Mapping, Sequence
 
-from .canary import resolve_api_key, run_doctor, select_doctor_probes
+from .canary import DoctorReport, resolve_api_key, run_doctor, select_doctor_probes
+from .metrics import METRICS_PATH, PROMETHEUS_CONTENT_TYPE, render_watch_metrics, write_prometheus_textfile
 from .recorder import RecorderError, validate_and_merge_headers, validate_url
 from .schema import EXIT_OK, EXIT_SILENT_PROTOCOL_BREACH, strict_json_loads
 
 _CHECK_STATUSES = frozenset({"PASS", "FAIL", "WARN", "SKIP", "ERROR"})
 _UNHEALTHY = frozenset({"FAIL", "ERROR"})
+_GRADE_SCORES = {"A+": 100, "A": 90, "B": 80, "C": 70, "F": 0}
 
 
 class _NoWebhookRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+class _WatchMetricsServer(http.server.ThreadingHTTPServer):
+    snapshot: bytes
+
+    def handle_error(self, request, client_address) -> None:
+        pass
+
+
+class _WatchMetricsHandler(http.server.BaseHTTPRequestHandler):
+    server: _WatchMetricsServer
+    timeout = 5
+
+    def log_message(self, format, *args) -> None:
+        pass
+
+    def do_GET(self) -> None:
+        found = self.path.partition("?")[0] in {"/metrics", METRICS_PATH}
+        body = self.server.snapshot if found else b""
+        self.send_response_only(200 if found else 404)
+        if found:
+            self.send_header("Content-Type", PROMETHEUS_CONTENT_TYPE)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+
+@contextmanager
+def _serve_metrics(port: int | None, probes_total: int) -> Iterator[_WatchMetricsServer | None]:
+    if port is None:
+        yield None
+        return
+    try:
+        listener = _WatchMetricsServer(("127.0.0.1", port), _WatchMetricsHandler)
+    except OSError:
+        raise ValueError("Could not bind --metrics-port on loopback.") from None
+    with listener:
+        listener.snapshot = render_watch_metrics(
+            up=False, grade_score=0, probes_passed=0, probes_total=probes_total,
+            p0_breaches=0, ttft_ms=None, last_check_timestamp_seconds=0,
+        )
+        thread = threading.Thread(target=listener.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
+        thread.start()
+        try:
+            print(f"inferdiff watch metrics: http://127.0.0.1:{listener.server_port}/metrics", flush=True)
+            yield listener
+        finally:
+            listener.shutdown()
+            thread.join()
+
+
+def _watch_metrics(report: DoctorReport | None, checks: Mapping[str, str], *, healthy: bool,
+                   timestamp: datetime.datetime) -> bytes:
+    ttfts = []
+    if report is not None:
+        for result in report.results:
+            for trace in result.traces:
+                ttft = trace.summary.timing.get("ttft_effective_ms")
+                if ttft is not None and math.isfinite(ttft) and ttft >= 0:
+                    ttfts.append(ttft)
+    return render_watch_metrics(
+        up=healthy, grade_score=_GRADE_SCORES.get(report.grade, 0) if report is not None else 0,
+        probes_passed=sum(status == "PASS" for status in checks.values()), probes_total=len(checks),
+        p0_breaches=report.p0_count if report is not None else 0,
+        ttft_ms=statistics.median(ttfts) if ttfts else None, last_check_timestamp_seconds=timestamp.timestamp(),
+    )
 
 
 def _is_feishu(host: str) -> bool:
@@ -72,6 +145,17 @@ def _open_log(path: str | Path | None) -> ContextManager[BinaryIO | None]:
         raise OSError("Could not open --out-jsonl.") from None
 
 
+def _validate_output_paths(prom_out: str | Path, out_jsonl: str | Path) -> None:
+    try:
+        prom = Path(prom_out).resolve()
+        log = Path(out_jsonl).resolve()
+        same_file = prom == log or (prom.exists() and log.exists() and prom.samefile(log))
+    except (OSError, RuntimeError, ValueError):
+        raise ValueError("Could not validate --prom-out and --out-jsonl paths.") from None
+    if same_file:
+        raise ValueError("--prom-out and --out-jsonl must use distinct files.")
+
+
 def _wait_until(deadline: float) -> None:
     delay = deadline - time.monotonic()
     while delay > 0:
@@ -91,6 +175,8 @@ def run_watch(
     cooldown: float = 300.0,
     webhook_url: str | None = None,
     out_jsonl: str | Path | None = None,
+    prom_out: str | Path | None = None,
+    metrics_port: int | None = None,
     fail_on_breach: bool = False,
     profile: str = "quick",
     only: Sequence[str] | None = None,
@@ -106,6 +192,10 @@ def run_watch(
         raise ValueError("--timeout must be a finite number greater than zero.")
     if max_runs < 0:
         raise ValueError("--max-runs must be a nonnegative integer.")
+    if metrics_port is not None and not 0 <= metrics_port <= 65535:
+        raise ValueError("--metrics-port must be between 0 and 65535.")
+    if prom_out is not None and out_jsonl is not None:
+        _validate_output_paths(prom_out, out_jsonl)
     validate_url(base_url)
     try:
         resolve_api_key(api_key)
@@ -127,7 +217,7 @@ def run_watch(
     last_alert = None
     run = 0
     try:
-        with _open_log(out_jsonl) as log:
+        with _open_log(out_jsonl) as log, _serve_metrics(metrics_port, len(probes)) as metrics_server:
             prefix = b""
             if log is not None and log.seek(0, os.SEEK_END):
                 log.seek(-1, os.SEEK_END)
@@ -143,6 +233,7 @@ def run_watch(
                                         profile=profile, only=probes, protocol=protocol, anthropic_version=anthropic_version)
                     observed = {result.probe_id: result.status for result in report.results if result.status in _CHECK_STATUSES}
                 except RecorderError:
+                    report = None
                     observed = {}
                 except OverflowError:
                     raise ValueError("--timeout exceeds the platform socket timeout range.") from None
@@ -160,9 +251,10 @@ def run_watch(
                 unhealthy = bool(failed)
                 ever_unhealthy = ever_unhealthy or unhealthy
                 status = "FAIL" if unhealthy else "PASS"
+                timestamp = datetime.datetime.now(datetime.timezone.utc)
                 line = _json_line({
                     "run": run,
-                    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+                    "timestamp": timestamp.isoformat(timespec="seconds"),
                     "status": status,
                     "event": event,
                     "checks": checks,
@@ -174,6 +266,15 @@ def run_watch(
                     except OSError:
                         raise OSError("Could not write --out-jsonl.") from None
                     prefix = b""
+                if prom_out is not None or metrics_server is not None:
+                    metrics = _watch_metrics(report, checks, healthy=not unhealthy, timestamp=timestamp)
+                    if prom_out is not None:
+                        try:
+                            write_prometheus_textfile(prom_out, metrics)
+                        except (OSError, ValueError):
+                            raise ValueError("Could not write --prom-out.") from None
+                    if metrics_server is not None:
+                        metrics_server.snapshot = metrics
                 details = f" ({', '.join(failed)})" if failed else ""
                 text = f"inferdiff watch run {run} {event or status}{details}"
                 print(text, flush=True)

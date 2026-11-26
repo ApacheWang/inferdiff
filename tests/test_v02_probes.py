@@ -1,7 +1,10 @@
 """Integration and regression coverage for the v0.2 storage probes."""
 
+import base64
+import hashlib
 import io
 import json
+import re
 import socket
 import tempfile
 import threading
@@ -14,6 +17,7 @@ from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import urlsplit
 
+from inferdiff.canary import DoctorReport, ProbeResult
 from inferdiff.cli import main
 from inferdiff.detectors import audit_trace
 from inferdiff.differ import diff_traces
@@ -26,7 +30,7 @@ from inferdiff.probes.proc_io import LinuxProcIoProbe
 from inferdiff.probes.prom import counter_delta, parse_prometheus, sum_deltas
 from inferdiff.recorder import RecorderError, record_stream, validate_url
 from inferdiff.schema import TraceSchemaError, load_trace, write_trace
-from inferdiff.waterfall import render_audit_html, render_diff_html
+from inferdiff.waterfall import render_audit_html, render_diff_html, render_doctor_html
 
 
 MIB = 1024 * 1024
@@ -644,6 +648,78 @@ class TestStorageDetectors(unittest.TestCase):
             timing={**self.clean.summary.timing, "ttft_effective_ms": ttft},
         ))
 
+    def test_doctor_html_surfaces_storage_findings_and_probe_metrics(self):
+        warm = self.trace({
+            "lmcache_mp": {
+                "status": "ok", "delta_hit_l2_keys": 3, "delta_hit_l2_tokens": 96,
+                "delta_l2_prefetch_failures": {"l1_oom": 2},
+                "endpoint": "https://metrics.invalid/secret-path?key=private-key",
+            },
+            "mooncake": {"master_ready": False, "master_status": "ok", "client_status": "degraded_503",
+                         "delta_quota_rejects": 4},
+            "proc_io": {"status": "ok", "comm": "local-process-name",
+                        "prefill_window": {"delta_rchar_bytes": 32 * MIB, "delta_read_bytes": 0}},
+        })
+        fragmented = self.trace({
+            "mooncake": {"client_status": "ok", "client_deltas": {"mooncake_ssd_read_bytes_total": 16 * MIB}},
+            "proc_io": {"status": "ok", "prefill_window": {
+                "delta_read_bytes": 16 * MIB, "delta_syscr": 2048, "avg_syscall_read_kb": 8,
+                "delta_write_bytes_net": -1024,
+            }},
+        })
+        findings = storage_findings(warm) + storage_findings(fragmented)
+        self.assertEqual([f.detector_id for f in findings], ["D6", "D7", "D8"])
+        result = ProbeResult(
+            "C7", "FAKE_STREAMING_BUFFER", "P1", "WARN", "Storage findings", 100, 6, None, "",
+            findings=findings, traces=[warm, fragmented],
+        )
+        report = DoctorReport(
+            "https://example.invalid/v1", "https://example.invalid/v1/chat/completions", "openai-chat",
+            "m", "quick", "B", 0, 0, 1, 0, None, None, [result],
+        )
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "doctor.html"
+            with patch("inferdiff.cli.run_doctor", return_value=report), redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["doctor", report.target_url, "--html", str(path)]), 0)
+            rendered = path.read_text(encoding="utf-8")
+        for detector in ("D6", "D7", "D8"):
+            self.assertIn(f'<span class="badge b-amb">{detector} P1</span>', rendered)
+        for source in ("LMCache MP", "Mooncake Store", "Linux proc_io"):
+            self.assertIn(source, rendered)
+        for label, value in (
+            ("L2 hits (keys)", "3"), ("L2 hits (tokens)", "96"), ("L2 prefetch failures (l1_oom)", "2"),
+            ("Quota rejects", "4"), ("Logical reads (rchar)", "32 MiB"), ("Physical reads (read_bytes)", "0 B"),
+            ("SSD read bytes", "16 MiB"), ("Read syscalls (syscr)", "2,048"), ("Average read size", "8 KiB"),
+            ("Net writes", "-1 KiB"),
+        ):
+            self.assertIn(f"<dt>{label}</dt><dd>{value}</dd>", rendered)
+        self.assertIn('<span class="badge b-amb">Master not ready</span>', rendered)
+        self.assertIn('<span class="badge b-amb">Client HTTP 503</span>', rendered)
+        self.assertNotIn("private-key", rendered)
+        self.assertNotIn("secret-path", rendered)
+        self.assertNotIn("local-process-name", rendered)
+        self.assertLess(len(rendered.encode("utf-8")), 80 * 1024)
+
+    def test_doctor_html_embeds_hash_locked_assets_without_external_dependencies(self):
+        result = ProbeResult("C7", "FAKE_STREAMING_BUFFER", "P1", "PASS", "Streaming", 100, 3, None,
+                             "https://github.com/BerriAI/litellm/issues/5803", traces=[self.clean])
+        rendered = render_doctor_html(DoctorReport(
+            "https://example.invalid/v1", "https://example.invalid/v1/chat/completions", "openai-chat",
+            "m", "quick", "A+", 0, 0, 0, 0, None, None, [result],
+        ))
+        self.assertIn("default-src 'none'", rendered)
+        self.assertIn("connect-src 'none'", rendered)
+        for tag in ("script", "style"):
+            (body,) = re.findall(rf"<{tag}>(.*?)</{tag}>", rendered, re.DOTALL)
+            digest = base64.b64encode(hashlib.sha256(body.encode("utf-8")).digest()).decode("ascii")
+            self.assertIn(f"{tag}-src 'sha256-{digest}'", rendered)
+        self.assertNotIn("'unsafe-inline'", rendered)
+        self.assertNotIn("'unsafe-eval'", rendered)
+        self.assertNotRegex(rendered, r"<(?:script|img|link|iframe)\b[^>]*\b(?:src|href)\s*=")
+        self.assertNotRegex(rendered, r"\bstyle\s*=")
+        self.assertNotIn("@import", rendered)
+        self.assertLess(len(rendered.encode("utf-8")), 80 * 1024)
+
     def test_probe_schema_and_strict_json_export(self):
         probe = {
             "sources": ["lmcache_mp", "mooncake", "secret-source"],
@@ -850,3 +926,18 @@ class TestStorageDetectors(unittest.TestCase):
             self.assertNotIn(payload, rendered)
             self.assertLess(len(rendered.encode("utf-8")), 80 * 1024)
         self.assertIn("D6, D7, D8", diff_html)
+
+    def test_diff_waterfall_labels_probe_metrics_from_either_trace(self):
+        baseline = self.trace({"lmcache_mp": {"status": "ok", "delta_hit_l2_keys": 9}})
+        target = self.trace({"mooncake": {"client_status": "ok", "delta_quota_rejects": 2}})
+        for before, after, omit in ((baseline, target, None), (baseline, self.clean, "Target")):
+            with self.subTest(omit=omit):
+                rendered = render_diff_html(before, after, diff_traces(before, after))
+                self.assertIn('<h3>Baseline</h3>', rendered)
+                self.assertIn('<dt>L2 hits (keys)</dt><dd>9</dd>', rendered)
+                if omit:
+                    self.assertNotIn('<h3>Target</h3>', rendered)
+                else:
+                    self.assertIn('<h3>Target</h3>', rendered)
+                    self.assertIn('<dt>Quota rejects</dt><dd>2</dd>', rendered)
+                self.assertLess(len(rendered.encode("utf-8")), 80 * 1024)

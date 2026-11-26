@@ -9,7 +9,7 @@ import urllib.parse
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import __version__
-from .canary import DoctorReport
+from .canary import DoctorReport, ProbeResult
 from .detectors import D6, D7, D8, Finding
 from .differ import DiffReport
 from .exporter import _safe_frame_summary, _sanitized_curl_lines, _strip_controls_and_newlines
@@ -29,6 +29,8 @@ APPROVED_ANCHOR_HOSTS = frozenset(
         "docs.ollama.com",
         "docs.lmcache.ai",
         "developers.openai.com",
+        "platform.claude.com",
+        "ai.google.dev",
     }
 )
 
@@ -82,7 +84,7 @@ def _safe_anchor(url: str, label: str = "anchor") -> str:
     try:
         p = urllib.parse.urlsplit(url)
         if p.scheme == "https" and (p.hostname or "").lower() in APPROVED_ANCHOR_HOSTS:
-            return f'<a href="{_esc(url, 200)}" style="color:#93c5fd" rel="noreferrer noopener">{_esc(label)}</a>'
+            return f'<a href="{_esc(url, 200)}" rel="noreferrer noopener">{_esc(label)}</a>'
     except ValueError:
         pass
     return _esc(label)
@@ -382,52 +384,191 @@ def _kpi_card(title: str, value: str, sub: str, accent: str = "") -> str:
     )
 
 
-def _probe_metric(value: Any, *, size: bool = False) -> str:
-    if not is_finite_number(value) or value < 0:
-        return "n/a"
-    if size:
-        if value >= 1024 * 1024:
+def _probe_metric(value: Any, unit: str = "", *, signed: bool = False) -> str:
+    if not is_finite_number(value) or (not signed and value < 0):
+        return ""
+    if unit == "bytes":
+        if abs(value) >= 1024 * 1024:
             return f"{value / (1024 * 1024):.3g} MiB"
-        if value >= 1024:
+        if abs(value) >= 1024:
             return f"{value / 1024:.3g} KiB"
         return f"{value:.3g} B"
-    return f"{value:.4g}"
+    formatted = f"{value:,}" if isinstance(value, int) else f"{value:.4g}"
+    return f"{formatted} {unit}" if unit else formatted
 
 
-def _backend_probe_kpi(doc: TraceDocument, findings: List[Finding]) -> str:
+_STORAGE_DETECTORS = {
+    D6: "Page-cache warming",
+    D7: "Cache delivery failures",
+    D8: "Fragmented reads or storage-backed TTFT regression",
+}
+_SEVERITY_BADGES = {"P0": "b-red", "P1": "b-amb", "P2": "b-slt"}
+_PROBE_STATUS_BADGES = {
+    "ok": ("b-grn", "Sampled"),
+    "incomplete": ("b-amb", "Incomplete sample"),
+    "unavailable": ("b-slt", "Unavailable"),
+    "unavailable_push_or_cold": ("b-slt", "Unavailable (push mode or cold)"),
+    "degraded_503": ("b-amb", "HTTP 503"),
+    "skipped_permission": ("b-slt", "Permission denied"),
+    "skipped_unavailable": ("b-slt", "Unavailable"),
+    "process_changed": ("b-amb", "Process changed"),
+    "ttft_not_observed": ("b-slt", "TTFT not observed"),
+    "ttft_unavailable": ("b-slt", "TTFT sample unavailable"),
+    "probe_error": ("b-red", "Probe error"),
+}
+_PROTOCOL_METRICS = {
+    "C9": ("Anthropic Messages SSE · /v1/messages", "stop_reason", "stop_reason", (
+        ("Output tokens", "output_tokens"), ("Output token limit", "max_tokens"),
+    )),
+    "C10": ("Gemini SSE · streamGenerateContent", "finishReason", "finish_reason", (
+        ("Prompt tokens", "prompt_tokens"), ("Candidate tokens", "candidate_tokens"),
+        ("Thinking tokens", "thoughts_tokens"), ("Total tokens", "total_tokens"),
+        ("Output token limit", "max_output_tokens"),
+    )),
+}
+
+
+def _badge(label: str, color: str) -> str:
+    return f'<span class="badge {color}">{_esc(label, 54)}</span>'
+
+
+def _sample_badge(status: Any, plane: str = "") -> str:
+    key = status if isinstance(status, str) else ""
+    color, label = _PROBE_STATUS_BADGES.get(key, ("b-slt", "Status not reported"))
+    return _badge(f"{plane} {label}" if plane else label, color)
+
+
+def _probe_section(bp: dict[str, Any], source: str) -> dict[str, Any]:
+    section = bp.get(source)
+    return section if isinstance(section, dict) else {}
+
+
+def _metric_list(metrics: Sequence[tuple[str, str]]) -> str:
+    rows = "".join(
+        f"<div><dt>{_esc(label)}</dt><dd>{_esc(value, 48)}</dd></div>" for label, value in metrics if value
+    )
+    return f'<dl class="metrics">{rows}</dl>' if rows else ""
+
+
+def _probe_card(title: str, badges: Sequence[str], metrics: Sequence[tuple[str, str]]) -> str:
+    return (
+        f'<div class="probe-card"><h4>{title}</h4><div class="badges">{"".join(badges)}</div>'
+        f'{_metric_list(metrics) or "<p>No counters reported</p>"}</div>'
+    )
+
+
+def _backend_probe_cards(bp: dict[str, Any]) -> str:
+    """Render known counters and states, without endpoints, PIDs, or arbitrary scrape labels."""
+    cards = []
+    if lmcache := _probe_section(bp, "lmcache_mp"):
+        failures = _probe_section(lmcache, "delta_l2_prefetch_failures")
+        metrics = [(label, _probe_metric(lmcache.get(key))) for label, key in (
+            ("L2 hits (keys)", "delta_hit_l2_keys"), ("L2 hits (tokens)", "delta_hit_l2_tokens"),
+            ("L2 loads completed", "delta_l2_load_completed"), ("L1 read failures", "delta_l1_read_failures"),
+        )]
+        drops = [lmcache.get(key) for key in ("delta_event_bus_dropped", "event_bus_dropped")]
+        metrics.append(("Event bus drops", _probe_metric(max((v for v in drops if is_finite_number(v)), default=None))))
+        metrics.extend(
+            (f"L2 prefetch failures ({reason})", _probe_metric(failures.get(reason)))
+            for reason in ("l1_oom", "not_found", "serde_failure", "unknown")
+        )
+        cards.append(_probe_card("LMCache MP", [_sample_badge(lmcache.get("status"))], metrics))
+
+    if mooncake := _probe_section(bp, "mooncake"):
+        badges = []
+        if "master_status" in mooncake:
+            badges.append(_sample_badge(mooncake["master_status"], "Master"))
+        if isinstance(ready := mooncake.get("master_ready"), bool):
+            badges.append(_badge("Master ready" if ready else "Master not ready", "b-grn" if ready else "b-amb"))
+        if "client_status" in mooncake:
+            badges.append(_sample_badge(mooncake["client_status"], "Client"))
+        if "status" in mooncake or not badges:
+            badges.append(_sample_badge(mooncake.get("status")))
+        client = _probe_section(mooncake, "client_deltas")
+        metrics = [
+            ("Quota rejects", _probe_metric(mooncake.get("delta_quota_rejects"))),
+            ("Evicted bytes", _probe_metric(mooncake.get("delta_evict_bytes"), "bytes")),
+        ]
+        for label, key, unit in (
+            ("SSD read bytes", "mooncake_ssd_read_bytes", "bytes"),
+            ("SSD read operations", "mooncake_ssd_read_ops", ""),
+            ("Offload read bytes", "mooncake_offload_read_bytes", "bytes"),
+            ("Offload read operations", "mooncake_offload_read_ops", ""),
+            ("Offload read requests", "mooncake_offload_read_requests", ""),
+        ):
+            metrics.append((label, _probe_metric(client.get(f"{key}_total", client.get(key)), unit)))
+        cards.append(_probe_card("Mooncake Store", badges, metrics))
+
+    if proc_io := _probe_section(bp, "proc_io"):
+        prefill = _probe_section(proc_io, "prefill_window")
+        full = _probe_section(proc_io, "full_window")
+        status = proc_io.get("status")
+        badges = [_sample_badge(status)]
+        if prefill.get("status") and prefill["status"] != status:
+            badges.append(_sample_badge(prefill["status"], "Prefill"))
+        metrics = [
+            ("Logical reads (rchar)", _probe_metric(prefill.get("delta_rchar_bytes"), "bytes")),
+            ("Physical reads (read_bytes)", _probe_metric(prefill.get("delta_read_bytes"), "bytes")),
+            ("Read syscalls (syscr)", _probe_metric(prefill.get("delta_syscr"))),
+            ("Average read size", _probe_metric(prefill.get("avg_syscall_read_kb"), "KiB")),
+            ("Net writes", _probe_metric(prefill.get("delta_write_bytes_net"), "bytes", signed=True)),
+            ("Total logical reads", _probe_metric(full.get("delta_rchar_bytes_total"), "bytes")),
+            ("Total physical reads", _probe_metric(full.get("delta_read_bytes_total"), "bytes")),
+            ("Total net writes", _probe_metric(full.get("delta_write_bytes_net"), "bytes", signed=True)),
+        ]
+        cards.append(_probe_card("Linux proc_io", badges, metrics))
+    return f'<div class="probe-cards">{"".join(cards)}</div>' if cards else ""
+
+
+def _storage_findings_html(findings: Sequence[Finding]) -> str:
+    storage = [finding for finding in findings if finding.detector_id in _STORAGE_DETECTORS]
+    if not storage:
+        return ""
+    rows = []
+    for finding in storage[:MAX_FINDING_ROWS]:
+        badge = _badge(f"{finding.detector_id} {finding.severity}", _SEVERITY_BADGES.get(finding.severity, "b-slt"))
+        ttft = ""
+        if finding.detector_id == D8:
+            ttft = _metric_list([
+                ("Baseline effective TTFT", _probe_metric(finding.evidence.get("before_ttft_effective_ms"), "ms")),
+                ("Target effective TTFT", _probe_metric(finding.evidence.get("after_ttft_effective_ms"), "ms")),
+            ])
+        rows.append(
+            f'<li>{badge} <strong>{_STORAGE_DETECTORS[finding.detector_id]}</strong> '
+            f'{_esc(scrub_report_text(finding.message), 260)}{ttft}</li>'
+        )
+    return f'<ul class="storage-findings">{"".join(rows)}</ul>'
+
+
+def _storage_section_html(content: str) -> str:
+    if not content:
+        return ""
+    return f'<section class="sec"><div class="sec-h"><h2>Backend storage probes</h2></div>{content}</section>'
+
+
+def _trace_storage_cards(doc: TraceDocument) -> str:
     bp = doc.summary.backend_probe
-    if not isinstance(bp, dict):
-        return _kpi_card("Backend Probe (v0.2)", "idle", "slot ready (LMCache/Mooncake/io)")
-    pio = bp.get("proc_io") if isinstance(bp.get("proc_io"), dict) else {}
-    pref = pio.get("prefill_window") if isinstance(pio.get("prefill_window"), dict) else {}
-    lmc = bp.get("lmcache_mp") if isinstance(bp.get("lmcache_mp"), dict) else {}
-    moon = bp.get("mooncake") if isinstance(bp.get("mooncake"), dict) else {}
-    active_ids = sorted({f.detector_id for f in findings if f.detector_id in (D6, D7, D8)})
+    return _backend_probe_cards(bp) if isinstance(bp, dict) else ""
+
+
+def _backend_probe_kpi(cards: str, findings: List[Finding]) -> str:
+    if not cards:
+        return _kpi_card("Backend Probe (v0.2)", "Not collected", "")
+    active_ids = sorted({f.detector_id for f in findings if f.detector_id in _STORAGE_DETECTORS})
     status = ", ".join(active_ids) if active_ids else "no D6–D8 findings"
-    metrics = []
-    keys = _probe_metric(lmc.get("delta_hit_l2_keys"))
-    tokens = _probe_metric(lmc.get("delta_hit_l2_tokens"))
-    if keys != "n/a" or tokens != "n/a":
-        metrics.append(f"L2 hits {keys} keys" if keys != "n/a" else f"L2 hits {tokens} tok")
-    rchar = _probe_metric(pref.get("delta_rchar_bytes"), size=True)
-    physical = _probe_metric(pref.get("delta_read_bytes"), size=True)
-    if rchar != "n/a" or physical != "n/a":
-        metrics.append(f"rchar {rchar} / read_bytes {physical}")
-    if not metrics and (quota := _probe_metric(moon.get("delta_quota_rejects"))) != "n/a":
-        metrics.append(f"Quota rejects {quota}")
-    return _kpi_card("Backend Probe (v0.2)", f"active · {status}",
-                     " · ".join(metrics) or "No counters available", "kpi-lit")
+    return _kpi_card("Backend Probe (v0.2)", f"active · {status}", "See storage telemetry", "kpi-lit")
 
 
-def _wrap_html_document(title: str, body_html: str) -> str:
+def _wrap_html_document(title: str, body_html: str, *, strict_styles: bool = False) -> str:
     """Wrap body in a 100% airgap-safe HTML5 shell with hash-locked CSP and zero external assets."""
     css = (
         ":root{--bg:#0b1120;--card:#111827;--bd:#1f2937;--fg:#e5e7eb;--mut:#94a3b8}"
         "*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.45 ui-sans-serif,system-ui,sans-serif;padding:14px}"
         ".wrap{max-width:1200px;margin:0 auto}.hero{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:12px 16px;margin-bottom:10px}"
         ".top{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px}"
-        ".badge{padding:4px 10px;border-radius:6px;font:700 12px ui-monospace,Consolas,monospace;color:#fff}"
-        ".b-red{background:#dc2626}.b-amb{background:#d97706}.b-grn{background:#059669}"
+        ".badge{display:inline-block;padding:3px 7px;border-radius:6px;font:700 11px ui-monospace,Consolas,monospace}"
+        ".b-red{background:#511c25;color:#fecaca}.b-amb{background:#483014;color:#fde68a}"
+        ".b-grn{background:#103c30;color:#a7f3d0}.b-slt{background:#283548;color:#e2e8f0}"
         ".pill{padding:2px 8px;border-radius:999px;background:#1e293b;color:#cbd5e1;font:11px ui-monospace,Consolas,monospace;border:1px solid #334155}"
         ".kpis{display:grid;grid-template-columns:repeat(5,1fr);gap:8px}"
         ".kpi{background:#0f172a;border:1px solid var(--bd);border-radius:8px;padding:8px 10px}"
@@ -436,19 +577,40 @@ def _wrap_html_document(title: str, body_html: str) -> str:
         ".sec-h{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:8px;flex-wrap:wrap}"
         ".sec-h h2{margin:0;font-size:13px;letter-spacing:.02em;color:#f8fafc}"
         ".legend{display:flex;gap:10px;flex-wrap:wrap;font-size:11px;color:var(--mut)}.dot{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px;vertical-align:-1px}"
+        f".dot-handshake{{background:{COLOR_HANDSHAKE}}}.dot-reasoning{{background:{COLOR_REASONING}}}"
+        f".dot-content{{background:{COLOR_CONTENT}}}.dot-tool{{background:{COLOR_TOOL}}}"
+        f".dot-stall{{background:{COLOR_STALL}}}.dot-alert{{background:{COLOR_ALERT}}}"
+        ".badges,.metrics{display:flex;gap:6px;flex-wrap:wrap}.metrics{margin:6px 0 0}"
+        ".metrics div{padding:4px 7px;background:#0b1120;border:1px solid #1f2937;border-radius:5px}"
+        ".metrics dt{font-size:11px;color:var(--mut)}.metrics dd{margin:1px 0 0;font:600 12px ui-monospace,Consolas,monospace}"
+        ".probe-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,215px),1fr));gap:8px}"
+        ".probe-card{padding:10px;background:#0f172a;border:1px solid var(--bd);border-radius:8px}"
+        ".probe-card h4,.probe-group h3,.storage-trace{margin:0 0 6px;font-size:12px}.probe-card p{margin:6px 0 0;color:var(--mut)}"
+        ".probe-group+.probe-group,.probe-cards+.storage-trace{margin-top:12px}"
+        ".storage-findings{list-style:none;padding:0;margin:0 0 8px}.storage-findings li+li{margin-top:4px}"
+        ".protocol{display:inline-block;margin-top:4px;background:#24264b;border-color:#45487d;color:#dddfff}"
+        ".canary-matrix{overflow-x:auto}"
         ".btn{background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:3px 9px;font:11px ui-monospace,Consolas,monospace;cursor:pointer}"
         ".btn.on{background:#312e81;border-color:#6366f1}"
         "svg{width:100%;height:auto;display:block}.wf-bar{cursor:pointer}.wf-bar:hover{opacity:.85}"
         ".split{display:grid;grid-template-columns:1fr 1fr;gap:10px}.code{background:#020617;border:1px solid var(--bd);border-radius:6px;padding:8px 10px;font:11.5px/1.4 ui-monospace,Consolas,monospace;overflow-x:auto;white-space:pre-wrap;word-break:break-all;margin:4px 0 0}"
         "mark{background:rgba(239,68,68,.35);color:#fecaca;border-radius:2px;padding:0 2px}"
         "table{width:100%;border-collapse:collapse;font-size:12px}th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--bd)}th{color:var(--mut);font-weight:600}"
-        "details summary{cursor:pointer;color:#93c5fd;font-size:12px}"
+        "a,details summary{color:#93c5fd}details summary{cursor:pointer;font-size:12px}"
+        "#click-wire{margin-top:8px}"
         ".foot{display:flex;justify-content:space-between;align-items:center;color:#64748b;font:11px ui-monospace,Consolas,monospace;padding:4px 2px}"
         ".hid{display:none}"
         "@media print{body{background:#fff;color:#111}.hero,.sec,.kpi,.code{background:#fff;border-color:#cbd5e1;color:#111}}"
         "@media(max-width:860px){.kpis{grid-template-columns:repeat(2,1fr)}.split{grid-template-columns:1fr}}"
     )
-    csp = f"default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-{_SCRIPT_SHA256_B64}'; img-src data:;"
+    style_src = "'unsafe-inline'"
+    if strict_styles:
+        css_hash = base64.b64encode(hashlib.sha256(css.encode("utf-8")).digest()).decode("ascii")
+        style_src = f"'sha256-{css_hash}'"
+    csp = (
+        f"default-src 'none'; style-src {style_src}; script-src 'sha256-{_SCRIPT_SHA256_B64}'; "
+        "img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none';"
+    )
     doc_html = (
         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
@@ -467,7 +629,8 @@ def _fit_within_budget(
     summary_line: str,
     builder: Callable[[int, int, int], str],
     *,
-    fallback_kpi: str = "",
+    fallback_sections: str = "",
+    strict_styles: bool = False,
 ) -> str:
     """Adaptively tighten folding and per-lane segment caps; fallback guarantees <80 KiB strictly."""
     tiers = (
@@ -484,22 +647,25 @@ def _fit_within_budget(
     # Guaranteed compact fallback (< 6 KiB) for extreme pathological traces
     fallback_body = (
         f'<div class="hero"><div class="top"><span class="badge b-amb">{_esc(title, 80)}</span></div>'
-        f'<pre class="code">{_esc(summary_line, 600)}</pre></div>{fallback_kpi}'
+        f'<pre class="code">{_esc(summary_line, 600)}</pre></div>'
     )
-    return _wrap_html_document(title, fallback_body)
+    candidate = _wrap_html_document(title, fallback_body + fallback_sections, strict_styles=strict_styles)
+    if len(candidate.encode("utf-8")) < MAX_HTML_BYTES:
+        return candidate
+    return _wrap_html_document(title, fallback_body, strict_styles=strict_styles)
 
 
 def _legend_html() -> str:
     items = [
-        (COLOR_HANDSHAKE, "Handshake/Empty"),
-        (COLOR_REASONING, "Reasoning"),
-        (COLOR_CONTENT, "Content"),
-        (COLOR_TOOL, "Tool Call"),
-        (COLOR_STALL, "Stall >250ms"),
-        (COLOR_ALERT, "Divergence/Breach"),
+        ("handshake", "Handshake/Empty"),
+        ("reasoning", "Reasoning"),
+        ("content", "Content"),
+        ("tool", "Tool Call"),
+        ("stall", "Stall >250ms"),
+        ("alert", "Divergence/Breach"),
     ]
     return '<div class="legend">' + "".join(
-        f'<span><i class="dot" style="background:{c}"></i>{lbl}</span>' for c, lbl in items
+        f'<span><i class="dot dot-{key}"></i>{lbl}</span>' for key, lbl in items
     ) + "</div>"
 
 
@@ -536,7 +702,13 @@ def render_diff_html(
     tools = a_asm.get("tool_calls") or []
     json_ok = all(tc.get("json_valid") is True for tc in tools) if tools else True
     has_fffd = "\ufffd" in (a_asm.get("content_text") or "")
-    probe_kpi = _backend_probe_kpi(after, all_f)
+    storage_cards = "".join(
+        f'<div class="probe-group"><h3>{label}</h3>{cards}</div>'
+        for label, doc in (("Baseline", before), ("Target", after))
+        if (cards := _trace_storage_cards(doc))
+    )
+    probe_kpi = _backend_probe_kpi(storage_cards, all_f)
+    storage = _storage_section_html(_storage_findings_html(all_f) + storage_cards)
 
     kpis = "".join(
         [
@@ -635,13 +807,13 @@ def render_diff_html(
             f'<div><button id="btn-abs" class="btn on" type="button">Absolute ms</button> '
             f'<button id="btn-norm" class="btn" type="button">Normalized %</button></div></div>'
             f"{_legend_html()}{svg_abs}{svg_norm}</div>"
-            f"{insp}"
+            f"{storage}{insp}"
         )
         return _wrap_html_document(title, body)
 
     return _fit_within_budget(
         title, f"{verdict} | frames {st['before_frames']} -> {st['after_frames']}", _assemble,
-        fallback_kpi=probe_kpi if after.summary.backend_probe is not None else "",
+        fallback_sections=storage,
     )
 
 
@@ -655,7 +827,7 @@ def render_audit_html(
     """Render a single-lane airgap-safe HTML5 + SVG waterfall report for `audit`."""
     has_p0 = any(f.severity == "P0" for f in findings)
     has_p1 = any(f.severity == "P1" for f in findings)
-    b_cls = "b-red" if has_p0 else ("b-amb" if has_p1 else "b-grn")
+    b_cls = "b-red" if has_p0 else "b-amb" if has_p1 else "b-slt" if findings else "b-grn"
     verdict = f"{findings[0].severity} · {findings[0].detector_id}: {findings[0].code}" if findings else "PASS · 0 SILENT FAILURES"
 
     asm = doc.summary.assembled
@@ -665,7 +837,9 @@ def render_audit_html(
     tools = asm.get("tool_calls") or []
     json_ok = all(tc.get("json_valid") is True for tc in tools) if tools else True
     has_fffd = "\ufffd" in (asm.get("content_text") or "")
-    probe_kpi = _backend_probe_kpi(doc, findings)
+    storage_cards = _trace_storage_cards(doc)
+    probe_kpi = _backend_probe_kpi(storage_cards, findings)
+    storage = _storage_section_html(_storage_findings_html(findings) + storage_cards)
 
     kpis = "".join(
         [
@@ -681,7 +855,7 @@ def render_audit_html(
     div_seq = findings[0].frame_seq if findings else None
     capped_findings = findings[:MAX_FINDING_ROWS]
     f_rows = "".join(
-        f"<tr><td><span class='badge {'b-red' if f.severity == 'P0' else 'b-amb'}'>{_esc(f.severity, 8)}</span></td>"
+        f'<tr><td>{_badge(f.severity, _SEVERITY_BADGES.get(f.severity, "b-slt"))}</td>'
         f"<td><code>{_esc(f.detector_id, 8)}</code></td><td>{_esc(f.code, 48)}</td><td>#{f.frame_seq}</td>"
         f"<td>{_esc(_strip_controls_and_newlines(redact_secret_text(f.message)), 160)}</td></tr>"
         for f in capped_findings
@@ -703,7 +877,7 @@ def render_audit_html(
             f'<div class="hero"><div class="top"><div><span class="badge {b_cls}">{_esc(verdict, 80)}</span> '
             f'<span class="pill">{_esc(doc.header.dialect)}</span> <span class="pill">model: {_esc(model, 48)}</span></div></div>'
             f'<div class="kpis">{kpis}</div></div>'
-            f'<div class="sec"><div class="sec-h"><h2>Single-Track Frame Waterfall</h2></div>{_legend_html()}{svg}</div>'
+            f'<div class="sec"><div class="sec-h"><h2>Single-Track Frame Waterfall</h2></div>{_legend_html()}{svg}</div>{storage}'
             f'<div class="sec"><div class="sec-h"><h2>Audit Findings &amp; Frame Inspector</h2></div>'
             f"<table><thead><tr><th>Sev</th><th>ID</th><th>Rule</th><th>Frame</th><th>Evidence</th></tr></thead><tbody>{f_rows}</tbody></table>"
             f'<pre id="click-wire" class="code" style="margin-top:8px">Click any frame bar above to inspect its summary.</pre>'
@@ -714,7 +888,7 @@ def render_audit_html(
 
     return _fit_within_budget(
         title, f"{verdict} | {doc.summary.total_frames} frames", _assemble,
-        fallback_kpi=probe_kpi if doc.summary.backend_probe is not None else "",
+        fallback_sections=storage,
     )
 
 
@@ -753,6 +927,33 @@ def render_replay_html(report: ReplayReport, *, known_secrets: Sequence[str] = (
     return _wrap_html_document("inferdiff replay", "".join(sections))
 
 
+def _doctor_protocol_html(result: ProbeResult) -> tuple[str, str]:
+    spec = _PROTOCOL_METRICS.get(result.probe_id)
+    if not spec:
+        return "", ""
+    label, reason_label, reason_key, fields = spec
+    reason = result.details.get(reason_key)
+    metrics = [(reason_label, scrub_report_text(reason) if isinstance(reason, str) else "")]
+    metrics.extend((title, _probe_metric(result.details.get(key))) for title, key in fields)
+    return f'<br><span class="pill protocol">{label}</span>', _metric_list(metrics)
+
+
+def _doctor_storage_html(report: DoctorReport) -> str:
+    groups = []
+    for result in report.results:
+        findings = _storage_findings_html(result.findings)
+        cards = []
+        for index, doc in enumerate(result.traces, start=1):
+            if rendered := _trace_storage_cards(doc):
+                label = f'<p class="storage-trace">Trace {index}</p>' if len(result.traces) > 1 else ""
+                cards.append(label + rendered)
+        if findings or cards:
+            groups.append(
+                f'<div class="probe-group"><h3>{_esc(result.probe_id, 8)}</h3>{findings}{"".join(cards)}</div>'
+            )
+    return _storage_section_html("".join(groups))
+
+
 def render_doctor_html(report: DoctorReport, *, include_wire: bool = False) -> str:
     """Render the Doctor Health Scorecard and multi-lane SVG frame waterfalls."""
     b_cls = "b-red" if report.grade == "F" else ("b-amb" if report.warning_count > 0 else "b-grn")
@@ -778,12 +979,13 @@ def render_doctor_html(report: DoctorReport, *, include_wire: bool = False) -> s
 
     max_ms = max((doc.summary.timing.get("total_ms") or 1.0 for _, doc, _ in traced_lanes), default=1.0)
     svg_h = max(60, len(traced_lanes) * 34 + 26)
-    st_badge = {"PASS": "b-grn", "WARN": "b-amb", "FAIL": "b-red", "ERROR": "b-red", "SKIP": "pill"}
+    st_badge = {"PASS": "b-grn", "WARN": "b-amb", "FAIL": "b-red", "ERROR": "b-red", "SKIP": "b-slt"}
     rows: List[str] = []
     for r in report.results:
-        cls = st_badge.get(r.status, "pill")
+        status = _badge(r.status, st_badge.get(r.status, "b-slt"))
+        protocol, metrics = _doctor_protocol_html(r)
         tok = str(r.tokens_used) if r.tokens_used is not None else "unknown"
-        ref_html = _safe_anchor(r.reference_url, "anchor")
+        ref_html = _safe_anchor(r.reference_url, "Docs" if protocol else "anchor")
         wire_snippet = ""
         if r.traces and r.traces[-1].frames:
             doc_last = r.traces[-1]
@@ -794,13 +996,20 @@ def render_doctor_html(report: DoctorReport, *, include_wire: bool = False) -> s
             )
             wire_snippet = f'<details><summary>frame</summary><pre class="code">{_esc(_strip_controls_and_newlines(snip), 180)}</pre></details>'
         rows.append(
-            f"<tr><td><span class='badge {cls}'>{_esc(r.status, 12)}</span></td>"
-            f"<td><code>{_esc(r.probe_id, 8)}</code> {_esc(r.code, 40)}</td>"
+            f"<tr><td>{status}</td>"
+            f"<td><code>{_esc(r.probe_id, 8)}</code> {_esc(r.code, 40)}{protocol}</td>"
             f"<td>{r.duration_ms:.0f} ms</td><td>{r.total_frames}</td><td>{_esc(tok, 16)}</td>"
-            f"<td>{_esc(_strip_controls_and_newlines(redact_secret_text(r.summary)), 150)} {wire_snippet}</td><td>{ref_html}</td></tr>"
+            f"<td>{_esc(_strip_controls_and_newlines(redact_secret_text(r.summary)), 150)}"
+            f"{metrics}{wire_snippet}</td><td>{ref_html}</td></tr>"
         )
 
     title = f"inferdiff doctor · {redact_secret_text(report.model)[:36]} (Grade {report.grade})"
+    matrix = (
+        '<div class="sec canary-matrix"><div class="sec-h"><h2>Endpoint &amp; Relay Canary Matrix</h2></div>'
+        "<table><thead><tr><th>Status</th><th>Probe</th><th>Time</th><th>Frames</th><th>Tokens</th>"
+        f"<th>Verdict &amp; Evidence</th><th>Ref</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
+    )
+    storage = _doctor_storage_html(report)
 
     def _assemble(thresh: int, max_segs: int, wcap: int) -> str:
         per_lane_cap = max(8, max_segs // max(1, len(traced_lanes)))
@@ -832,11 +1041,12 @@ def render_doctor_html(report: DoctorReport, *, include_wire: bool = False) -> s
             f'<div><button id="btn-abs" class="btn on" type="button">Absolute ms</button> '
             f'<button id="btn-norm" class="btn" type="button">Normalized %</button></div></div>'
             f"{_legend_html()}{svg_abs}{svg_norm}"
-            f'<pre id="click-wire" class="code" style="margin-top:8px">Click any frame bar above to inspect its summary.</pre></div>'
-            f'<div class="sec"><div class="sec-h"><h2>Endpoint &amp; Relay Canary Matrix</h2></div>'
-            f"<table><thead><tr><th>Status</th><th>Probe</th><th>Time</th><th>Frames</th><th>Tokens</th><th>Verdict &amp; Evidence</th><th>Ref</th></tr></thead>"
-            f"<tbody>{''.join(rows)}</tbody></table></div>"
+            f'<pre id="click-wire" class="code">Click any frame bar above to inspect its summary.</pre></div>'
+            f"{matrix}{storage}"
         )
-        return _wrap_html_document(title, body)
+        return _wrap_html_document(title, body, strict_styles=True)
 
-    return _fit_within_budget(title, f"{verdict} | profile={report.profile}", _assemble)
+    return _fit_within_budget(
+        title, f"{verdict} | profile={report.profile}", _assemble,
+        fallback_sections=matrix + storage, strict_styles=True,
+    )

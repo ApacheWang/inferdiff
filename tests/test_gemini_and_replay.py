@@ -132,6 +132,25 @@ def _recorded_trace(path, *, breach=False, warning=False, legacy_secrets=False, 
 
 
 class GeminiProbeTests(unittest.TestCase):
+    def test_doctor_html_labels_gemini_failure_and_distinguishes_token_counts(self):
+        payload = _sse(_parts({'text': 'The numbers are complete.'}), _end('STOP', candidates=32, thoughts=0))
+        with tempfile.TemporaryDirectory() as directory, _serve(lambda _: (200, payload)) as (host, _):
+            path = Path(directory) / 'report.html'
+            code, _, stderr = _cli('doctor', host, '--model', 'gemini-test', '--protocol', 'gemini',
+                                   '--html', path, '--save-dir', directory, '--timeout', '2')
+            report = path.read_text(encoding='utf-8')
+        self.assertEqual((code, stderr), (2, ''))
+        self.assertIn('Gemini SSE', report)
+        self.assertIn('streamGenerateContent', report)
+        self.assertIn('<span class="badge b-red">FAIL</span>', report)
+        self.assertIn('<dt>finishReason</dt><dd>STOP</dd>', report)
+        self.assertIn('<dt>Prompt tokens</dt><dd>9</dd>', report)
+        self.assertIn('<dt>Candidate tokens</dt><dd>32</dd>', report)
+        self.assertIn('<dt>Thinking tokens</dt><dd>0</dd>', report)
+        self.assertIn('<dt>Total tokens</dt><dd>41</dd>', report)
+        self.assertIn('href="https://ai.google.dev/', report)
+        self.assertLess(len(report.encode('utf-8')), 80 * 1024)
+
     def _probe(self, respond, *, selection=('--only', 'C10')):
         with tempfile.TemporaryDirectory() as directory, _serve(respond) as (host, requests):
             path = Path(directory)

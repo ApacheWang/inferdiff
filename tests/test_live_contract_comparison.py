@@ -115,6 +115,27 @@ def _run_cli(*args: str) -> tuple[int, str, str]:
 
 
 class TestLiveAnthropicContract(unittest.TestCase):
+    def test_doctor_html_labels_messages_and_reports_output_usage(self):
+        key = "relay-anthropic-credential"
+        with (tempfile.TemporaryDirectory() as root,
+              _serve("/v1/messages", _messages_stream) as (url, _)):
+            path = Path(root) / "report.html"
+            code, _, stderr = _run_cli(
+                "doctor", url, "--model", "claude-mock", "--only", "C9", "--api-key", key,
+                "--timeout", "2", "--html", str(path), "--save-dir", root,
+            )
+            report = path.read_text(encoding="utf-8")
+        self.assertEqual((code, stderr), (EXIT_OK, ""))
+        self.assertIn("Anthropic Messages SSE", report)
+        self.assertIn("/v1/messages", report)
+        self.assertIn('<span class="badge b-grn">PASS</span>', report)
+        self.assertIn("<dt>stop_reason</dt><dd>max_tokens</dd>", report)
+        self.assertIn("<dt>Output tokens</dt><dd>32</dd>", report)
+        self.assertIn('href="https://platform.claude.com/', report)
+        self.assertNotIn(key, report)
+        self.assertNotIn(root, report)
+        self.assertLess(len(report.encode("utf-8")), 80 * 1024)
+
     def _doctor(
         self, base_suffix: str = "", *, flags: tuple[str, ...] = ("--only", "C9"),
         status: int = 200, **stream_options: Any,

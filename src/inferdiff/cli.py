@@ -38,6 +38,7 @@ from .exporter import (
 from .exporters import (
     _ReportCase, audit_cases, canary_cases, comparison_cases, diff_cases, render_junit, render_sarif, replay_cases,
 )
+from .init_cmd import DEFAULT_ENDPOINT, INIT_TARGETS, render_init_config, write_init_config
 from .probes import CompositeBackendProbe, LinuxProcIoProbe, LmcacheMpProbe, MooncakeStoreProbe
 from .proxy import create_proxy_server
 from .recorder import RecorderError, record_stream, validate_and_merge_headers, validate_url
@@ -273,6 +274,19 @@ def _cmd_watch(args: argparse.Namespace) -> int:
         )
     except OSError:
         raise ValueError("Watch could not read or write local data.") from None
+
+
+def _cmd_init(args: argparse.Namespace) -> int:
+    default_path, content = render_init_config(
+        args.target, endpoint=args.endpoint, model=args.model, profile=args.profile,
+    )
+    if args.stdout:
+        sys.stdout.write(content)
+    else:
+        path = Path(args.output or default_path)
+        write_init_config(path, content, force=args.force)
+        sys.stdout.write(f"Wrote {path}\n")
+    return EXIT_OK
 
 
 _PROBE_OPTIONS = {
@@ -686,6 +700,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"inferdiff {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    p_init = sub.add_parser("init", help="Generate a GitHub Actions, GitLab CI, or pre-commit config")
+    p_init.add_argument("--target", choices=INIT_TARGETS, default="github-actions",
+                        help="Config to generate (default: github-actions)")
+    p_init.add_argument("--output", metavar="PATH", help="Write to a custom path")
+    p_init.add_argument("--stdout", action="store_true", help="Print the config without writing a file")
+    p_init.add_argument("--force", action="store_true", help="Replace an existing output file")
+    p_init.add_argument("--endpoint", default=DEFAULT_ENDPOINT,
+                        help=f"Public endpoint URL for live CI templates (default: {DEFAULT_ENDPOINT})")
+    p_init.add_argument("--model", default="", help="Model ID for live CI templates (default: auto-discover)")
+    p_init.add_argument("--profile", choices=("quick", "relay", "full"), default="quick",
+                        help="Canary profile for live CI templates (default: quick)")
+    p_init.set_defaults(func=_cmd_init)
 
     p_proxy = sub.add_parser("proxy", help="Forward local HTTP traffic and audit live LLM streams")
     p_proxy.add_argument("--upstream", required=True, help="Upstream HTTP(S) base URL")

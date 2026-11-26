@@ -24,6 +24,7 @@ VALID_DIALECTS = (
     "sglang-native",
     "ollama-ndjson",
     "anthropic-messages",
+    "gemini-sse",
 )
 
 UsageValue = Union[int, str]
@@ -164,6 +165,10 @@ def extract_effective_params(body: Dict[str, Any], dialect: str) -> Dict[str, An
         # Nested engine override containers take precedence over top-level body when present
         containers = [extra, sp, body]
         budget_keys = ("max_output_tokens", "max_completion_tokens", "max_tokens", "max_new_tokens")
+    elif dialect == "gemini-sse":
+        config = body.get("generationConfig")
+        containers = [config] if isinstance(config, dict) else []
+        budget_keys = ("maxOutputTokens",)
     else:  # openai-chat
         containers = [extra, sp, body]
         budget_keys = ("max_completion_tokens", "max_output_tokens", "max_tokens", "max_new_tokens")
@@ -180,7 +185,8 @@ def extract_effective_params(body: Dict[str, Any], dialect: str) -> Dict[str, An
     seed = raw_seed if is_strict_int(raw_seed) else None
 
     # Resolve each stop type independently using container precedence so explicit empty or null overrides win
-    found_stop, raw_stop = _pick_first_present(containers, ("stop",), allow_null_override=True)
+    stop_key = "stopSequences" if dialect == "gemini-sse" else "stop"
+    found_stop, raw_stop = _pick_first_present(containers, (stop_key,), allow_null_override=True)
     stop_sequences = _normalize_str_stop_value(raw_stop) if (found_stop and raw_stop is not None) else []
 
     found_stop_ids, raw_stop_ids = _pick_first_present(containers, ("stop_token_ids",), allow_null_override=True)
@@ -393,6 +399,8 @@ def assemble_summary(
     terminal_status: str = "unknown"
     matched_stop: Optional[Any] = None
     usage = empty_usage()
+    if dialect == "gemini-sse":
+        usage["total_tokens"] = "unknown"
 
     saw_done_sentinel = False
     saw_typed_responses_terminal = False
@@ -595,9 +603,9 @@ def assemble_summary(
         reas_delta = norm.get("reasoning_delta") or ""
         tool_deltas = norm.get("tool_deltas") or []
 
-        # Detect payload arriving after finish_reason on Chat / SGLang streams (allows trailing usage & [DONE])
+        # Gemini, Chat, and SGLang may send usage after the candidate finishes.
         if (
-            dialect in ("openai-chat", "sglang-native")
+            dialect in ("openai-chat", "sglang-native", "gemini-sse")
             and saw_finish_reason
             and not is_sse_done
             and (text_delta or reas_delta or tool_deltas)
@@ -649,7 +657,7 @@ def assemble_summary(
         f_usage = norm.get("usage")
         if isinstance(f_usage, dict):
             updated_usage = False
-            for k in ("prompt_tokens", "completion_tokens", "reasoning_tokens", "cached_tokens"):
+            for k in usage:
                 v = f_usage.get(k)
                 if is_strict_int(v) and v >= 0:
                     usage[k] = v
@@ -703,8 +711,9 @@ def assemble_summary(
                 if has_lone_surrogate(parsed_args):
                     json_valid = False
                     json_error = "Arguments contain invalid lone UTF-16 surrogate"
-                elif dialect == "anthropic-messages" and not isinstance(parsed_args, dict):
-                    json_error = "Anthropic tool input must be a JSON object"
+                elif dialect in ("anthropic-messages", "gemini-sse") and not isinstance(parsed_args, dict):
+                    vendor = "Anthropic" if dialect == "anthropic-messages" else "Gemini"
+                    json_error = f"{vendor} tool input must be a JSON object"
                 else:
                     json_valid = True
             except (json.JSONDecodeError, ValueError, RecursionError) as exc:
@@ -740,6 +749,8 @@ def assemble_summary(
         eof_clean = saw_done_sentinel
     elif dialect == "openai-responses":
         eof_clean = saw_typed_responses_terminal
+    elif dialect == "gemini-sse":
+        eof_clean = saw_finish_reason
     elif dialect == "ollama-ndjson":
         eof_clean = saw_done_sentinel
     else:

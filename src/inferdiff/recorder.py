@@ -14,23 +14,27 @@ import ssl
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
+from urllib.parse import unquote_plus, urlsplit
 
 from ._probe_data import PROBE_URL_FIELDS, probe_url
-from ._urls import RecorderError, validate_url
+from ._urls import RecorderError, gemini_request_url, validate_url
 from .dialects import detect_dialect, normalize_payload
 from .probes import (
     BackendProbe, CompositeBackendProbe, LinuxProcIoProbe, LmcacheMpProbe, MooncakeStoreProbe, NullProbe,
 )
 from .probes._task import TTFT_HOOK_BUDGET, ProbeTask, run_ttft_hook
 from .redact import (
+    extract_body_secret_values,
     extract_header_secret_values,
     extract_query_secret_values,
+    extract_url_secret_values,
     has_control_chars,
     redact_headers,
     sanitize_url_for_error,
     sanitize_url_for_export,
     scrub_known_secrets,
+    scrub_report_data,
 )
 from .schema import (
     TraceDocument,
@@ -44,6 +48,7 @@ from .schema import (
     extract_effective_params,
     frame_has_effective_payload,
     has_lone_surrogate,
+    safe_utf8_len,
     strict_json_loads,
     validate_backend_probe,
 )
@@ -53,6 +58,8 @@ _HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 _MANAGED_HEADERS = frozenset({"content-length", "transfer-encoding", "host"})
 _MAX_CHUNK_LINE_BYTES = 16384
 _MAX_TRAILER_BYTES = 65536
+_JSON_STRING_RE = re.compile(r'"(?:\\[^\r\n]|[^"\\\r\n])*"')
+_SSE_NON_DATA_LINE_RE = re.compile(r"(?:^|(?<=[\r\n]))(?!data(?=[:\r\n]|$))[^\r\n]+")
 # One EOF phase can make five default HTTP calls plus a local snapshot.
 _PROBE_HOOK_BUDGET = 12.0
 # The built-in TTFT hooks only schedule work or return immediately.
@@ -107,6 +114,35 @@ def _decode_safe(data: bytes) -> Tuple[str, bool]:
         return data.decode("utf-8"), False
     except UnicodeDecodeError:
         return data.decode("utf-8", errors="surrogateescape"), True
+
+
+def _scrub_gemini_wire(text: str, known_secrets: Sequence[str], *, sse_block: bool = False) -> str:
+    text = scrub_known_secrets(text, known_secrets)
+    has_short_keys = any(len(secret) < 6 for secret in known_secrets)
+    if not has_short_keys and "\\" not in text:
+        return text
+
+    def scrub_line(match: re.Match[str]) -> str:
+        field, separator, value = match[0].partition(":")
+        if separator and field in ("", "event", "id", "retry"):
+            return field + separator + scrub_known_secrets(value, known_secrets, min_length=1)
+        return scrub_known_secrets(match[0], known_secrets, min_length=1)
+
+    def scrub_string(match: re.Match[str]) -> str:
+        literal = match[0]
+        if not has_short_keys and "\\" not in literal:
+            return literal
+        try:
+            value = strict_json_loads(literal)
+        except ValueError:
+            return literal
+        safe = scrub_known_secrets(value, known_secrets, min_length=1)
+        return canonical_json_line(safe) if safe != value else literal
+
+    if sse_block and has_short_keys:
+        text = _SSE_NON_DATA_LINE_RE.sub(scrub_line, text)
+    # Scrub JSON-escaped credential contexts and keep numeric fields unchanged when a key is short.
+    return _JSON_STRING_RE.sub(scrub_string, text)
 
 
 @dataclass
@@ -569,7 +605,7 @@ def build_frame_from_chunk(
             sglang_prev_text,
         )
 
-    if dialect not in ("ollama-ndjson", "anthropic-messages") and chunk.payload_text == "[DONE]":
+    if dialect not in ("ollama-ndjson", "anthropic-messages", "gemini-sse") and chunk.payload_text == "[DONE]":
         done_norm = dict(empty_norm)
         done_norm["phase"] = "TERMINAL"
         done_norm["closed_events"] = ["[DONE]"]
@@ -712,6 +748,7 @@ def record_stream(
     label: str = "",
     timeout: float = 120.0,
     probe: Optional[BackendProbe] = None,
+    known_secrets: Sequence[str] = (),
 ) -> TraceDocument:
     """Send one streaming POST via stdlib http.client and record per-frame flushed .trace.jsonl."""
     parsed = validate_url(url)
@@ -721,11 +758,27 @@ def record_stream(
     if not isinstance(request_body, dict):
         raise RecorderError("Request body must be a JSON object.")
 
+    is_gemini = dialect == "gemini-sse" or (dialect == "auto" and detect_dialect(parsed.path) == "gemini-sse")
+    gemini_secrets = []
+    query_key = None
+    if is_gemini:
+        gemini_secrets = extract_url_secret_values(url) + extract_body_secret_values(request_body) + list(known_secrets)
+        url, query_key = gemini_request_url(url)
+        parsed = urlsplit(url)
+        query_fields = [field for field in parsed.query.split("&")
+                        if field and unquote_plus(field.partition("=")[0]).lower() != "alt"]
+        query = "&".join([*query_fields, "alt=sse"])
+        parsed = parsed._replace(query=query)
+        url = parsed.geturl()
+
     body = dict(request_body)
-    if "stream" not in body:
-        body["stream"] = True
-    elif body["stream"] is not True:
+    if "stream" in body and body["stream"] is not True:
         raise RecorderError("Request body must have stream=true for streaming capture.")
+    if is_gemini:
+        # Gemini selects SSE in the URL and has no top-level stream field.
+        body.pop("stream", None)
+    else:
+        body["stream"] = True
 
     body_bytes = canonical_json_bytes(body)
     req_path = parsed.path or "/"
@@ -738,6 +791,15 @@ def record_stream(
         "Accept-Encoding": "identity",
     }
     send_headers = validate_and_merge_headers(default_headers, headers)
+    if query_key and not any(name.lower() == "x-goog-api-key" for name in send_headers):
+        send_headers = validate_and_merge_headers(send_headers, {"x-goog-api-key": query_key})
+    if is_gemini and any(name.lower() == "x-goog-api-key" and not value.isascii()
+                         for name, value in send_headers.items()):
+        raise RecorderError("Gemini API keys must contain only ASCII characters.")
+
+    outgoing_secrets = extract_header_secret_values(send_headers, min_length=1 if is_gemini else 6)
+    outgoing_secrets.extend(extract_query_secret_values(parsed.query))
+    outgoing_secrets.extend(gemini_secrets if is_gemini else known_secrets)
 
     conn: http.client.HTTPConnection
     if parsed.scheme == "https":
@@ -795,9 +857,6 @@ def record_stream(
         raise RecorderHTTPError(status_code, url)
 
     redacted_req_headers = redact_headers(send_headers)
-    outgoing_secrets = extract_header_secret_values(send_headers)
-    outgoing_secrets.extend(extract_query_secret_values(parsed.query))
-
     safe_stored_url = sanitize_url_for_export(url)
     header = TraceHeader(
         trace_id=trace_id,
@@ -819,6 +878,11 @@ def record_stream(
         },
         backend_probe=probe_topology,
     )
+    if is_gemini:
+        header.label = scrub_known_secrets(header.label, outgoing_secrets, min_length=1)
+        header.request = scrub_report_data(header.request, outgoing_secrets)
+        header.response_meta = scrub_report_data(header.response_meta, outgoing_secrets)
+        header.backend_probe = scrub_report_data(header.backend_probe, outgoing_secrets)
 
     framer: Union[SSEFramer, NDJSONFramer] = (
         NDJSONFramer() if resolved_dialect == "ollama-ndjson" else SSEFramer()
@@ -842,12 +906,18 @@ def record_stream(
     def _emit_chunk(wc: WireChunk) -> None:
         nonlocal prev_rel_ms, sglang_prev, probe_ttft_sampled, ttft_task, ttft_deadline
         # Scrub any reflected outgoing credential (e.g. echoed API key) BEFORE normalization or persistence
-        if outgoing_secrets:
+        if outgoing_secrets or is_gemini:
+            scrub_wire = _scrub_gemini_wire if is_gemini else scrub_known_secrets
+            sse_event = wc.sse_event
+            if sse_event:
+                sse_event = scrub_known_secrets(sse_event, outgoing_secrets, min_length=1 if is_gemini else 6)
+            raw_wire = (_scrub_gemini_wire(wc.raw_wire, outgoing_secrets, sse_block=True) if is_gemini
+                        else scrub_known_secrets(wc.raw_wire, outgoing_secrets))
             wc = WireChunk(
                 t_mono_ns=wc.t_mono_ns,
-                sse_event=scrub_known_secrets(wc.sse_event, outgoing_secrets) if wc.sse_event else None,
-                payload_text=scrub_known_secrets(wc.payload_text, outgoing_secrets),
-                raw_wire=scrub_known_secrets(wc.raw_wire, outgoing_secrets),
+                sse_event=sse_event,
+                payload_text=scrub_wire(wc.payload_text, outgoing_secrets),
+                raw_wire=raw_wire,
                 is_incomplete=wc.is_incomplete,
                 invalid_utf8=wc.invalid_utf8,
                 framing_error=wc.framing_error,
@@ -861,6 +931,11 @@ def record_stream(
             sglang_prev_text=sglang_prev,
         )
         prev_rel_ms = tf.t_rel_ms
+        if is_gemini:
+            if tf.parse_error:
+                tf.raw_wire = scrub_known_secrets(tf.raw_wire, outgoing_secrets, min_length=1)
+            # Normalized values may decode escaping beyond the wire value's encoding.
+            tf.norm = scrub_report_data(tf.norm, outgoing_secrets)
         frames.append(tf)
         if fh is not None:
             fh.write(canonical_json_line(tf.to_dict()) + "\n")
@@ -952,6 +1027,11 @@ def record_stream(
             socket_eof_clean=socket_eof_clean,
             backend_probe_summary=probe_summary,
         )
+        if is_gemini:
+            # Reassembled text can recreate a reflected key split over multiple events.
+            summary.assembled = scrub_report_data(summary.assembled, outgoing_secrets)
+            summary.assembled["content_utf8_bytes"] = safe_utf8_len(summary.assembled["content_text"])
+            summary.backend_probe = scrub_report_data(summary.backend_probe, outgoing_secrets)
         if fh is not None:
             fh.write(canonical_json_line(summary.to_dict()) + "\n")
             fh.flush()

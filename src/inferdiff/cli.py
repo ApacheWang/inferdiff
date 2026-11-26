@@ -35,7 +35,9 @@ from .exporter import (
     render_github_issue,
     sanitize_trace_for_json_export,
 )
-from .exporters import _ReportCase, audit_cases, canary_cases, comparison_cases, diff_cases, render_junit, render_sarif
+from .exporters import (
+    _ReportCase, audit_cases, canary_cases, comparison_cases, diff_cases, render_junit, render_sarif, replay_cases,
+)
 from .probes import CompositeBackendProbe, LinuxProcIoProbe, LmcacheMpProbe, MooncakeStoreProbe
 from .recorder import RecorderError, record_stream, validate_and_merge_headers, validate_url
 from .redact import (
@@ -46,6 +48,7 @@ from .redact import (
     scrub_report_data,
     scrub_report_text,
 )
+from .replay import render_replay_terminal, run_replay
 from .schema import (
     EXIT_OK,
     EXIT_SEMANTIC_REGRESSION,
@@ -58,7 +61,7 @@ from .schema import (
     strict_json_loads,
 )
 from .watch import run_watch
-from .waterfall import render_audit_html, render_diff_html, render_doctor_html
+from .waterfall import render_audit_html, render_diff_html, render_doctor_html, render_replay_html
 
 
 def _configure_stdio() -> None:
@@ -121,8 +124,12 @@ def _trace_report_secrets(doc: TraceDocument) -> list[str]:
 
 def _live_report_secrets(url: str, headers: Mapping[str, str], api_key: str | None = None) -> list[str]:
     secrets = extract_url_secret_values(url) + extract_header_secret_values(headers, min_length=1)
-    secrets.extend(key for key in (resolve_api_key(api_key), os.environ.get("OPENAI_API_KEY", "").strip(),
-                                   os.environ.get("ANTHROPIC_API_KEY", "").strip()) if key)
+    key = resolve_api_key(api_key)
+    if key:
+        secrets.append(key)
+    for name in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        if value := os.environ.get(name, "").strip():
+            secrets.append(value)
     return secrets
 
 
@@ -219,13 +226,14 @@ def _canary_selection(args: argparse.Namespace) -> Dict[str, Any]:
 
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
+    base_url = args.base_url if args.base_url_option is None else args.base_url_option
     headers = _parse_headers(args.header)
     paths = (args.html, args.out_sarif, args.out_junit)
     protected = [Path(args.save_dir) / "doctor_summary.json"] if args.save_dir else []
     _validate_output_paths(paths, protected)
-    known_secrets = _live_report_secrets(args.base_url, headers, args.api_key)
+    known_secrets = _live_report_secrets(base_url, headers, args.api_key)
     report = run_doctor(
-        base_url=args.base_url,
+        base_url=base_url,
         model=args.model or None,
         api_key=args.api_key,
         headers=headers,
@@ -364,6 +372,31 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         if args.html:
             sys.stdout.write(f"Saved HTML waterfall report: {args.html}\n")
     return rc
+
+
+def _cmd_replay(args: argparse.Namespace) -> int:
+    json_path = args.out_json if args.out_json != "-" else None
+    outputs = (json_path, args.out_sarif, args.out_junit, args.out_html)
+    report = run_replay(args.path, baseline=args.baseline, strict=args.strict)
+    known_secrets = [secret for trace in (*report.traces, *report.baseline_traces)
+                     for secret in _trace_report_secrets(trace.doc)]
+    try:
+        _validate_output_paths(outputs, report.input_paths)
+        if json_path or args.out_json == "-":
+            payload = _render_json(report.to_dict(), known_secrets, indent=2)
+            if json_path:
+                _write_text_file(json_path, payload)
+            else:
+                sys.stdout.write(payload)
+        if args.out_sarif or args.out_junit:
+            _write_ci_reports(args, replay_cases(report), known_secrets)
+        if args.out_html:
+            _write_text_file(args.out_html, render_replay_html(report, known_secrets=known_secrets))
+    except (ValueError, OSError) as exc:
+        raise ValueError(scrub_report_text(str(exc), known_secrets)) from None
+    if args.out_json != "-":
+        sys.stdout.write(render_replay_terminal(report, known_secrets=known_secrets))
+    return report.exit_code
 
 
 def _cmd_diff(args: argparse.Namespace) -> int:
@@ -606,8 +639,9 @@ def _add_probe_options(parser: argparse.ArgumentParser, side: str = "") -> None:
 
 def _add_canary_options(parser: argparse.ArgumentParser | argparse._ArgumentGroup) -> None:
     parser.add_argument("--profile", choices=("quick", "full", "relay"), help="Canary profile (default: quick)")
-    parser.add_argument("--only", help="Comma-separated checks (C1 through C9)")
-    parser.add_argument("--protocol", choices=("openai", "anthropic"), help="Select Anthropic Messages (C9) or OpenAI canaries")
+    parser.add_argument("--only", help="Comma-separated checks (C1 through C10)")
+    parser.add_argument("--protocol", choices=("openai", "anthropic", "gemini"),
+                        help="Select OpenAI canaries, Anthropic Messages (C9), or Gemini SSE (C10)")
     parser.add_argument("--anthropic-version", metavar="DATE", help="Anthropic version header (opts into C9 by default)")
 
 
@@ -627,10 +661,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     # doctor (primary zero-setup entry point per Spec §2.1)
     p_doc = sub.add_parser("doctor", aliases=["canary"],
-                           help="Live C1..C9 streaming contract checks for engines and API relays")
-    p_doc.add_argument("base_url", help="Target base URL (e.g. http://127.0.0.1:8080/v1 or https://api.example.com/v1)")
+                           help="Live C1..C10 streaming contract checks for engines and API relays")
+    target = p_doc.add_mutually_exclusive_group(required=True)
+    target.add_argument("base_url", nargs="?", help="Target base URL (e.g. http://127.0.0.1:8080/v1)")
+    target.add_argument("--base-url", dest="base_url_option", help="Target base URL")
     p_doc.add_argument("--model", "-m", default="", help="Model ID (auto-discovers /models or /api/tags if omitted)")
-    p_doc.add_argument("--api-key", default=None, help="API key or $ENV_VAR (default: OPENAI_API_KEY or ANTHROPIC_API_KEY)")
+    p_doc.add_argument("--api-key", default=None, help="API key or $ENV_VAR (defaults to the selected protocol's environment key)")
     p_doc.add_argument("--header", "-H", action="append", default=[], help="Extra HTTP header 'Name: value' (repeatable)")
     _add_canary_options(p_doc)
     p_doc.add_argument("--timeout", type=float, default=60.0, help="Per-probe socket timeout in seconds")
@@ -645,7 +681,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_watch = sub.add_parser("watch", help="Run canaries continuously and alert on health transitions")
     p_watch.add_argument("--base-url", required=True, help="Inference endpoint base URL")
     p_watch.add_argument("--model", "-m", help="Model ID (auto-discovers if omitted)")
-    p_watch.add_argument("--api-key", help="API key or $ENV_VAR (default: OPENAI_API_KEY or ANTHROPIC_API_KEY)")
+    p_watch.add_argument("--api-key", help="API key or $ENV_VAR (defaults to the selected protocol's environment key)")
     p_watch.add_argument("--header", "-H", action="append", default=[], help="Extra inference HTTP header (repeatable)")
     _add_canary_options(p_watch)
     p_watch.add_argument("--timeout", type=float, default=60.0, help="Per-probe socket timeout in seconds")
@@ -680,6 +716,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_aud.add_argument("--no-color", action="store_true")
     _add_ci_report_options(p_aud)
     p_aud.set_defaults(func=_cmd_audit)
+
+    p_replay = sub.add_parser("replay", help="Audit saved traces offline and gate new protocol breaches")
+    p_replay.add_argument("path", help="A .trace.jsonl file or directory of .trace.jsonl files")
+    p_replay.add_argument("--baseline", metavar="DIR", help="Compare against saved traces matched by relative path")
+    p_replay.add_argument("--out-json", metavar="PATH", help="Write replay JSON (use - for stdout)")
+    p_replay.add_argument("--out-html", metavar="PATH", help="Write a self-contained replay report")
+    p_replay.add_argument("--strict", action="store_true", help="Exit 3 on P1 warnings (P0 breaches exit 2)")
+    _add_ci_report_options(p_replay)
+    p_replay.set_defaults(func=_cmd_replay)
 
     # diff
     p_diff = sub.add_parser("diff", help="Diff baseline and target .trace.jsonl with chunk-jitter-proof alignment")

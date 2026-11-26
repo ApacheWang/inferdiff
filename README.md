@@ -74,6 +74,7 @@ Every `diff --html`, `audit --html`, `doctor --html`, and `export --format html`
 | `C7` (P1) | Buffered non-streaming response dumped as a fake SSE burst | `quick`, `full`, `relay` | [`LiteLLM #5803`](https://github.com/BerriAI/litellm/issues/5803) |
 | `C8` (P2) | Randomized-prefix same-seed heterogeneous backend pool drift (advisory) | `full`, `relay` | [vLLM Benchmarking CLI](https://docs.vllm.ai/en/stable/benchmarking/cli/) |
 | `C9` (P0) | Anthropic Messages lifecycle, dishonest `max_tokens` termination, and missing output usage | `--only C9` or `--protocol anthropic` | [Anthropic streaming messages](https://platform.claude.com/docs/en/build-with-claude/streaming) |
+| `C10` (P0) | Gemini SSE truncation honesty, token accounting, and UTF-8 integrity in visible and thinking output | `--only C10` or `--protocol gemini` | [Gemini streaming content](https://ai.google.dev/api/generate-content) |
 
 ```bash
 inferdiff doctor https://api.anthropic.com/v1 --model "$CLAUDE_MODEL" \
@@ -81,6 +82,23 @@ inferdiff doctor https://api.anthropic.com/v1 --model "$CLAUDE_MODEL" \
 ```
 
 C9 requests a long tool argument with a 32-token budget and falls back to a long text prompt if the server rejects the tool request. It validates text, thinking, and tool input deltas. It uses `x-api-key` and falls back to `ANTHROPIC_API_KEY`. `--anthropic-version` alone also selects C9, and `--only C1,C9` runs both checks against a gateway's sibling routes. HTTP 404 or 405 on `/v1/messages` yields `SKIP`.
+
+```bash
+inferdiff doctor https://generativelanguage.googleapis.com --model "$GEMINI_MODEL" \
+  --protocol gemini --api-key '$GEMINI_API_KEY' --save-dir ./gemini-traces
+```
+
+C10 requests a long response with a 32-token budget and checks for `MAX_TOKENS`. Gemini credentials are sent in `x-goog-api-key`, with `GEMINI_API_KEY` or `GOOGLE_API_KEY` as environment fallbacks. HTTP 404, 405, or 501 yields `SKIP`.
+
+## Offline Trace Replay
+
+```bash
+inferdiff replay ./traces/run.trace.jsonl
+inferdiff replay ./after --baseline ./before --out-json replay.json \
+  --out-sarif replay.sarif --out-junit replay.xml --out-html replay.html
+```
+
+Replay runs the current detectors over saved `.trace.jsonl` files locally. With a baseline, it matches traces by relative path, runs pair checks on matches, and reports `NEW_BREACHES`, `FIXED_BREACHES`, and `UNCHANGED`. New P0 findings exit `2`. `--strict` also gates P1 findings with exit `3`.
 
 ## Recording, Side-by-Side Comparison & Bundled Examples
 

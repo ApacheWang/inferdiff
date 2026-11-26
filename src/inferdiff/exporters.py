@@ -15,10 +15,12 @@ from .comparison import ComparisonReport
 from .detectors import DETECTOR_NAMES, D5, VALID_AUDIT_DETECTORS, Finding
 from .differ import DiffReport
 from .redact import sanitize_url_path, scrub_report_text
-from .schema import EXIT_USAGE_OR_IO_ERROR, TraceDocument, is_finite_number
+from .replay import ReplayReport
+from .schema import EXIT_SEMANTIC_REGRESSION, EXIT_USAGE_OR_IO_ERROR, TraceDocument, is_finite_number
 
 _SARIF_SCHEMA = "https://json.schemastore.org/sarif-2.1.0.json"
 _SARIF_ENDPOINT_BASE = "INFERDIFF_ENDPOINTS"
+_SARIF_TRACE_BASE = "INFERDIFF_TRACES"
 _SARIF_LEVELS = {"FAIL": "error", "WARN": "warning"}
 _JUNIT_TAGS = {"FAIL": "failure", "SKIP": "skipped", "ERROR": "error"}
 _STATUS_RANK = {status: rank for rank, status in enumerate(("PASS", "SKIP", "WARN", "FAIL", "ERROR"))}
@@ -33,6 +35,7 @@ class _ReportCase:
     outcomes: tuple[tuple[str, str], ...] = ()
     duration_seconds: float = 0.0
     executed: bool = True
+    trace_path: str = ""
 
     @property
     def status(self) -> str:
@@ -56,13 +59,13 @@ def _trace_endpoint(doc: TraceDocument) -> str:
 
 
 def _detector_cases(
-    detector_ids: Iterable[str], findings: Sequence[Finding], endpoint: str, scope: str,
+    detector_ids: Iterable[str], findings: Sequence[Finding], endpoint: str, scope: str, *, trace_path: str = "",
 ) -> list[_ReportCase]:
     outcomes: dict[str, list[tuple[str, str]]] = defaultdict(list)
     for finding in findings:
         status = "FAIL" if finding.severity == "P0" else "WARN"
         outcomes[finding.detector_id].append((status, finding.message))
-    return [_ReportCase(rule_id, DETECTOR_NAMES[rule_id], scope, endpoint, tuple(outcomes[rule_id]))
+    return [_ReportCase(rule_id, DETECTOR_NAMES[rule_id], scope, endpoint, tuple(outcomes[rule_id]), trace_path=trace_path)
             for rule_id in sorted(detector_ids)]
 
 
@@ -71,6 +74,28 @@ def audit_cases(
 ) -> list[_ReportCase]:
     """Represent enabled single-trace detectors, including those with no findings."""
     return _detector_cases(VALID_AUDIT_DETECTORS if only is None else only, findings, _trace_endpoint(doc), "audit")
+
+
+def replay_cases(report: ReplayReport) -> list[_ReportCase]:
+    """Export every executed detector and the findings that can drive the replay gate."""
+    regressions: dict[str, list[Finding]] = defaultdict(list)
+    if report.regression is not None:
+        for breach in report.regression.new:
+            regressions[breach.trace].append(breach.finding)
+    cases = []
+    for trace in report.traces:
+        scope = f"replay.{trace.name}"
+        has_pair = trace.pair_findings is not None
+        detectors = DETECTOR_NAMES if has_pair else VALID_AUDIT_DETECTORS
+        findings = trace.findings if report.regression is None else regressions[trace.name]
+        trace_cases = _detector_cases(detectors, findings, "", scope, trace_path=trace.name)
+        if not has_pair:
+            trace_cases.append(_ReportCase(D5, DETECTOR_NAMES[D5], scope, executed=False,
+                                           outcomes=(("SKIP", "D5 requires a matching baseline trace."),)))
+        cases.extend(sorted(trace_cases, key=lambda case: case.rule_id or ""))
+    if report.exit_code == EXIT_SEMANTIC_REGRESSION:
+        cases.append(_ReportCase(None, "Replay verdict", "replay", outcomes=(("FAIL", "Strict replay detected a P1 breach."),)))
+    return cases
 
 
 def diff_cases(after: TraceDocument, report: DiffReport, *, ignore_timing: bool = False) -> list[_ReportCase]:
@@ -121,8 +146,11 @@ def _endpoint_uri(endpoint: str, rule_id: str, known_secrets: Sequence[str]) -> 
         path = parsed.path if parsed.scheme in ("http", "https") and parsed.hostname else ""
     except ValueError:
         path = ""
+    return _artifact_uri(path, rule_id, known_secrets, prefix="inferdiff-endpoints")
 
-    segments = ["inferdiff-endpoints"]
+
+def _artifact_uri(path: str, rule_id: str, known_secrets: Sequence[str], *, prefix: str) -> str:
+    segments = [prefix]
     for part in _clean_text(sanitize_url_path(path), known_secrets).split("/"):
         value = _clean_text(unquote(part), known_secrets)
         if value in ("", ".", ".."):
@@ -138,6 +166,7 @@ def render_sarif(cases: Sequence[_ReportCase], *, known_secrets: Sequence[str] =
     """Render executed rules and a result for each failed check or warning."""
     rules, results = [], []
     rule_indices: dict[str, int] = {}
+    uri_bases = {_SARIF_ENDPOINT_BASE: {"uri": "file:///", "description": {"text": "Root for synthetic endpoint paths."}}}
     for case in cases:
         rule_id = case.rule_id
         if not case.executed or rule_id is None:
@@ -149,14 +178,20 @@ def render_sarif(cases: Sequence[_ReportCase], *, known_secrets: Sequence[str] =
         for status, message in case.outcomes:
             if status not in _SARIF_LEVELS:
                 continue
-            uri = _endpoint_uri(case.endpoint, rule_id, known_secrets)
+            if case.trace_path:
+                uri = _artifact_uri(case.trace_path, rule_id, known_secrets, prefix="inferdiff-traces")
+                base = _SARIF_TRACE_BASE
+                uri_bases[base] = {"uri": "file:///", "description": {"text": "Root for synthetic trace paths."}}
+            else:
+                uri = _endpoint_uri(case.endpoint, rule_id, known_secrets)
+                base = _SARIF_ENDPOINT_BASE
             results.append({
                 "ruleId": rule_id,
                 "ruleIndex": rule_indices[rule_id],
                 "level": _SARIF_LEVELS[status],
                 "message": {"text": _clean_text(message, known_secrets) or rule_id},
                 "locations": [{
-                    "physicalLocation": {"artifactLocation": {"uri": uri, "uriBaseId": _SARIF_ENDPOINT_BASE}},
+                    "physicalLocation": {"artifactLocation": {"uri": uri, "uriBaseId": base}},
                     "logicalLocations": [{"name": rule_id, "fullyQualifiedName": uri}],
                 }],
             })
@@ -165,9 +200,7 @@ def render_sarif(cases: Sequence[_ReportCase], *, known_secrets: Sequence[str] =
         "version": "2.1.0",
         "runs": [{
             "tool": {"driver": {"name": "inferdiff", "version": __version__, "rules": rules}},
-            "originalUriBaseIds": {_SARIF_ENDPOINT_BASE: {
-                "uri": "file:///", "description": {"text": "Root for synthetic endpoint paths."},
-            }},
+            "originalUriBaseIds": uri_bases,
             "results": results,
         }],
     }, ensure_ascii=True, indent=2, allow_nan=False) + "\n"
@@ -187,7 +220,7 @@ def render_junit(cases: Sequence[_ReportCase], *, known_secrets: Sequence[str] =
         seconds = case.duration_seconds
         total_seconds += seconds
         name = f"{case.rule_id} {case.code}" if case.rule_id else case.code
-        testcase = ET.SubElement(suite, "testcase", classname=f"inferdiff.{case.scope}",
+        testcase = ET.SubElement(suite, "testcase", classname=_clean_text(f"inferdiff.{case.scope}", known_secrets),
                                  name=_clean_text(name, known_secrets), time=f"{seconds:.6f}")
         status = case.status
         if status == "PASS":

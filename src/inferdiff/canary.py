@@ -16,8 +16,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from . import __version__
+from ._urls import gemini_request_url
 from .anthropic import ANTHROPIC_VERSION, inspect_anthropic_stream, record_anthropic_stream
 from .detectors import D1, D2, D3, D4, Finding, audit_trace
+from .gemini import inspect_gemini_stream, record_gemini_stream
 from .recorder import RecorderError, RecorderHTTPError, record_stream, validate_and_merge_headers, validate_url
 from .redact import (
     extract_header_secret_values,
@@ -54,11 +56,13 @@ PROBE_CATALOG: Dict[str, Tuple[str, str, str]] = {
     "C7": ("FAKE_STREAMING_BUFFER", "P1", "https://github.com/BerriAI/litellm/issues/5803"),
     "C8": ("SEED_AND_RELAY_DRIFT", "P2", "https://docs.vllm.ai/en/stable/benchmarking/cli/"),
     "C9": ("anthropic_stream_contract", "P0", "https://platform.claude.com/docs/en/build-with-claude/streaming"),
+    "C10": ("gemini_stream_contract", "P0", "https://ai.google.dev/api/generate-content"),
 }
 
 C6_TARGET_TEXT = "吞吐量Δ=99.8% [🔥🚀🧪🌊]"
 C6_TRAILING_EMOJI = "🌊"
 C9_MAX_TOKENS = 32
+C10_MAX_OUTPUT_TOKENS = 32
 
 
 def _clean_display(text: Any, secrets_list: Sequence[str] = (), max_chars: int = 180) -> str:
@@ -190,21 +194,27 @@ def select_doctor_probes(
 ) -> Tuple[str, ...]:
     if profile not in PROFILE_PROBES:
         raise ValueError(f"Unknown doctor profile: {profile!r} (valid: quick, full, relay)")
-    if protocol not in (None, "openai", "anthropic"):
-        raise ValueError("Invalid protocol (expected openai or anthropic).")
+    if protocol not in (None, "openai", "anthropic", "gemini"):
+        raise ValueError("Invalid protocol (expected openai, anthropic, or gemini).")
     if anthropic_version is not None and not anthropic_version.strip():
         raise ValueError("--anthropic-version cannot be empty.")
-    if protocol == "openai" and anthropic_version is not None:
-        raise ValueError("--anthropic-version requires Anthropic Messages. Omit --protocol openai.")
+    if protocol in ("openai", "gemini") and anthropic_version is not None:
+        raise ValueError(f"--anthropic-version requires Anthropic Messages. Omit --protocol {protocol}.")
     if only is None:
+        if protocol == "gemini":
+            return ("C10",)
         return ("C9",) if protocol == "anthropic" or anthropic_version is not None else PROFILE_PROBES[profile]
     requested = {probe.strip().upper() for probe in only if probe.strip()}
     if not requested or requested - PROBE_CATALOG.keys():
         raise ValueError(f"Invalid --only value. Valid canary checks are {', '.join(PROBE_CATALOG)}.")
     if protocol == "anthropic" and requested != {"C9"}:
         raise ValueError("--protocol anthropic supports C9. To include OpenAI checks, omit --protocol.")
+    if protocol == "gemini" and requested != {"C10"}:
+        raise ValueError("--protocol gemini supports C10. To include other checks, omit --protocol.")
     if protocol == "openai" and "C9" in requested:
         raise ValueError("C9 uses Anthropic Messages. To select C9, omit --protocol openai.")
+    if protocol == "openai" and "C10" in requested:
+        raise ValueError("C10 uses Gemini SSE. To select C10, omit --protocol openai.")
     return tuple(probe for probe in PROBE_CATALOG if probe in requested)
 
 
@@ -215,6 +225,15 @@ def _doctor_headers(headers: Mapping[str, str], key: Optional[str], *, anthropic
     if key is None:
         return dict(headers)
     return validate_and_merge_headers(headers, {auth_name: key if anthropic else f"Bearer {key}"})
+
+
+def _gemini_headers(headers: Mapping[str, str], key: str | None, query_key: str | None) -> Dict[str, str]:
+    auth_name = "x-goog-api-key"
+    if key is None:
+        if any(name.lower() == auth_name for name in headers):
+            return dict(headers)
+        key = query_key or os.environ.get("GEMINI_API_KEY", "").strip() or os.environ.get("GOOGLE_API_KEY", "").strip()
+    return validate_and_merge_headers(headers, {auth_name: key}) if key else dict(headers)
 
 
 def _format_origin(parsed: urllib.parse.SplitResult) -> str:
@@ -295,6 +314,50 @@ def _pick_preferred_model(ids: List[str]) -> Optional[str]:
         if not any(w in low for w in skip_words):
             return mid
     return ids[0]
+
+
+def _resolve_gemini_target(
+    base_url: str, model: str | None, headers: Mapping[str, str], timeout: float,
+) -> tuple[str, str]:
+    parsed = validate_url(base_url)
+    path = parsed.path.rstrip("/")
+    prefix, separator, resource = path.rpartition("/v1beta/models")
+    model_in_url = ""
+    if separator and (not resource or resource.startswith("/")):
+        path = f"{prefix}/v1beta"
+        if resource.endswith(":streamGenerateContent"):
+            model_in_url = urllib.parse.unquote(resource[1:-len(":streamGenerateContent")])
+    elif not path.endswith("/v1beta"):
+        for suffix in ("/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1"):
+            if path.endswith(suffix):
+                path = path[:-len(suffix)]
+                break
+        path += "/v1beta"
+
+    query = [(name, value) for name, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+             if name.lower() != "alt"]
+    origin = _format_origin(parsed)
+    models_path = f"{path}/models"
+    resolved_model = (model or "").strip().removeprefix("models/") or model_in_url
+    if not resolved_model:
+        models_url = origin + models_path
+        if query:
+            models_url += "?" + urllib.parse.urlencode(query)
+        _, models = _http_get_json(models_url, headers, min(timeout, 15.0))
+        entries = models.get("models") if models else None
+        ids = []
+        if isinstance(entries, list):
+            for entry in entries:
+                name = entry.get("name") if isinstance(entry, dict) else None
+                if isinstance(name, str) and name:
+                    methods = entry.get("supportedGenerationMethods")
+                    if methods is None or isinstance(methods, list) and "generateContent" in methods:
+                        ids.append(name.removeprefix("models/"))
+        resolved_model = _pick_preferred_model(ids) or "inferdiff-probe"
+
+    stream_path = f"{models_path}/{urllib.parse.quote(resolved_model, safe='')}:streamGenerateContent"
+    stream_query = urllib.parse.urlencode([("alt", "sse"), *query])
+    return f"{origin}{stream_path}?{stream_query}", resolved_model
 
 
 def resolve_endpoints_and_model(
@@ -1563,6 +1626,58 @@ def _run_c9(
     )
 
 
+def _run_c10(
+    url: str,
+    headers: Dict[str, str],
+    timeout: float,
+    save_dir: Optional[Path],
+    secrets_list: Sequence[str],
+) -> ProbeResult:
+    code, severity, reference = PROBE_CATALOG["C10"]
+    prompt = (
+        'Write a JSON array alternating the literal strings "北" and "🌐" 1000 times. '
+        "Start the array immediately. Write the literal characters and include every entry."
+    )
+    body = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": C10_MAX_OUTPUT_TOKENS},
+    }
+    path = _save_path(save_dir, "c10_gemini_stream_contract.trace.jsonl")
+    started = time.monotonic()
+    try:
+        doc = record_gemini_stream(url=url, request_body=body, out_path=path, headers=headers,
+                                   label="doctor-C10", timeout=timeout, known_secrets=secrets_list)
+    except RecorderError as exc:
+        duration = (time.monotonic() - started) * 1000
+        if isinstance(exc, RecorderHTTPError) and exc.status_code in (404, 405, 501):
+            return ProbeResult("C10", code, severity, "SKIP",
+                               f"Gemini streamGenerateContent is unsupported (HTTP {exc.status_code})",
+                               duration, 0, None, reference)
+        return ProbeResult("C10", code, severity, "ERROR", _clean_display(f"transport/HTTP error: {exc}", secrets_list),
+                           duration, 0, None, reference)
+
+    contract = inspect_gemini_stream(doc, max_tokens=C10_MAX_OUTPUT_TOKENS)
+    status = "FAIL" if contract.violations else "PASS"
+    summary = (contract.violations[0] if contract.violations else
+               "Honest MAX_TOKENS finish, valid usage, and intact UTF-8.")
+    return ProbeResult(
+        "C10", code, severity, status, _clean_display(summary, secrets_list),
+        doc.summary.timing.get("total_ms") or (time.monotonic() - started) * 1000,
+        doc.summary.total_frames, contract.total_tokens, reference,
+        trace_paths=[str(path)] if path else [], traces=[doc],
+        details={
+            "finish_reason": _clean_display(contract.finish_reason, secrets_list) if contract.finish_reason else None,
+            "max_output_tokens": C10_MAX_OUTPUT_TOKENS,
+            "prompt_tokens": contract.prompt_tokens,
+            "candidate_tokens": contract.candidate_tokens,
+            "thoughts_tokens": contract.thoughts_tokens,
+            "total_tokens": contract.total_tokens,
+            "thought_frames": contract.thought_frames,
+            "violations": [_clean_display(message, secrets_list) for message in contract.violations],
+        },
+    )
+
+
 _PROBE_RUNNERS = {
     "C1": _run_c1,
     "C2": _run_c2,
@@ -1616,40 +1731,53 @@ def run_doctor(
     protocol: Optional[str] = None,
     anthropic_version: Optional[str] = None,
 ) -> DoctorReport:
-    """Execute selected live canaries; the standard profiles opt out of C9."""
+    """Execute selected live canaries across the requested streaming protocols."""
     probes = select_doctor_probes(profile, only, protocol=protocol, anthropic_version=anthropic_version)
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("--timeout must be a finite number greater than zero.")
     extra_headers = validate_and_merge_headers({}, headers)
     key = resolve_api_key(api_key)
     url_secrets = extract_url_secret_values(base_url)
+    request_base_url = base_url
+    all_secrets = url_secrets + extract_header_secret_values(extra_headers, min_length=1)
+    if key:
+        all_secrets.append(key)
+    if "C10" in probes:
+        request_base_url, query_key = gemini_request_url(base_url)
+        gemini_headers = _gemini_headers(extra_headers, key, query_key)
+        all_secrets.extend(extract_header_secret_values(gemini_headers, min_length=1))
+        gemini_url, gemini_model = _resolve_gemini_target(request_base_url, model, gemini_headers, timeout)
     if "C9" in probes:
-        messages_url, models_url = _resolve_anthropic_urls(base_url)
+        messages_url, models_url = _resolve_anthropic_urls(request_base_url)
         messages_headers = _doctor_headers(extra_headers, key, anthropic=True)
         if anthropic_version is not None or not any(name.lower() == "anthropic-version" for name in messages_headers):
             messages_headers = validate_and_merge_headers(messages_headers, {
                 "anthropic-version": anthropic_version.strip() if anthropic_version else ANTHROPIC_VERSION,
             })
         messages_secrets = extract_header_secret_values(messages_headers, min_length=1) + url_secrets
-    if probes == ("C9",):
-        chat_url, dialect, known_secrets = messages_url, "anthropic-messages", messages_secrets
-        resolved_model = (model or "").strip()
-        if not resolved_model:
+        all_secrets.extend(messages_secrets)
+
+    if any(pid in _PROBE_RUNNERS for pid in probes):
+        req_headers = _doctor_headers(extra_headers, key)
+        all_secrets.extend(extract_header_secret_values(req_headers, min_length=1))
+        chat_url, responses_url, dialect, resolved_model = resolve_endpoints_and_model(
+            request_base_url, model=model, headers=req_headers, timeout=timeout,
+            known_secrets=extract_header_secret_values(req_headers),
+        )
+        messages_model = (model or "").strip() or resolved_model
+    elif "C9" in probes:
+        chat_url, dialect = messages_url, "anthropic-messages"
+        messages_model = (model or "").strip()
+        if not messages_model:
             _, models = _http_get_json(models_url, messages_headers, min(timeout, 15.0))
             data = models.get("data") if models else None
             ids = [entry["id"] for entry in data if isinstance(entry, dict)
                    and isinstance(entry.get("id"), str) and entry["id"]] if isinstance(data, list) else []
             # Some relays don't expose model discovery. Send the probe so an absent Messages route still skips.
-            resolved_model = _pick_preferred_model(ids) or "inferdiff-probe"
-        messages_model = resolved_model
+            messages_model = _pick_preferred_model(ids) or "inferdiff-probe"
+        resolved_model = messages_model
     else:
-        req_headers = _doctor_headers(extra_headers, key)
-        known_secrets = extract_header_secret_values(req_headers, min_length=1) + url_secrets
-        chat_url, responses_url, dialect, resolved_model = resolve_endpoints_and_model(
-            base_url, model=model, headers=req_headers, timeout=timeout,
-            known_secrets=extract_header_secret_values(req_headers),
-        )
-        messages_model = (model or "").strip() or resolved_model
+        chat_url, dialect, resolved_model = gemini_url, "gemini-sse", gemini_model
 
     if save_dir == "":
         ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -1666,9 +1794,11 @@ def run_doctor(
     for pid in probes:
         if pid == "C9":
             res = _run_c9(messages_url, messages_model, messages_headers, timeout, out_dir, messages_secrets)
+        elif pid == "C10":
+            res = _run_c10(gemini_url, gemini_headers, timeout, out_dir, all_secrets)
         else:
             runner = _PROBE_RUNNERS[pid]
-            res = runner(chat_url, responses_url, dialect, resolved_model, req_headers, timeout, out_dir, profile, known_secrets)
+            res = runner(chat_url, responses_url, dialect, resolved_model, req_headers, timeout, out_dir, profile, all_secrets)
         results.append(res)
 
     grade, rc, p0_count, warn_count, err_count = compute_wire_grade(results, strict=strict)
@@ -1676,10 +1806,10 @@ def run_doctor(
     total_tokens = sum(known_toks) if known_toks else None
 
     report = DoctorReport(
-        target_url=_report_url(base_url, known_secrets),
-        chat_url=_report_url(chat_url, known_secrets),
+        target_url=_report_url(base_url, all_secrets),
+        chat_url=_report_url(chat_url, all_secrets),
         dialect=dialect,
-        model=_clean_display(resolved_model, known_secrets, 128),
+        model=_clean_display(resolved_model, all_secrets, 128),
         profile=profile,
         grade=grade,
         exit_code=rc,
@@ -1691,7 +1821,6 @@ def run_doctor(
         results=results,
     )
     if out_dir is not None:
-        all_secrets = known_secrets + messages_secrets if "C9" in probes else known_secrets
         (out_dir / "doctor_summary.json").write_text(
             json.dumps(scrub_report_data(report.to_dict(), all_secrets), ensure_ascii=True, indent=2,
                        allow_nan=False) + "\n",

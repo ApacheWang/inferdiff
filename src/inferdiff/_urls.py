@@ -1,6 +1,6 @@
 """Shared validation for inference and telemetry targets."""
 
-from urllib.parse import SplitResult, urlsplit
+from urllib.parse import SplitResult, unquote_plus, urlsplit
 
 from .redact import has_control_chars
 
@@ -28,3 +28,17 @@ def validate_url(url: str) -> SplitResult:
     if port == 0:
         raise RecorderError("Invalid URL port.")
     return parsed
+
+
+def gemini_request_url(url: str) -> tuple[str, str | None]:
+    """Separate query credentials from a Gemini URL for header-only authentication."""
+    parsed = validate_url(url)
+    params = []
+    key = None
+    for field in parsed.query.split("&"):
+        name, _, value = field.partition("=")
+        if unquote_plus(name).lower() in {"key", "x-goog-api-key"}:
+            key = key or unquote_plus(value) or None
+        elif field:
+            params.append(field)
+    return parsed._replace(query="&".join(params), fragment="").geturl(), key

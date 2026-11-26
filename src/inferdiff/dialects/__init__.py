@@ -5,13 +5,15 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from ..schema import NormalizedDelta
-from . import anthropic_messages, ollama_ndjson, openai_chat, openai_responses, sglang_native
+from . import anthropic_messages, gemini_sse, ollama_ndjson, openai_chat, openai_responses, sglang_native
 
 
 def detect_dialect(url_path: str, content_type: str = "") -> str:
     """Infer dialect from URL path and Content-Type when --dialect=auto."""
     path = url_path.rstrip("/").lower()
     ct = content_type.split(";", 1)[0].strip().lower()
+    if path.endswith(":streamgeneratecontent"):
+        return "gemini-sse"
     if path.endswith("/v1/messages"):
         return "anthropic-messages"
     if path.endswith("/v1/responses") or path.endswith("/responses"):
@@ -42,4 +44,6 @@ def normalize_payload(
         return ollama_ndjson.normalize_frame(payload, sse_event)
     if dialect == "anthropic-messages":
         return anthropic_messages.normalize_frame(payload, sse_event)
+    if dialect == "gemini-sse":
+        return gemini_sse.normalize_frame(payload)
     raise ValueError(f"Unsupported dialect: {dialect!r}")

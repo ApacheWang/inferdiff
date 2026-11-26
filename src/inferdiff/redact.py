@@ -97,6 +97,13 @@ _REPORT_QUOTED_HEADER_RE = re.compile(
 )
 _REDACTED_QUERY_RE = re.compile(r"REDACTED_sha256:[a-f0-9]{8}\Z")
 _REDACTED_HEADER_RE = re.compile(r"(?:[\w-]+ )?\$REDACTED_sha256:[a-f0-9]{8}\Z")
+_GEMINI_QUERY_KEY_RE = re.compile(
+    r"(?i)((?:[?&]|&amp;|\\u0026|\\u003f)(?:key|x-goog-api-key)=)([^&#\s\"'\\<>]+)"
+)
+_GEMINI_HEADER_KEY_RE = re.compile(
+    r"(?i)(?<![\w-])((?P<quote>[\"']?)x-goog-api-key(?P=quote)[ \t]*[:=][ \t]*)"
+    r"(\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s\"'&,;}{<>]+)"
+)
 _PATH_CREDENTIAL_NAMES = {"key", "token", "sig", "signature", "bearer"}
 
 SAFE_REPRO_PROTOCOL_KEYS = frozenset(
@@ -202,11 +209,18 @@ def extract_url_secret_values(url: str) -> list[str]:
         return []
     bare_query = [part for part in parts.query.split("&") if part and "=" not in part]
     _, path_secrets = _sanitize_url_path(parts.path)
-    return [urllib.parse.unquote(value) for value in (parts.username, parts.password, parts.fragment, *bare_query)
-            if value] + [
-        value for name, value in urllib.parse.parse_qsl(parts.query)
-        if name.lower() not in SAFE_EXPORT_QUERY_KEYS and not _REDACTED_QUERY_RE.fullmatch(value)
-    ] + path_secrets
+    secrets = [urllib.parse.unquote(value) for value in (parts.username, parts.password, parts.fragment, *bare_query)
+               if value]
+    for field in parts.query.split("&"):
+        raw_name, equals, raw_value = field.partition("=")
+        if not equals or urllib.parse.unquote_plus(raw_name).lower() in SAFE_EXPORT_QUERY_KEYS:
+            continue
+        value = urllib.parse.unquote_plus(raw_value)
+        if value and not _REDACTED_QUERY_RE.fullmatch(value):
+            secrets.append(value)
+            if raw_value != value:
+                secrets.append(raw_value)
+    return secrets + path_secrets
 
 
 def _is_report_credential(key: str) -> bool:
@@ -240,25 +254,35 @@ def sanitize_url_path(path: str) -> str:
     return _sanitize_url_path(path)[0]
 
 
+def _secret_variants(known_secrets: Sequence[str], min_length: int) -> dict[str, str]:
+    variants = {}
+    for secret in sorted({s for s in known_secrets if isinstance(s, str) and len(s) >= min_length}):
+        for variant in (
+            secret, urllib.parse.quote(secret, safe="", errors="replace"), urllib.parse.quote(secret, errors="replace"),
+            urllib.parse.quote_plus(secret, errors="replace"), json.dumps(secret, ensure_ascii=True)[1:-1],
+        ):
+            variants.setdefault(variant, secret)
+    return variants
+
+
+def _secret_pattern(variants: Mapping[str, str]) -> re.Pattern[str]:
+    alternatives = []
+    for value in sorted(variants, key=lambda value: (-len(value), value)):
+        literal = re.escape(value)
+        if len(value) < 4 and value.isalnum():
+            literal = rf"(?<!\w){literal}(?!\w)"
+        alternatives.append(literal)
+    return re.compile("|".join(alternatives))
+
+
 def scrub_report_text(text: str, known_secrets: Sequence[str] = ()) -> str:
     """Redact credentials and their common encodings in user-visible report fields."""
     if not text:
         return text
 
-    variants = {
-        variant for secret in known_secrets if secret for variant in (
-            secret, urllib.parse.quote(secret, safe="", errors="replace"), urllib.parse.quote(secret, errors="replace"),
-            urllib.parse.quote_plus(secret, errors="replace"), json.dumps(secret, ensure_ascii=True)[1:-1],
-        )
-    }
+    variants = _secret_variants(known_secrets, 1)
     if variants:
-        alternatives = []
-        for value in sorted(variants, key=len, reverse=True):
-            literal = re.escape(value)
-            if len(value) < 4 and value.isalnum():
-                literal = rf"(?<!\w){literal}(?!\w)"
-            alternatives.append(literal)
-        pattern = re.compile("|".join(alternatives))
+        pattern = _secret_pattern(variants)
         text = pattern.sub("[redacted]", text)
         # Proxies may percent-encode characters that urllib.quote leaves unescaped.
         decoded = urllib.parse.unquote(text)
@@ -304,28 +328,45 @@ def scrub_report_data(value: Any, known_secrets: Sequence[str] = ()) -> Any:
     return scrub(value)
 
 
-def scrub_known_secrets(text: str, known_secrets: Sequence[str] = ()) -> str:
+def scrub_known_secrets(text: str, known_secrets: Sequence[str] = (), *, min_length: int = 6) -> str:
     """Scrub exact known outgoing secret strings plus standard secret patterns from text."""
     if not text:
         return text
-    out = text
-    for sec in sorted(set(s for s in known_secrets if isinstance(s, str) and len(s) >= 6), key=len, reverse=True):
-        if sec in out:
-            out = out.replace(sec, f"$REDACTED_sha256:{fingerprint8(sec)}")
-    return redact_secret_text(out)
+    variants = _secret_variants(known_secrets, min_length)
+    if variants:
+        text = _secret_pattern(variants).sub(
+            lambda match: f"$REDACTED_sha256:{fingerprint8(variants[match.group()])}", text,
+        )
+    return redact_secret_text(text)
 
 
 def redact_secret_text(text: str) -> str:
     """Scrub recognized credential patterns from free-form text or wire excerpts."""
     if not text:
         return text
-    out = text
+    def redact_query_key(match: re.Match[str]) -> str:
+        prefix, value = match.groups()
+        if value == "[redacted]" or _REDACTED_QUERY_RE.fullmatch(value.removeprefix("$")):
+            return match.group()
+        return prefix + f"REDACTED_sha256:{fingerprint8(value)}"
+
+    def redact_google_header(match: re.Match[str]) -> str:
+        prefix, _, value = match.groups()
+        quote = value[0] if value[0] in "\"'" else ""
+        secret = value[1:-1] if quote else value
+        if not secret or secret == "[redacted]" or _REDACTED_HEADER_RE.fullmatch(secret):
+            return match.group()
+        return f"{prefix}{quote}$REDACTED_sha256:{fingerprint8(secret)}{quote}"
+
+    out = _GEMINI_QUERY_KEY_RE.sub(redact_query_key, text)
+    out = _GEMINI_HEADER_KEY_RE.sub(redact_google_header, out)
     for idx, pat in enumerate(_SECRET_VALUE_PATTERNS):
         if idx == 6:
             out = pat.sub(lambda m: f"{m.group(1)} $REDACTED_sha256:{fingerprint8(m.group(0))}", out)
         elif idx == 7:
             out = pat.sub(
-                lambda m: f"{m.group(1)}{m.group(2)}$REDACTED_sha256:{fingerprint8(m.group(3))}",
+                lambda m: m.group() if m.group(3) == "[redacted]" or _REDACTED_HEADER_RE.fullmatch(m.group(3))
+                else f"{m.group(1)}{m.group(2)}$REDACTED_sha256:{fingerprint8(m.group(3))}",
                 out,
             )
         else:

@@ -6,14 +6,15 @@ import base64
 import hashlib
 import html
 import urllib.parse
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import __version__
 from .canary import DoctorReport
 from .detectors import D6, D7, D8, Finding
 from .differ import DiffReport
 from .exporter import _safe_frame_summary, _sanitized_curl_lines, _strip_controls_and_newlines
-from .redact import redact_secret_text
+from .redact import redact_secret_text, scrub_report_text
+from .replay import ReplayBreach, ReplayReport
 from .schema import TraceDocument, TraceFrame, frame_has_effective_payload, is_finite_number
 
 MAX_HTML_BYTES = 81_920
@@ -715,6 +716,41 @@ def render_audit_html(
         title, f"{verdict} | {doc.summary.total_frames} frames", _assemble,
         fallback_kpi=probe_kpi if doc.summary.backend_probe is not None else "",
     )
+
+
+def render_replay_html(report: ReplayReport, *, known_secrets: Sequence[str] = ()) -> str:
+    """Render an offline HTML summary and detector findings for a trace bundle."""
+    def finding_table(breaches: Sequence[ReplayBreach]) -> str:
+        if not breaches:
+            return ""
+        rows = []
+        for breach in breaches:
+            finding = breach.finding
+            trace = _esc(scrub_report_text(breach.trace, known_secrets))
+            message = _esc(scrub_report_text(finding.message, known_secrets))
+            rows.append(f"<tr><td>{trace}</td><td>{finding.detector_id}</td><td>{finding.severity}</td><td>{message}</td></tr>")
+        return (
+            "<table><thead><tr><th>Trace</th><th>Detector</th><th>Severity</th><th>Finding</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table>"
+        )
+
+    sections = [
+        '<div class="hero"><h1>inferdiff replay</h1>'
+        f"<p>{len(report.traces)} traces · Exit code {report.exit_code}</p></div>"
+    ]
+    if report.regression is None:
+        for trace in report.traces:
+            name = _esc(scrub_report_text(trace.name, known_secrets))
+            breaches = [ReplayBreach(trace.name, finding) for finding in trace.findings]
+            sections.append(
+                f'<section class="sec"><h2>{name}</h2><p>{len(breaches)} findings</p>{finding_table(breaches)}</section>'
+            )
+    else:
+        for section, breaches in report.regression.sections():
+            sections.append(
+                f'<section class="sec"><h2>{section}</h2><p>{len(breaches)} findings</p>{finding_table(breaches)}</section>'
+            )
+    return _wrap_html_document("inferdiff replay", "".join(sections))
 
 
 def render_doctor_html(report: DoctorReport, *, include_wire: bool = False) -> str:

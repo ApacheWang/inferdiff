@@ -169,6 +169,11 @@ def detect_d2(doc: TraceDocument) -> List[Finding]:
     # Spec §4.2: nonempty reasoning predicate (any reasoning characters or unclosed <think>)
     has_reasoning = (reasoning_text != "") or has_unclosed_think
 
+    if doc.header.dialect == "gemini-sse" and doc.summary.eof_clean and finish_reason == "MAX_TOKENS":
+        thought_tokens = usage.get("reasoning_tokens")
+        if has_reasoning or (is_strict_int(thought_tokens) and thought_tokens > 0):
+            return []  # Gemini can use the entire budget for thinking.
+
     # Observed stop-match guard: only suppress D2 when the reported matched_stop actually
     # corresponds to one of the request's configured stop conditions (strict type match).
     matched_configured_stop = (
@@ -182,7 +187,7 @@ def detect_d2(doc: TraceDocument) -> List[Finding]:
         return []
 
     has_tokens = is_strict_int(comp_tokens) and comp_tokens >= 1
-    stopped_empty = finish_reason == "stop"
+    stopped_empty = finish_reason == "stop" or (doc.header.dialect == "gemini-sse" and finish_reason == "STOP")
 
     if has_tokens or has_reasoning or stopped_empty:
         return [

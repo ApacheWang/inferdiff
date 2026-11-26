@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/ApacheWang/inferdiff/actions/workflows/ci.yml/badge.svg)](https://github.com/ApacheWang/inferdiff/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://github.com/ApacheWang/inferdiff)
-[![零第三方依赖](https://img.shields.io/badge/dependencies-0%20stdlib%20only-2ea043)](pyproject.toml)
+[![零第三方依赖](https://raw.githubusercontent.com/ApacheWang/inferdiff/main/assets/badge-zero-deps.svg)](pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 **HTTP 返回 `200 OK`，不代表你的流式推理真的没坏。**

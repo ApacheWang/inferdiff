@@ -9,7 +9,7 @@
 
 Catch silent `HTTP 200 OK` failures — truncated tool JSON, ghost thinking starvation, buffered nonconformant SSE relays, and illusory benchmark speedups — with **zero third-party runtime dependencies** (Python 3.11+ standard library only).
 
-[中文文档 (README.zh-CN.md)](https://github.com/ApacheWang/inferdiff/blob/main/README.zh-CN.md)
+[中文文档 (README.zh-CN.md)](https://github.com/ApacheWang/inferdiff/blob/main/README.zh-CN.md) · [PyPI (`inferdiff`)](https://pypi.org/project/inferdiff/) · [Releases](https://github.com/ApacheWang/inferdiff/releases)
 
 ![inferdiff live relay doctor and GitHub Issue export demo](https://raw.githubusercontent.com/ApacheWang/inferdiff/main/assets/hero-demo.gif)
 
@@ -24,24 +24,22 @@ Standard uptime monitors and latency benchmarks only check HTTP status codes and
 | **AI Infra & Perf Engineers** | Engine upgrades report massive throughput/TTFT jumps because fixed-length `ignore_eos` runs stopped at `8 / 8000` tokens, prefix caches leaked across runs, or empty handshake frames gamed first-frame timers. | [`SGLang #53119`](https://github.com/sgl-project/sglang/pull/53119), [`SGLang #50443`](https://github.com/sgl-project/sglang/issues/50443), [vLLM Benchmarking CLI](https://docs.vllm.ai/en/stable/benchmarking/cli/) | Separates empty handshake `ttff_ms` from real `ttft_effective_ms` and flags short-generation & cache-pollution illusions (`D3`, `D5`). |
 | **OSS Contributors & Release CI** | SSE chunk boundaries shift between runs, making raw `curl` logs impossible to diff by eye — while noisy log dumps get closed upstream. | [rusefi LLM Policy](https://github.com/rusefi/rusefi/wiki/LLM-policy) | Normalizes chunk jitter, pins the **exact first divergent wire frame**, and exports an airgapped `<80 KiB` HTML waterfall or a `<=25`-line redacted `curl` reproducer. |
 
-## Quickstart
+## 5-Second Quickstart (Zero Install via `uvx` or `pip`)
 
-Zero-install via [`uvx`](https://docs.astral.sh/uv/guides/tools/) directly from GitHub, or install locally with `pip` (Python 3.11+, zero runtime dependencies):
+Zero-install via [`uvx`](https://docs.astral.sh/uv/guides/tools/) directly from [PyPI](https://pypi.org/project/inferdiff/), or install locally with `pip` (Python 3.11+, zero third-party dependencies):
 
 ```bash
 # 1. Zero-install live health check on a local engine (llama-server, vLLM, SGLang, Ollama)
-uvx --from git+https://github.com/ApacheWang/inferdiff inferdiff \
-  doctor http://127.0.0.1:8080/v1 --html doctor.html
+uvx inferdiff doctor http://127.0.0.1:8080/v1 --html doctor.html
 
 # 2. Audit an OpenAI-compatible relay API + generate shareable single-file HTML scorecard
-OPENAI_API_KEY=sk-... uvx --from git+https://github.com/ApacheWang/inferdiff inferdiff \
-  doctor https://api.your-relay.example/v1 \
+OPENAI_API_KEY=sk-... uvx inferdiff doctor https://api.your-relay.example/v1 \
   --model qwen3-32b --profile relay --html relay-report.html
 
-# 3. Or install once locally (or clone this repo to try bundled golden examples offline)
-pip install git+https://github.com/ApacheWang/inferdiff
+# 3. Or install once from PyPI
+pip install inferdiff
 
-# Offline demo on bundled Case 1 (llama.cpp #30773, no GPU or server required)
+# Offline demo on bundled Case 1 (llama.cpp #30773, clone repo — no GPU or server required)
 inferdiff diff \
   examples/case1_responses_truncated_tool/baseline.trace.jsonl \
   examples/case1_responses_truncated_tool/target.trace.jsonl \

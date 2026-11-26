@@ -11,7 +11,7 @@
 
 如果把压测工具比作“测水流快慢的水表”，把评测数据集比作“给作文打分的评委”，`inferdiff` 就是抓获底层静默损坏的 **Wireshark + 协议验钞机**。
 
-[English Documentation (README.md)](README.md)
+[English Documentation (README.md)](README.md) · [PyPI (`inferdiff`)](https://pypi.org/project/inferdiff/) · [Releases](https://github.com/ApacheWang/inferdiff/releases)
 
 ![inferdiff 实时中转体检与 25 行 GitHub Issue 导出演示](assets/hero-demo.gif)
 
@@ -24,24 +24,22 @@
 | **AI Infra 与压测工程师** | 升级跑分看似“吞吐暴涨、TTFT 大降”，结果是定长 `ignore_eos` 请求提前短生成（如 `8 / 8000`）、前缀缓存未隔离污染基线，或靠提前发空握手帧刷低首帧延迟。 | [`SGLang #53119`](https://github.com/sgl-project/sglang/pull/53119)、[`SGLang #50443`](https://github.com/sgl-project/sglang/issues/50443)、[vLLM Benchmarking CLI](https://docs.vllm.ai/en/stable/benchmarking/cli/) | 严格剥离“空握手 `ttff_ms`”与“真首字 `ttft_effective_ms`”，自动拦截短生成与假加速（`D3`、`D5`）。 |
 | **开源贡献者与发版 CI** | 流式输出每次切块位置不同，肉眼滚 `curl` 难以定位分叉帧；贴大段原始日志提 Issue 又常被维护者视为噪音直接关闭。 | [rusefi LLM Policy](https://github.com/rusefi/rusefi/wiki/LLM-policy) | 双层状态机抹平切块抖动，精准锁定**第一处分歧物理帧**，一键导出内网秒开的单文件 `<80 KiB` HTML 瀑布图与 `<=25` 行脱敏复现单。 |
 
-## 快速上手
+## 5 秒零配置上手
 
-可通过 [`uvx`](https://docs.astral.sh/uv/guides/tools/) 直接从 GitHub 零安装运行，或使用 `pip` 本地安装（Python 3.11+，零第三方运行时依赖）：
+已正式上线 [PyPI](https://pypi.org/project/inferdiff/)，可通过 [`uvx`](https://docs.astral.sh/uv/guides/tools/) 零安装运行，或使用 `pip` 本地安装（Python 3.11+，零第三方运行时依赖）：
 
 ```bash
 # 1. 无需录制历史包，零安装一键体检本地推理引擎并生成单文件 HTML 瀑布图
-uvx --from git+https://github.com/ApacheWang/inferdiff inferdiff \
-  doctor http://127.0.0.1:8080/v1 --html doctor.html
+uvx inferdiff doctor http://127.0.0.1:8080/v1 --html doctor.html
 
 # 2. 专检第三方 OpenAI 兼容中转站（密钥自动脱敏），生成可截图分享的 HTML 评分卡
-OPENAI_API_KEY=sk-... uvx --from git+https://github.com/ApacheWang/inferdiff inferdiff \
-  doctor https://api.your-relay.example/v1 \
+OPENAI_API_KEY=sk-... uvx inferdiff doctor https://api.your-relay.example/v1 \
   --model qwen3-32b --profile relay --html relay-report.html
 
-# 3. 或本地安装一次（克隆仓库即可离线体验内置 3 组真实故障黄金样本）
-pip install git+https://github.com/ApacheWang/inferdiff
+# 3. 或通过 PyPI 安装一次
+pip install inferdiff
 
-# 无需 GPU，直接用内置 Case 1（llama.cpp #30773）体验 diff、HTML 瀑布图与 25 行工单导出
+# 无需 GPU，克隆仓库即可直接用内置 Case 1（llama.cpp #30773）体验 diff、HTML 瀑布图与 25 行工单导出
 inferdiff diff \
   examples/case1_responses_truncated_tool/baseline.trace.jsonl \
   examples/case1_responses_truncated_tool/target.trace.jsonl \

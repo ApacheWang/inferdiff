@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install editable package
+        run: python -m pip install -e .
+
+      - name: Run unit and integration test suite
+        run: python -m unittest discover -s tests -v
+
+      - name: Verify CLI golden examples, <=25-line issue export, and <80 KiB HTML waterfall
+        shell: python
+        run: |
+          import pathlib, subprocess, sys, tempfile
+          with tempfile.TemporaryDirectory() as td:
+              h1 = pathlib.Path(td) / "case1.html"
+              checks = [
+                  (["inferdiff", "diff", "examples/case1_responses_truncated_tool/baseline.trace.jsonl", "examples/case1_responses_truncated_tool/target.trace.jsonl", "--html", str(h1), "--no-color"], 2),
+                  (["inferdiff", "diff", "examples/case2_ollama_ghost_thinking_tokens/baseline.trace.jsonl", "examples/case2_ollama_ghost_thinking_tokens/target.trace.jsonl", "--no-color"], 2),
+                  (["inferdiff", "diff", "examples/case3_sglang_8_of_8000_short_gen/baseline.trace.jsonl", "examples/case3_sglang_8_of_8000_short_gen/target.trace.jsonl", "--fail-on", "p1", "--no-color"], 3),
+              ]
+              for cmd, expected in checks:
+                  res = subprocess.run(cmd, capture_output=True, text=True)
+                  if res.returncode != expected:
+                      print(f"FAIL {cmd}: got {res.returncode}, expected {expected}", file=sys.stderr)
+                      print(res.stdout, res.stderr, file=sys.stderr)
+                      sys.exit(1)
+              assert h1.exists() and h1.stat().st_size <= 81920, f"HTML missing or oversized: {h1.stat().st_size}"
+              exp = subprocess.run(
+                  ["inferdiff", "export", "examples/case1_responses_truncated_tool/baseline.trace.jsonl", "examples/case1_responses_truncated_tool/target.trace.jsonl", "--format", "github-issue"],
+                  capture_output=True,
+                  text=True,
+              )
+              assert exp.returncode == 2 and len(exp.stdout.splitlines()) <= 25, f"Issue export invalid: rc={exp.returncode}, lines={len(exp.stdout.splitlines())}"
+          print("All golden examples, <=25-line issue export, and <80 KiB HTML waterfall verified.")

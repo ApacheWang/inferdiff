@@ -11,6 +11,9 @@
 - Added offline `replay` for trace files and directories, with `--baseline` to gate new findings by relative path.
 - Added SARIF 2.1.0 and JUnit XML exports. The GitHub Action accepts optional `sarif-output` and `junit-output` paths in live and offline modes.
 - Added `inferdiff init` to scaffold GitHub Actions and GitLab CI canaries and offline pre-commit baseline checks.
+- Added `inferdiff.testing` for offline stream and live endpoint assertions, and `inferdiff badge` for SVG doctor grade badges.
+- Added Prometheus metrics at the proxy's `/_inferdiff/metrics` endpoint.
+- Extended `inferdiff audit` to read SSE, NDJSON, and saved traces from files or stdin, with redacted JSON, SARIF, JUnit, and GitHub Issue output.
 - Hardened credential redaction for protocol-token collisions, handling of malformed traces and relay responses, report serialization, and comparisons with zero-duration samples.
 
 ## v0.1.1

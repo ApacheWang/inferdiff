@@ -7,7 +7,7 @@ import json
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 from ._probe_data import NUMBER, PROBE_FIELDS
 
@@ -385,6 +385,7 @@ def assemble_summary(
     total_ms: float,
     socket_eof_clean: bool = True,
     backend_probe_summary: Optional[Dict[str, Any]] = None,
+    ndjson: bool = False,
 ) -> TraceSummary:
     """Build deterministic TraceSummary from recorded frames with strict protocol ordering."""
     dialect = header.dialect
@@ -745,6 +746,8 @@ def assemble_summary(
     # Strict dialect-specific clean EOF
     if not socket_eof_clean or protocol_violations:
         eof_clean = False
+    elif dialect == "sglang-native" and ndjson:
+        eof_clean = saw_finish_reason
     elif dialect in ("openai-chat", "sglang-native"):
         eof_clean = saw_done_sentinel
     elif dialect == "openai-responses":
@@ -869,7 +872,7 @@ def load_trace(path: Union[str, Path], *, source: str | None = None) -> TraceDoc
     try:
         # JSONL uses LF or CRLF. Other Unicode separators can appear inside a valid string.
         with trace_file.open(encoding="utf-8", newline="\n") as fh:
-            lines = fh.readlines()
+            return parse_trace(fh, source=src)
     except FileNotFoundError as exc:
         raise TraceSchemaError(f"Trace file not found: {src}") from exc
     except OSError as exc:
@@ -877,6 +880,10 @@ def load_trace(path: Union[str, Path], *, source: str | None = None) -> TraceDoc
     except UnicodeDecodeError as exc:
         raise TraceSchemaError(f"{src}: trace is not valid UTF-8") from exc
 
+
+def parse_trace(lines: Iterable[str], *, source: str) -> TraceDocument:
+    """Validate trace records from a file or an in-memory capture."""
+    src = source
     records: List[Dict[str, Any]] = []
     for lineno, line in enumerate(lines, start=1):
         if not line.strip():

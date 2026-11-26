@@ -11,6 +11,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from . import __version__
+from ._sse_contract import CAPTURE_DIALECTS
+from .audit_cmd import (
+    AUDIT_RULES, audit_capture, read_capture, render_audit_report, select_audit_rules, stream_audit_cases,
+    trace_report_metadata,
+)
 from .badge import render_badge_svg
 from .canary import (
     PROBE_CATALOG,
@@ -27,7 +32,7 @@ from .comparison import (
     render_comparison_markdown,
     render_comparison_terminal,
 )
-from .detectors import AUDIT_RULE_LIST, VALID_AUDIT_DETECTORS, audit_trace
+from .detectors import DETECTOR_NAMES, Finding, audit_trace
 from .differ import DiffReport, diff_traces
 from .exporter import (
     render_audit_terminal,
@@ -37,7 +42,7 @@ from .exporter import (
     sanitize_trace_for_json_export,
 )
 from .exporters import (
-    _ReportCase, audit_cases, canary_cases, comparison_cases, diff_cases, render_junit, render_sarif, replay_cases,
+    _ReportCase, canary_cases, comparison_cases, diff_cases, render_junit, render_sarif, replay_cases,
 )
 from .init_cmd import DEFAULT_ENDPOINT, INIT_TARGETS, render_init_config, write_init_config
 from .probes import CompositeBackendProbe, LinuxProcIoProbe, LmcacheMpProbe, MooncakeStoreProbe
@@ -409,44 +414,44 @@ def _cmd_record(args: argparse.Namespace) -> int:
     return agg_rc
 
 
-def _parse_only_detectors(raw_only: Optional[str]) -> Optional[set[str]]:
-    if raw_only is None:
-        return None
-    tokens = [tok.strip().upper() for tok in raw_only.split(",") if tok.strip()]
-    if not tokens:
-        raise ValueError(f"Invalid --only value. Valid audit rules are {AUDIT_RULE_LIST}.")
-    unknown = sorted(set(tokens) - VALID_AUDIT_DETECTORS)
-    if unknown:
-        raise ValueError(
-            f"Invalid detector selection for audit: {', '.join(unknown)}. Valid audit rules are {AUDIT_RULE_LIST}."
-        )
-    return set(tokens)
-
-
 def _cmd_audit(args: argparse.Namespace) -> int:
-    only = _parse_only_detectors(args.only)
-    _validate_output_paths((args.html, args.out_sarif, args.out_junit), [args.trace_path])
-    doc = load_trace(args.trace_path)
-    findings = audit_trace(doc, only=only)
-    rc = _audit_exit_code(findings, strict=args.strict)
-    known_secrets = _trace_report_secrets(doc)
-    if args.html:
-        _write_text_file(args.html, render_audit_html(doc, findings))
-    if args.out_sarif or args.out_junit:
-        _write_ci_reports(args, audit_cases(doc, findings, only=only), known_secrets)
-    if args.json:
-        safe = sanitize_trace_for_json_export(doc, include_body=False, include_wire=False)
-        payload = {
-            **safe,
-            "findings": [f.to_dict() for f in findings],
-            "exit_code": rc,
-        }
-        sys.stdout.write(_render_json(payload, known_secrets))
-    else:
-        sys.stdout.write(render_audit_terminal(doc, findings, no_color=args.no_color))
+    only = select_audit_rules(args.only)
+    protected = [] if args.input == "-" else [args.input]
+    try:
+        _validate_output_paths((args.html, args.out_sarif, args.out_junit), protected)
+    except ValueError as exc:
+        message = "Report output would overwrite the input capture." if "overwrite" in str(exc) else (
+            "Use a distinct file for each audit report.")
+        raise ValueError(message) from None
+    except (OSError, RuntimeError):
+        raise ValueError("Could not resolve the audit report paths.") from None
+
+    report, doc, recorded = audit_capture(read_capture(args.input), dialect=args.dialect,
+                                          expect_usage=args.expect_usage, strict=args.strict, only=only)
+    if args.html and doc is None:
+        raise ValueError("An HTML waterfall requires a recorded trace.")
+    try:
+        metadata = trace_report_metadata(doc, _trace_report_secrets(doc)) if args.json and doc is not None else {}
+    except (RecursionError, TypeError):
+        raise ValueError("Invalid metadata in the recorded trace.") from None
+    try:
         if args.html:
-            sys.stdout.write(f"Saved HTML waterfall report: {args.html}\n")
-    return rc
+            keys = {(finding.detector_id, finding.severity, finding.frame_seq) for finding in recorded}
+            for finding in report["findings"]:
+                rule = finding["detector_id"]
+                if (rule, finding["severity"], finding["frame_seq"]) not in keys:
+                    recorded.append(Finding(rule, DETECTOR_NAMES.get(rule, rule), finding["severity"],
+                                            finding["message"], finding["frame_seq"]))
+            _write_text_file(args.html, render_audit_html(doc, recorded))
+        if args.out_sarif or args.out_junit:
+            _write_ci_reports(args, stream_audit_cases(report, recorded=doc is not None, only=only), ())
+    except (OSError, ValueError):
+        raise ValueError("Could not write the audit report.") from None
+    if args.json:
+        sys.stdout.write(json.dumps({**metadata, **report}, ensure_ascii=True, separators=(",", ":"), allow_nan=False) + "\n")
+    else:
+        sys.stdout.write(render_audit_report(report, github_issue=args.github_issue or args.format == "github-issue"))
+    return report["exit_code"]
 
 
 def _cmd_replay(args: argparse.Namespace) -> int:
@@ -822,14 +827,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_rec.set_defaults(func=_cmd_record)
 
     # audit
-    p_aud = sub.add_parser("audit", help="Audit a single .trace.jsonl for silent failures and storage symptoms")
-    p_aud.add_argument("trace_path", help="Path to .trace.jsonl")
-    p_aud.add_argument("--only", default=None, help=f"Comma-separated subset of {AUDIT_RULE_LIST}")
-    p_aud.add_argument("--html", default="", help="Write single-file airgap-safe HTML frame waterfall")
-    p_aud.add_argument("--json", action="store_true", help="Emit sanitized JSON audit report")
+    p_aud = sub.add_parser("audit", help="Audit captured SSE, NDJSON, or an inferdiff trace offline")
+    p_aud.add_argument("input", metavar="PATH|-", help="Capture file or - to read standard input")
+    p_aud.add_argument("--dialect", choices=CAPTURE_DIALECTS, default="auto", help="Wire dialect (default: auto)")
+    p_aud.add_argument("--expect-usage", action="store_true", help="Warn if requested usage is missing (D4)")
+    p_aud.add_argument("--only", help=f"Comma-separated subset of {', '.join(sorted(AUDIT_RULES))}")
+    p_aud.add_argument("--html", default="", help="Write an HTML waterfall for a recorded trace")
+    display = p_aud.add_mutually_exclusive_group()
+    display.add_argument("--json", action="store_true", help="Print a redacted JSON audit report")
+    display.add_argument("--github-issue", action="store_true", help="Print a redacted GitHub Issue snippet (up to 25 lines)")
+    display.add_argument("--format", choices=("github-issue",), help="Alias for --github-issue")
     p_aud.add_argument("--strict", action="store_true", help="Treat P1 warnings as non-zero exit code 3")
     p_aud.add_argument("--no-color", action="store_true")
-    _add_ci_report_options(p_aud)
+    p_aud.add_argument("--sarif", "--out-sarif", dest="out_sarif", metavar="PATH", help="Write a SARIF 2.1.0 report")
+    p_aud.add_argument("--junit", "--out-junit", dest="out_junit", metavar="PATH", help="Write a JUnit XML report")
     p_aud.set_defaults(func=_cmd_audit)
 
     p_replay = sub.add_parser("replay", help="Audit saved traces offline and gate new protocol breaches")

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from http.client import HTTPException
 
-from ._sse_contract import inspect_sse
+from ._sse_contract import contract_report, inspect_sse
 from .canary import PROBE_CATALOG, DoctorReport, run_doctor
 from .detectors import DETECTOR_NAMES
 from .recorder import RecorderError
@@ -63,17 +63,8 @@ def assert_sse_honest(
     requested usage is a P1 warning. P0 breaches always fail the assertion.
     """
     resolved_dialect, findings = inspect_sse(sse_text, dialect=dialect, expect_usage=expect_usage)
-    p0_count = sum(finding["severity"] == "P0" for finding in findings)
-    warning_count = sum(finding["severity"] == "P1" for finding in findings)
-    grade = "F" if p0_count else "C" if warning_count >= 2 else "B" if warning_count else "A+"
-    report = {
-        "grade": grade,
-        "dialect": resolved_dialect,
-        "p0_count": p0_count,
-        "warning_count": warning_count,
-        "findings": findings,
-    }
-    if p0_count or (warning_count and not allow_warnings):
+    report = contract_report(resolved_dialect, findings)
+    if report["p0_count"] or (report["warning_count"] and not allow_warnings):
         raise InferdiffAssertionError(report)
     return report
 

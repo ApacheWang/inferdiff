@@ -1,4 +1,4 @@
-"""Offline checks for captured server-sent event streams."""
+"""Offline contract checks for captured inference streams."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from typing import Any
 from .detectors import detect_d1, detect_d4
 from .dialects import normalize_payload
 from .dialects.anthropic_messages import TOOL_TYPES
-from .recorder import SSEFramer, WireChunk, build_frame_from_chunk
+from .recorder import NDJSONFramer, SSEFramer, WireChunk, build_frame_from_chunk
 from .redact import is_protocol_enum, is_protocol_event
 from .schema import (
     VALID_DIALECTS,
@@ -22,6 +22,7 @@ from .schema import (
 )
 
 _ALIASES = {"openai": "openai-chat", "anthropic": "anthropic-messages", "gemini": "gemini-sse"}
+CAPTURE_DIALECTS = ("auto", *VALID_DIALECTS, *_ALIASES)
 _MESSAGES = {
     "D1": "The stream reported success with an incomplete or inconsistent tool call.",
     "D2": "The stream contains U+FFFD or invalid Unicode.",
@@ -41,11 +42,12 @@ def _objects(value: Any) -> Iterator[tuple[int, dict]]:
         yield from ((pos, obj) for pos, obj in enumerate(value) if isinstance(obj, dict))
 
 
-def _load_payload(data: str) -> dict:
+def _load_payload(data: str) -> dict | None:
     try:
-        return _object(strict_json_loads(data))
+        payload = strict_json_loads(data)
     except (ValueError, RecursionError):
-        return {}
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def _detect_dialect(chunks: list[WireChunk], payloads: list[dict]) -> str:
@@ -63,7 +65,7 @@ def _detect_dialect(chunks: list[WireChunk], payloads: list[dict]) -> str:
             return "openai-chat"
         if "meta_info" in payload:
             return "sglang-native"
-        if "done" in payload and ("message" in payload or "response" in payload):
+        if isinstance(payload.get("done"), bool):
             return "ollama-ndjson"
     return "openai-chat"
 
@@ -196,43 +198,153 @@ def _anthropic_tool_violations(doc: TraceDocument, payloads: list[dict]) -> Iter
         if (payload.get("type") == "content_block_start" and isinstance(block.get("type"), str)
                 and block["type"] in TOOL_TYPES and not (is_strict_int(index) and index >= 0)):
             yield seq
+        delta = _object(payload.get("delta"))
+        if (payload.get("type") == "content_block_delta" and delta.get("type") == "input_json_delta"
+                and not isinstance(delta.get("partial_json"), str)):
+            yield seq
+
+
+def _token_count(usage: dict, field: str) -> bool:
+    value = usage.get(field)
+    return is_strict_int(value) and value >= 0
 
 
 def _has_expected_usage(dialect: str, payloads: list[dict], frames: list[TraceFrame]) -> bool:
     fields = ("prompt_tokens", "completion_tokens")
     if dialect == "openai-chat":
         # With include_usage, the extra empty-choices event follows all finished choices.
-        if len(payloads) < 2 or not frames or not frames[-1].is_done_sentinel or payloads[-2].get("choices") != []:
+        if len(frames) < 2 or not frames[-1].is_done_sentinel:
             return False
-        usage = _object(payloads[-2].get("usage"))
-        return all(is_strict_int(usage.get(name)) and usage[name] >= 0 for name in fields)
-    return all(any(is_strict_int(frame.norm.get("usage", {}).get(name)) for frame in frames) for name in fields)
+        previous = frames[-2]
+        payload = payloads[previous.seq]
+        if payload:
+            if payload.get("choices") != []:
+                return False
+            usage = _object(payload.get("usage"))
+        elif previous.norm.get("phase") == "USAGE":
+            usage = _object(previous.norm.get("usage"))
+        else:
+            return False
+        return not previous.parse_error and all(_token_count(usage, name) for name in fields)
+
+    def has_usage(field: str, start: int) -> bool:
+        return any(not frame.parse_error and _token_count(_object(frame.norm.get("usage")), field)
+                   for frame in frames[start:])
+
+    terminal = next((pos for pos in range(len(frames) - 1, -1, -1)
+                     if any(isinstance(value, str) and value not in ("", "unknown") for value in
+                            (frames[pos].norm.get("finish_reason"), frames[pos].norm.get("terminal_status")))), None)
+    if terminal is None:
+        return False
+    prompt_start = 0 if dialect == "anthropic-messages" else terminal
+    return has_usage("prompt_tokens", prompt_start) and has_usage("completion_tokens", terminal)
 
 
 def inspect_sse(sse_text: str, *, dialect: str, expect_usage: bool) -> tuple[str, list[dict]]:
     if not isinstance(sse_text, str):
         raise TypeError("SSE input must be text.")
+    return _inspect_stream(sse_text.encode("utf-8", errors="surrogatepass"), dialect, expect_usage, ndjson=False)
+
+
+def inspect_capture(raw: bytes, *, dialect: str, expect_usage: bool) -> tuple[str, list[dict]]:
+    """Inspect a UTF-8 wire capture, detecting its framing independently of its dialect."""
+    raw = raw.removeprefix(b"\xef\xbb\xbf")
+    ndjson = raw.lstrip().startswith((b"{", b"["))
+    return _inspect_stream(raw, dialect, expect_usage, ndjson=ndjson, require_payload=True)
+
+
+def inspect_recording(doc: TraceDocument, *, dialect: str, expect_usage: bool) -> tuple[str, list[dict]]:
+    """Run the wire checks with the recorded frame numbers and HTTP evidence."""
+    resolved = doc.header.dialect if dialect == "auto" else _resolve_dialect(dialect)
+    first_wire = next((frame.raw_wire.lstrip() for frame in doc.frames if frame.raw_wire.strip()), "")
+    ndjson = doc.header.dialect == "ollama-ndjson" or first_wire.startswith(("{", "["))
+    chunks = []
+    for frame in doc.frames:
+        raw = frame.raw_wire.encode("utf-8", errors="surrogatepass")
+        framed = _frame_wire(raw, ndjson=ndjson)
+        chunks.append(framed[0] if len(framed) == 1 else WireChunk(0, frame.sse_event, "", frame.raw_wire))
+    findings = _inspect_chunks(chunks, replace(doc.header, dialect=resolved), expect_usage, ndjson=ndjson,
+                               recording=doc)
+    return resolved, findings
+
+
+def contract_report(dialect: str, findings: list[dict]) -> dict:
+    p0_count = sum(finding["severity"] == "P0" for finding in findings)
+    warning_count = sum(finding["severity"] == "P1" for finding in findings)
+    grade = "F" if p0_count else "C" if warning_count >= 2 else "B" if warning_count else "A+"
+    return {"grade": grade, "dialect": dialect, "p0_count": p0_count,
+            "warning_count": warning_count, "findings": findings}
+
+
+def _resolve_dialect(dialect: str) -> str:
     if not isinstance(dialect, str):
         raise ValueError("Unsupported SSE dialect.")
     dialect = _ALIASES.get(dialect, dialect)
     if dialect != "auto" and dialect not in VALID_DIALECTS:
         raise ValueError("Unsupported SSE dialect.")
+    return dialect
 
-    framer = SSEFramer()
-    chunks = framer.feed(sse_text.encode("utf-8", errors="surrogatepass"), 0) + framer.finish(0)
-    payloads = [_load_payload(chunk.payload_text) for chunk in chunks]
+
+def _frame_wire(raw: bytes, *, ndjson: bool) -> list[WireChunk]:
+    framer = NDJSONFramer() if ndjson else SSEFramer()
+    return framer.feed(raw, 0) + framer.finish(0)
+
+
+def _inspect_stream(
+    raw: bytes, dialect: str, expect_usage: bool, *, ndjson: bool, require_payload: bool = False,
+) -> tuple[str, list[dict]]:
+    chunks = _frame_wire(raw, ndjson=ndjson)
+    decoded = [_load_payload(chunk.payload_text) for chunk in chunks]
+    if require_payload and not any(payload is not None or chunk.payload_text == "[DONE]"
+                                   for chunk, payload in zip(chunks, decoded)):
+        raise ValueError("Capture contains no readable SSE events or NDJSON objects.")
+    payloads = [payload or {} for payload in decoded]
+    dialect = _resolve_dialect(dialect)
     if dialect == "auto":
         dialect = _detect_dialect(chunks, payloads)
+    header = TraceHeader("", "", "", dialect, {}, {"status_code": 200})
+    findings = _inspect_chunks(chunks, header, expect_usage, ndjson=ndjson, payloads=payloads)
+    if not any(finding["code"] == "D2" for finding in findings):
+        # Framing skips comments and empty lines, where the original bytes can still be corrupt.
+        if _has_corrupt_unicode(raw.decode("utf-8", errors="surrogateescape")):
+            findings.append(_finding("D2", None))
+    return dialect, findings
 
+
+def _finding(code: str, seq: int | None, *, severity: str = "P0", message: str | None = None) -> dict:
+    return {"code": code, "detector_id": code, "severity": severity,
+            "frame_seq": seq, "message": message or _MESSAGES[code]}
+
+
+def _recording_eof_clean(recording: TraceDocument, group_count: int) -> bool:
+    if recording.summary.eof_clean:
+        return True
+    violations = recording.summary.assembled.get("protocol_violations") or []
+    # Older summaries assemble the first candidate in each frame as one stream.
+    return group_count > 1 and bool(violations) and all(
+        isinstance(item, str) and item.endswith(": payload_after_finish_reason") for item in violations
+    )
+
+
+def _inspect_chunks(
+    chunks: list[WireChunk], header: TraceHeader, expect_usage: bool, *, ndjson: bool,
+    payloads: list[dict] | None = None, recording: TraceDocument | None = None,
+) -> list[dict]:
+    dialect = header.dialect
+    if payloads is None:
+        payloads = [_load_payload(chunk.payload_text) or {} for chunk in chunks]
     findings: list[dict] = []
 
+    has_provider_payloads = recording is None or any(payloads)
+
     def add(code: str, seq: int | None, *, severity: str = "P0", message: str | None = None) -> None:
-        findings.append({"code": code, "detector_id": code, "severity": severity,
-                         "frame_seq": seq, "message": message or _MESSAGES[code]})
+        findings.append(_finding(code, seq, severity=severity, message=message))
 
     frames, previous_text = [], ""
     for seq, (chunk, payload) in enumerate(zip(chunks, payloads)):
-        if chunk.invalid_utf8 or "\ufffd" in chunk.raw_wire or _has_corrupt_unicode(payload):
+        original = recording.frames[seq] if recording is not None else None
+        if (_has_corrupt_unicode(chunk.raw_wire) or _has_corrupt_unicode(payload)
+                or chunk.invalid_utf8 or (original is not None and original.parse_error == "invalid_utf8")):
             add("D2", seq)
         event_type = payload.get("type")
         if (dialect == "anthropic-messages" and chunk.sse_event is None and isinstance(event_type, str)
@@ -240,42 +352,49 @@ def inspect_sse(sse_text: str, *, dialect: str, expect_usage: bool) -> tuple[str
             # A saved capture may retain data frames while dropping SSE event names.
             chunk = replace(chunk, sse_event=event_type)
         try:
-            frame, previous_text = build_frame_from_chunk(
-                chunk, seq=seq, dialect=dialect, prev_rel_ms=0, t0_ns=0, sglang_prev_text=previous_text,
-            )
+            if original is not None and (dialect == recording.header.dialect or not chunk.payload_text):
+                frame = original
+            else:
+                frame, previous_text = build_frame_from_chunk(
+                    chunk, seq=seq, dialect=dialect, prev_rel_ms=0, t0_ns=0, sglang_prev_text=previous_text,
+                )
         except RecursionError:
             add("D4", seq)
             continue
         frames.append(frame)
         if frame.norm.get("phase") == "ERROR" and not frame.parse_error:
             add("D4", seq)
-    if "\ufffd" in sse_text and not any(finding["code"] == "D2" for finding in findings):
-        add("D2", None)
-
-    header = TraceHeader("", "", "", dialect, {}, {"status_code": 200, "content_type": "text/event-stream"})
     frame_groups = [frames]
     if dialect in {"openai-chat", "gemini-sse"}:
         frame_groups, collisions = _candidate_streams(dialect, frames, payloads)
         for seq in sorted(collisions):
             add("D3", seq)
-    docs = [TraceDocument(header, group, assemble_summary(header, group, total_ms=0)) for group in frame_groups]
+    socket_clean = recording is None or _recording_eof_clean(recording, len(frame_groups))
+    docs = [TraceDocument(header, group, assemble_summary(header, group, total_ms=0, ndjson=ndjson,
+                                                         socket_eof_clean=socket_clean)) for group in frame_groups]
     for doc in docs:
-        for finding in detect_d1(doc):
+        broken_tools = detect_d1(doc)
+        broken_stream = detect_d4(doc)
+        for finding in broken_tools:
             add("D1", finding.frame_seq)
-        for finding in detect_d4(doc):
+        for finding in broken_stream:
             add("D4", finding.frame_seq)
         if dialect == "openai-responses":
             for tool in doc.summary.assembled["tool_calls"]:
                 if tool["identity_conflict"]:
                     add("D3", tool["last_seq"])
-        elif dialect == "anthropic-messages":
+        elif dialect == "anthropic-messages" and has_provider_payloads:
             for seq in _anthropic_tool_violations(doc, payloads):
                 add("D1", seq)
+                add("C9", seq, message="Anthropic Messages reported success with an incomplete tool call.")
+        elif dialect == "gemini-sse" and doc.summary.assembled["finish_reason"] == "STOP":
+            for finding in broken_tools + broken_stream:
+                add("C10", finding.frame_seq, message="Gemini reported STOP with a malformed or incomplete stream.")
 
-    if dialect in {"anthropic-messages", "gemini-sse"}:
+    if dialect in {"anthropic-messages", "gemini-sse"} and has_provider_payloads:
         for seq in _stop_reason_violations(dialect, payloads):
             add("C9" if dialect == "anthropic-messages" else "C10", seq)
     if expect_usage and not _has_expected_usage(dialect, payloads, frames):
         add("D4", len(chunks) - 1 if chunks else None, severity="P1", message="Requested usage is missing.")
 
-    return dialect, list({(item["code"], item["severity"], item["frame_seq"]): item for item in findings}.values())
+    return list({(item["code"], item["severity"], item["frame_seq"]): item for item in findings}.values())

@@ -61,6 +61,20 @@ inferdiff export \
 
 > GitHub Markdown 会过滤页面内联交互脚本；前往 [`v0.1.0` Release 下载 `case1-waterfall.html` 附件](https://github.com/ApacheWang/inferdiff/releases/tag/v0.1.0)，即可离线悬停查看单帧耗时、切换绝对毫秒 / 归一化比例并点击任意帧检查详情。
 
+## GitHub Action 集成（CI 门禁 + 自动上传 HTML 瀑布图）
+
+在工作流中直接引用 `ApacheWang/inferdiff@v0.1.1`，即可对在线推理端点或离线双轨迹跑回归门禁并自动归档 `<80 KiB` 单文件 HTML 瀑布图：
+
+```yaml
+- name: Run inferdiff wire gate
+  uses: ApacheWang/inferdiff@v0.1.1
+  with:
+    url: http://127.0.0.1:8080/v1
+    profile: full
+    strict: "true"
+    html-out: inferdiff-report.html
+```
+
 ## 健康评级与确定性 CI 退出码
 
 - **Doctor 评级**：`A+`（全部探针通过、零跳过零告警）、`A`（无 P0/P1 问题，含 P2 建议告警或未触发/跳过项）、`B`（1 项 P1 告警）、`C`（2 项及以上 P1 告警）、`F`（检出 P0 静默协议违约或传输/HTTP 硬失败）。

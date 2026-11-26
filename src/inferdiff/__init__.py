@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from .canary import DoctorReport, ProbeResult, run_doctor
 from .detectors import Finding, audit_trace, detect_d1, detect_d2, detect_d3, detect_d4, detect_d5

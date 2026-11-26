@@ -687,6 +687,182 @@ class TestSingleFileHtmlWaterfall(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
+    def test_v011_default_thinking_retry_c5_required_fallback_c7_reasoning_c8_variance_and_action_yml(self):
+        seen_c2_kwargs: List[Any] = []
+        seen_c5_choices: List[Any] = []
+        c8_calls = {"n": 0}
+
+        class ThinkingModelHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+            def log_message(self, format, *args): return
+
+            def do_GET(self):
+                if self.path.endswith("/models"):
+                    body = json.dumps({"data": [{"id": "qwen3-0.6b-thinking"}]}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def _sse(self, evs: List[str], gap: float = 0.0):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                for i, e in enumerate(evs):
+                    if i > 0 and gap > 0:
+                        time.sleep(gap)
+                    self.wfile.write(e.encode("utf-8"))
+                    self.wfile.flush()
+
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length", "0"))
+                req = json.loads((self.rfile.read(n) if n else b"{}").decode("utf-8"))
+                no_think_chat = (req.get("chat_template_kwargs") or {}).get("enable_thinking") is False
+                no_think_resp = (req.get("reasoning") or {}).get("effort") == "none"
+
+                if self.path.endswith("/responses"):
+                    if not no_think_resp:
+                        # First attempt burns 28-tok cap in reasoning_text.delta
+                        self._sse([
+                            'event: response.reasoning_text.delta\ndata: {"type":"response.reasoning_text.delta","delta":"thinking about write_config..."}\n\n',
+                            'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":50,"output_tokens":28}}}\n\n',
+                        ])
+                    else:
+                        # Retry with reasoning.effort="none" triggers real truncated tool call breach!
+                        self._sse([
+                            'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_1","call_id":"call_1","name":"write_config","type":"function_call","arguments":""}}\n\n',
+                            'event: response.function_call_arguments.delta\ndata: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_1","delta":"{\\"description\\": \\"cut"}\n\n',
+                            'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":50,"output_tokens":28}}}\n\n',
+                        ])
+                    return
+
+                txt = (req.get("messages") or [{}])[0].get("content", "")
+                if "write_config" in txt:  # C1 chat
+                    if not no_think_chat:
+                        self._sse([
+                            'data: {"model":"qwen3-0.6b-thinking","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Thinking..."}}]}\n\n',
+                            'data: {"model":"qwen3-0.6b-thinking","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}\n\n',
+                            "data: [DONE]\n\n",
+                        ])
+                    else:
+                        self._sse([
+                            'data: {"model":"qwen3-0.6b-thinking","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"c1","function":{"name":"write_config","arguments":"{\\"description\\": \\"cut"}}]}}]}\n\n',
+                            'data: {"model":"qwen3-0.6b-thinking","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}\n\n',
+                            "data: [DONE]\n\n",
+                        ])
+                elif "digits 42" in txt:  # C2 must NOT disable thinking
+                    seen_c2_kwargs.append(req.get("chat_template_kwargs"))
+                    self._sse([
+                        'data: {"model":"qwen3-0.6b-thinking","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Step 1..."}}]}\n\n',
+                        'data: {"model":"qwen3-0.6b-thinking","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}\n\n',
+                        'data: {"model":"qwen3-0.6b-thinking","choices":[],"usage":{"prompt_tokens":16,"completion_tokens":32,"total_tokens":48}}\n\n',
+                        "data: [DONE]\n\n",
+                    ])
+                elif req.get("ignore_eos") is True:  # C3
+                    self._sse([
+                        'data: {"model":"qwen3-0.6b-thinking","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"1 2 3"}}]}\n\n',
+                        'data: {"model":"qwen3-0.6b-thinking","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}\n\n',
+                        'data: {"model":"qwen3-0.6b-thinking","choices":[],"usage":{"prompt_tokens":18,"completion_tokens":96,"total_tokens":114}}\n\n',
+                        "data: [DONE]\n\n",
+                    ])
+                elif "Reply OK." in txt:  # C4
+                    pt = 716 if req.get("tools") else 11
+                    self._sse([
+                        'data: {"model":"qwen3-0.6b-thinking","choices":[{"index":0,"delta":{"role":"assistant","content":"OK"}}]}\n\n',
+                        'data: {"model":"qwen3-0.6b-thinking","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+                        f'data: {{"model":"qwen3-0.6b-thinking","choices":[],"usage":{{"prompt_tokens":{pt},"completion_tokens":1,"total_tokens":{pt + 1}}}}}\n\n',
+                        "data: [DONE]\n\n",
+                    ])
+                elif "node-a" in txt:  # C5: reject tool_choice="required" with 400 -> fallback "auto" -> thinking retry succeeds!
+                    seen_c5_choices.append(req.get("tool_choice"))
+                    if req.get("tool_choice") == "required":
+                        self.send_response(400)
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    if not no_think_chat:
+                        self._sse([
+                            'data: {"model":"qwen3-0.6b-thinking","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Thinking..."}}]}\n\n',
+                            'data: {"model":"qwen3-0.6b-thinking","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}\n\n',
+                            "data: [DONE]\n\n",
+                        ])
+                    else:
+                        self._sse([
+                            'data: {"model":"qwen3-0.6b-thinking","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"c1","function":{"name":"get_node_status","arguments":"{\\"node\\":\\"node-a\\"}"}}]}}]}\n\n',
+                            'data: {"model":"qwen3-0.6b-thinking","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"c2","function":{"name":"get_node_status","arguments":"{\\"node\\":\\"node-b\\"}"}}]}}]}\n\n',
+                            'data: {"model":"qwen3-0.6b-thinking","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+                            "data: [DONE]\n\n",
+                        ])
+                elif "原样逐字复述" in txt:  # C6: thinking-starved on try 1 -> retry with enable_thinking=False passes!
+                    if not no_think_chat:
+                        self._sse([
+                            'data: {"model":"qwen3-0.6b-thinking","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Let me repeat..."}}]}\n\n',
+                            'data: {"model":"qwen3-0.6b-thinking","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}\n\n',
+                            "data: [DONE]\n\n",
+                        ])
+                    else:
+                        self._sse([
+                            f'data: {json.dumps({"model":"qwen3-0.6b-thinking","choices":[{"index":0,"delta":{"role":"assistant","content":C6_TARGET_TEXT}}]}, ensure_ascii=False)}\n\n',
+                            'data: {"model":"qwen3-0.6b-thinking","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+                            "data: [DONE]\n\n",
+                        ])
+                elif "01 through 25" in txt:  # C7: pure incremental reasoning_content frames -> PASS (not SKIP!)
+                    evs = [
+                        f'data: {{"model":"qwen3-0.6b-thinking","choices":[{{"index":0,"delta":{{"role":"assistant","reasoning_content":"step {i} "}}}}]}}\n\n'
+                        for i in range(6)
+                    ]
+                    evs.append('data: {"model":"qwen3-0.6b-thinking","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}\n\n')
+                    evs.append("data: [DONE]\n\n")
+                    self._sse(evs, gap=0.005)
+                else:  # C8: identical model/fingerprint/prompt_tokens, slight text variance -> PASS with note!
+                    c8_calls["n"] += 1
+                    txt_out = "READY" if c8_calls["n"] == 1 else "READY."
+                    self._sse([
+                        f'data: {{"model":"qwen3-0.6b-thinking","system_fingerprint":"b0-local","choices":[{{"index":0,"delta":{{"role":"assistant","content":"{txt_out}"}}}}]}}\n\n',
+                        'data: {"model":"qwen3-0.6b-thinking","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+                        'data: {"model":"qwen3-0.6b-thinking","choices":[],"usage":{"prompt_tokens":26,"completion_tokens":2,"total_tokens":28}}\n\n',
+                        "data: [DONE]\n\n",
+                    ])
+
+        srv = _ThreadingServer(("127.0.0.1", 0), ThinkingModelHandler)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            rep = run_doctor(base_url=f"http://127.0.0.1:{port}/v1", profile="full", save_dir=None)
+            by = {r.probe_id: r for r in rep.results}
+            self.assertEqual(by["C1"].status, "FAIL")
+            self.assertIn("/v1/responses breach", by["C1"].summary)
+            self.assertEqual(by["C2"].status, "PASS")
+            self.assertEqual(seen_c2_kwargs, [None])  # C2 never disables thinking!
+            self.assertEqual(by["C5"].status, "PASS")
+            self.assertEqual(seen_c5_choices[:2], ["required", "auto"])
+            self.assertEqual(by["C6"].status, "PASS")
+            self.assertEqual(by["C7"].status, "PASS")
+            self.assertIn("reasoning frames", by["C7"].summary)
+            self.assertEqual(by["C8"].status, "PASS")
+            self.assertIn("minor text variance", by["C8"].summary)
+            self.assertEqual(rep.exit_code, EXIT_SILENT_PROTOCOL_BREACH)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+        # Verify action.yml exists and avoids direct ${{ inputs.* }} interpolation inside run: shell blocks
+        action_yml = Path(__file__).resolve().parents[1] / "action.yml"
+        self.assertTrue(action_yml.exists())
+        txt = action_yml.read_text(encoding="utf-8")
+        self.assertIn('using: "composite"', txt)
+        self.assertIn("branding:", txt)
+        for line in txt.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(("inferdiff ", "python ", "args=", "if [[", "exit ")):
+                self.assertNotIn("${{ inputs.", line)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -326,6 +326,29 @@ def _has_inband_error(doc: TraceDocument) -> bool:
     return any((f.norm or {}).get("phase") == "ERROR" or (f.norm or {}).get("inband_error") for f in doc.frames)
 
 
+def _is_thinking_starved(doc: TraceDocument) -> bool:
+    """Return True when reasoning tokens consumed the budget leaving no visible content or tool calls."""
+    asm = doc.summary.assembled
+    content = (asm.get("content_text") or "").strip()
+    tcalls = asm.get("tool_calls") or []
+    reas = asm.get("reasoning_text") or ""
+    return (not content) and (not tcalls) and (bool(reas) or bool(asm.get("has_unclosed_think")))
+
+
+def _with_thinking_disabled(body: Dict[str, Any], dialect: str) -> Dict[str, Any]:
+    """Return a shallow copy of request body with dialect-appropriate non-thinking override."""
+    b = dict(body)
+    if dialect == "openai-responses":
+        b["reasoning"] = {"effort": "none"}
+    elif dialect == "ollama-ndjson":
+        b["think"] = False
+    else:
+        kwargs = dict(b.get("chat_template_kwargs") or {})
+        kwargs["enable_thinking"] = False
+        b["chat_template_kwargs"] = kwargs
+    return b
+
+
 def _build_chat_body(
     dialect: str,
     model: str,
@@ -558,6 +581,25 @@ def _run_c1(
     total_frames = doc.summary.total_frames
     tot_tok = _doc_tokens(doc)
 
+    # Default-thinking models (e.g. Qwen3 without --reasoning-budget 0) can exhaust the 28-tok cap
+    # inside <think> before emitting tool calls; retry once with thinking disabled if supported.
+    if (not _has_inband_error(doc)) and (D1 not in d_ids) and (D4 not in d_ids) and _is_thinking_starved(doc):
+        nt_body = _with_thinking_disabled(body, dialect)
+        try:
+            doc_nt = record_stream(url=chat_url, request_body=nt_body, out_path=out_p, headers=headers, dialect=dialect, label="doctor-C1", timeout=timeout)
+            dur += doc_nt.summary.timing.get("total_ms") or 0.0
+            total_frames += doc_nt.summary.total_frames
+            nt_tok = _doc_tokens(doc_nt)
+            if nt_tok is not None:
+                tot_tok = (tot_tok or 0) + nt_tok
+            doc = doc_nt
+            docs = [doc_nt]
+            findings = audit_trace(doc)
+            d_ids = {f.detector_id for f in findings}
+            asm = doc.summary.assembled
+        except RecorderError:
+            pass  # Endpoint rejected extension field (e.g. HTTP 400); preserve original trace/SKIP
+
     if _has_inband_error(doc):
         return ProbeResult("C1", code, "P0", "FAIL", "HTTP 200 returned an in-band error event", dur, total_frames, tot_tok, ref, tpaths, findings, docs)
 
@@ -585,17 +627,42 @@ def _run_c1(
         out_r = _save_path(save_dir, "c1_responses_tool_clip.trace.jsonl")
         try:
             doc_r = record_stream(url=responses_url, request_body=resp_body, out_path=out_r, headers=headers, dialect="openai-responses", label="doctor-C1-responses", timeout=timeout)
-            docs.append(doc_r)
-            if out_r:
-                tpaths.append(str(out_r))
+            r_findings = audit_trace(doc_r)
+            r_ids = {f.detector_id for f in r_findings}
             dur += doc_r.summary.timing.get("total_ms") or 0.0
             total_frames += doc_r.summary.total_frames
             rt = _doc_tokens(doc_r)
             if rt is not None:
                 tot_tok = (tot_tok or 0) + rt
-            r_findings = audit_trace(doc_r)
+
+            # If thinking consumed the /v1/responses 28-tok cap before emitting tool calls, retry once
+            # with reasoning.effort="none" (falling back to a 192-tok micro-budget on HTTP 400/422).
+            if (not _has_inband_error(doc_r)) and (D1 not in r_ids) and (D4 not in r_ids) and _is_thinking_starved(doc_r):
+                retry_candidates = [
+                    _with_thinking_disabled(resp_body, "openai-responses"),
+                    dict(resp_body, max_output_tokens=192),
+                ]
+                for cand_body in retry_candidates:
+                    try:
+                        doc_r2 = record_stream(url=responses_url, request_body=cand_body, out_path=out_r, headers=headers, dialect="openai-responses", label="doctor-C1-responses", timeout=timeout)
+                        dur += doc_r2.summary.timing.get("total_ms") or 0.0
+                        total_frames += doc_r2.summary.total_frames
+                        rt2 = _doc_tokens(doc_r2)
+                        if rt2 is not None:
+                            tot_tok = (tot_tok or 0) + rt2
+                        doc_r = doc_r2
+                        r_findings = audit_trace(doc_r)
+                        r_ids = {f.detector_id for f in r_findings}
+                        break
+                    except RecorderError as rexc:
+                        if "HTTP 400" in str(rexc) or "HTTP 422" in str(rexc):
+                            continue
+                        break
+
+            docs.append(doc_r)
+            if out_r:
+                tpaths.append(str(out_r))
             findings.extend(r_findings)
-            r_ids = {f.detector_id for f in r_findings}
             if _has_inband_error(doc_r) or D1 in r_ids or D4 in r_ids:
                 msg = r_findings[0].message if r_findings else "HTTP 200 /v1/responses returned in-band error"
                 return ProbeResult("C1", code, "P0", "FAIL", _clean_display(f"/v1/responses breach: {msg}", secrets_list), dur, total_frames, tot_tok, ref, tpaths, findings, docs)
@@ -876,6 +943,7 @@ def _run_c5(
         temperature=0.0,
         seed=42,
         tools=tools,
+        tool_choice="required" if dialect != "ollama-ndjson" else None,
         parallel_tool_calls=True if dialect != "ollama-ndjson" else None,
         include_usage=(dialect != "ollama-ndjson"),
     )
@@ -885,16 +953,43 @@ def _run_c5(
         doc = record_stream(url=chat_url, request_body=body, out_path=out_p, headers=headers, dialect=dialect, label="doctor-C5", timeout=timeout)
     except RecorderError as exc:
         if "HTTP 400" in str(exc) or "HTTP 422" in str(exc):
-            return ProbeResult("C5", code, sev, "SKIP", _clean_display(f"parallel tool calling unsupported ({exc})", secrets_list), (time.monotonic() - t0) * 1000, 0, None, ref)
-        return ProbeResult("C5", code, sev, "ERROR", _clean_display(f"transport/HTTP error: {exc}", secrets_list), (time.monotonic() - t0) * 1000, 0, None, ref)
+            if dialect != "ollama-ndjson" and body.get("tool_choice") == "required":
+                body["tool_choice"] = "auto"
+                try:
+                    doc = record_stream(url=chat_url, request_body=body, out_path=out_p, headers=headers, dialect=dialect, label="doctor-C5", timeout=timeout)
+                except RecorderError as exc2:
+                    if "HTTP 400" in str(exc2) or "HTTP 422" in str(exc2):
+                        return ProbeResult("C5", code, sev, "SKIP", _clean_display(f"parallel tool calling unsupported ({exc2})", secrets_list), (time.monotonic() - t0) * 1000, 0, None, ref)
+                    return ProbeResult("C5", code, sev, "ERROR", _clean_display(f"transport/HTTP error: {exc2}", secrets_list), (time.monotonic() - t0) * 1000, 0, None, ref)
+            else:
+                return ProbeResult("C5", code, sev, "SKIP", _clean_display(f"parallel tool calling unsupported ({exc})", secrets_list), (time.monotonic() - t0) * 1000, 0, None, ref)
+        else:
+            return ProbeResult("C5", code, sev, "ERROR", _clean_display(f"transport/HTTP error: {exc}", secrets_list), (time.monotonic() - t0) * 1000, 0, None, ref)
 
     dur = doc.summary.timing.get("total_ms") or ((time.monotonic() - t0) * 1000)
+    total_frames = doc.summary.total_frames
+    tot_tok = _doc_tokens(doc)
     findings = audit_trace(doc)
     d_ids = {f.detector_id for f in findings}
     tpaths = [str(out_p)] if out_p else []
 
+    if (not _has_inband_error(doc)) and (D1 not in d_ids) and (D4 not in d_ids) and _is_thinking_starved(doc):
+        nt_body = _with_thinking_disabled(body, dialect)
+        try:
+            doc_nt = record_stream(url=chat_url, request_body=nt_body, out_path=out_p, headers=headers, dialect=dialect, label="doctor-C5", timeout=timeout)
+            dur += doc_nt.summary.timing.get("total_ms") or 0.0
+            total_frames += doc_nt.summary.total_frames
+            nt_tok = _doc_tokens(doc_nt)
+            if nt_tok is not None:
+                tot_tok = (tot_tok or 0) + nt_tok
+            doc = doc_nt
+            findings = audit_trace(doc)
+            d_ids = {f.detector_id for f in findings}
+        except RecorderError:
+            pass
+
     if _has_inband_error(doc):
-        return ProbeResult("C5", code, "P0", "FAIL", "HTTP 200 returned an in-band error event", dur, doc.summary.total_frames, _doc_tokens(doc), ref, tpaths, findings, [doc])
+        return ProbeResult("C5", code, "P0", "FAIL", "HTTP 200 returned an in-band error event", dur, total_frames, tot_tok, ref, tpaths, findings, [doc])
 
     role_ok, raw_indices, any_omitted_idx = _inspect_raw_c5_wire(doc)
     tcalls = doc.summary.assembled.get("tool_calls") or []
@@ -911,7 +1006,7 @@ def _run_c5(
             parts.append("parallel tools merged onto colliding idx=0")
         elif findings:
             parts.append(_clean_display(findings[0].message, secrets_list))
-        return ProbeResult("C5", code, "P0", "FAIL", " + ".join(parts), dur, doc.summary.total_frames, _doc_tokens(doc), ref, tpaths, findings, [doc])
+        return ProbeResult("C5", code, "P0", "FAIL", " + ".join(parts), dur, total_frames, tot_tok, ref, tpaths, findings, [doc])
 
     # Validate raw indices strictly BEFORE dialect fallback normalization
     invalid_raw_idx = any((not is_strict_int(ix)) or ix < 0 for ix in raw_indices)
@@ -928,7 +1023,7 @@ def _run_c5(
             warns.append(f"non-contiguous/invalid raw tool indices {raw_indices}")
 
     if warns:
-        return ProbeResult("C5", code, "P1", "WARN", "; ".join(warns), dur, doc.summary.total_frames, _doc_tokens(doc), ref, tpaths, findings, [doc])
+        return ProbeResult("C5", code, "P1", "WARN", "; ".join(warns), dur, total_frames, tot_tok, ref, tpaths, findings, [doc])
 
     if len(tcalls) < 2:
         return ProbeResult(
@@ -938,8 +1033,8 @@ def _run_c5(
             "SKIP",
             f"inconclusive: model emitted only {len(tcalls)} tool call(s) (expected 2 parallel calls)",
             dur,
-            doc.summary.total_frames,
-            _doc_tokens(doc),
+            total_frames,
+            tot_tok,
             ref,
             tpaths,
             findings,
@@ -953,8 +1048,8 @@ def _run_c5(
         "PASS",
         f"initial role present, {len(tcalls)} parallel calls with contiguous raw indices {distinct_raw}",
         dur,
-        doc.summary.total_frames,
-        _doc_tokens(doc),
+        total_frames,
+        tot_tok,
         ref,
         tpaths,
         findings,
@@ -990,17 +1085,37 @@ def _run_c6(
         return ProbeResult("C6", code, sev, "ERROR", _clean_display(f"transport/HTTP error: {exc}", secrets_list), (time.monotonic() - t0) * 1000, 0, None, ref)
 
     dur = doc.summary.timing.get("total_ms") or ((time.monotonic() - t0) * 1000)
+    total_frames = doc.summary.total_frames
+    tot_tok = _doc_tokens(doc)
     findings = audit_trace(doc)
     d_ids = {f.detector_id for f in findings}
     tpaths = [str(out_p)] if out_p else []
 
+    if (not _has_inband_error(doc)) and (D4 not in d_ids) and _is_thinking_starved(doc):
+        nt_body = _with_thinking_disabled(body, dialect)
+        try:
+            doc_nt = record_stream(url=chat_url, request_body=nt_body, out_path=out_p, headers=headers, dialect=dialect, label="doctor-C6", timeout=timeout)
+            dur += doc_nt.summary.timing.get("total_ms") or 0.0
+            total_frames += doc_nt.summary.total_frames
+            nt_tok = _doc_tokens(doc_nt)
+            if nt_tok is not None:
+                tot_tok = (tot_tok or 0) + nt_tok
+            doc = doc_nt
+            findings = audit_trace(doc)
+            d_ids = {f.detector_id for f in findings}
+        except RecorderError:
+            pass
+
     if _has_inband_error(doc):
-        return ProbeResult("C6", code, "P0", "FAIL", "HTTP 200 returned an in-band error event", dur, doc.summary.total_frames, _doc_tokens(doc), ref, tpaths, findings, [doc])
+        return ProbeResult("C6", code, "P0", "FAIL", "HTTP 200 returned an in-band error event", dur, total_frames, tot_tok, ref, tpaths, findings, [doc])
 
     content = doc.summary.assembled.get("content_text") or ""
-    has_fffd_frame = any("\ufffd" in ((f.norm or {}).get("text_delta") or "") for f in doc.frames)
+    has_fffd_frame = any(
+        "\ufffd" in ((f.norm or {}).get("text_delta") or "") or "\ufffd" in ((f.norm or {}).get("reasoning_delta") or "")
+        for f in doc.frames
+    )
     has_bad_utf8 = any(f.parse_error == "invalid_utf8" for f in doc.frames)
-    has_fffd_text = "\ufffd" in content
+    has_fffd_text = "\ufffd" in content or "\ufffd" in (doc.summary.assembled.get("reasoning_text") or "")
     swallowed_tail = (
         ("🔥" in content or "🚀" in content)
         and (C6_TRAILING_EMOJI not in content)
@@ -1017,7 +1132,7 @@ def _run_c6(
             reasons.append("trailing 4-byte emoji swallowed before finish_reason=stop")
         if D4 in d_ids and not reasons:
             reasons.append(_clean_display(findings[0].message, secrets_list))
-        return ProbeResult("C6", code, "P0", "FAIL", "; ".join(reasons), dur, doc.summary.total_frames, _doc_tokens(doc), ref, tpaths, findings, [doc])
+        return ProbeResult("C6", code, "P0", "FAIL", "; ".join(reasons), dur, total_frames, tot_tok, ref, tpaths, findings, [doc])
 
     # Require actual multilingual + 4-byte emoji echo to claim PASS (ASCII-only output is inconclusive)
     has_multibyte = ("吞吐量" in content or "Δ" in content) and (C6_TRAILING_EMOJI in content)
@@ -1029,8 +1144,8 @@ def _run_c6(
             "SKIP",
             "inconclusive: output did not echo CJK + trailing 4-byte emoji target",
             dur,
-            doc.summary.total_frames,
-            _doc_tokens(doc),
+            total_frames,
+            tot_tok,
             ref,
             tpaths,
             findings,
@@ -1044,8 +1159,8 @@ def _run_c6(
         "PASS",
         f"0 U+FFFD across {doc.summary.total_frames} frames, CJK & trailing 4-byte emoji intact",
         dur,
-        doc.summary.total_frames,
-        _doc_tokens(doc),
+        total_frames,
+        tot_tok,
         ref,
         tpaths,
         findings,
@@ -1091,20 +1206,25 @@ def _run_c7(
 
     ttft_eff = doc.summary.timing.get("ttft_effective_ms") or 0.0
     total_ms = doc.summary.timing.get("total_ms") or 0.0
-    eff_frames = [f for f in doc.frames if (f.norm or {}).get("text_delta")]
+    eff_frames = [
+        f for f in doc.frames
+        if (f.norm or {}).get("text_delta") or (f.norm or {}).get("reasoning_delta")
+    ]
     eff_count = len(eff_frames)
     content_bytes = doc.summary.assembled.get("content_utf8_bytes") or 0
+    reasoning_bytes = len((doc.summary.assembled.get("reasoning_text") or "").encode("utf-8"))
+    stream_bytes = content_bytes + reasoning_bytes
 
     ratio = (ttft_eff / total_ms) if total_ms > 0 else 0.0
-    content_span_ms = (eff_frames[-1].t_rel_ms - eff_frames[0].t_rel_ms) if eff_count >= 2 else 0.0
+    stream_span_ms = (eff_frames[-1].t_rel_ms - eff_frames[0].t_rel_ms) if eff_count >= 2 else 0.0
 
-    # Buffered fake streaming: >=40B payload, >=250ms total latency, >96% spent waiting for first content,
-    # AND all content delivered in a single burst (<5ms arrival span).
+    # Buffered fake streaming: >=40B streamed payload (content or reasoning), >=250ms total latency,
+    # >96% spent waiting for first token, AND all payload delivered in a single burst (<5ms arrival span).
     is_buffered = (
-        content_bytes >= 40
+        stream_bytes >= 40
         and total_ms >= 250.0
         and ratio > 0.96
-        and content_span_ms < 5.0
+        and stream_span_ms < 5.0
     )
     if is_buffered:
         return ProbeResult(
@@ -1112,7 +1232,7 @@ def _run_c7(
             code,
             "P1",
             "WARN",
-            f"{ratio * 100:.1f}% latency in TTFT ({ttft_eff:.0f}/{total_ms:.0f} ms), {eff_count}-frame burst ({content_span_ms:.1f} ms span)",
+            f"{ratio * 100:.1f}% latency in TTFT ({ttft_eff:.0f}/{total_ms:.0f} ms), {eff_count}-frame burst ({stream_span_ms:.1f} ms span)",
             dur,
             doc.summary.total_frames,
             _doc_tokens(doc),
@@ -1129,7 +1249,7 @@ def _run_c7(
             code,
             sev,
             "SKIP",
-            f"inconclusive: only {eff_count} content frame(s) over {total_ms:.1f} ms (span {content_span_ms:.1f} ms)",
+            f"inconclusive: only {eff_count} streamed frame(s) over {total_ms:.1f} ms (span {stream_span_ms:.1f} ms)",
             dur,
             doc.summary.total_frames,
             _doc_tokens(doc),
@@ -1139,12 +1259,13 @@ def _run_c7(
             [doc],
         )
 
+    frame_kind = "content" if content_bytes > 0 else "reasoning"
     return ProbeResult(
         "C7",
         code,
         sev,
         "PASS",
-        f"incremental stream ({eff_count} content frames, content span {content_span_ms:.1f} ms)",
+        f"incremental stream ({eff_count} {frame_kind} frames, span {stream_span_ms:.1f} ms)",
         dur,
         doc.summary.total_frames,
         _doc_tokens(doc),
@@ -1225,8 +1346,6 @@ def _run_c8(
         drifts.append(f"prompt_tokens shifted ({p1} -> {p2}) on identical template")
     if tail1 != tail2:
         drifts.append(f"protocol tail mutated ({tail1} -> {tail2})")
-    if txt1 != txt2:
-        drifts.append("output text drifted across seed=42 runs")
 
     if drifts:
         return ProbeResult("C8", code, "P2", "WARN", "; ".join(drifts), dur, frames, tot_tok, ref, tpaths, findings, [d1, d2])
@@ -1234,12 +1353,43 @@ def _run_c8(
     # Require reported telemetry (usage or fingerprint/model) to claim full backend consistency
     has_telemetry = (is_strict_int(p1) and is_strict_int(p2)) or bool(fp1 and fp2)
     if not has_telemetry:
+        if txt1 != txt2:
+            return ProbeResult(
+                "C8",
+                code,
+                "P2",
+                "WARN",
+                "output text drifted across seed=42 runs (prompt_tokens and system_fingerprint omitted)",
+                dur,
+                frames,
+                tot_tok,
+                ref,
+                tpaths,
+                findings,
+                [d1, d2],
+            )
         return ProbeResult(
             "C8",
             code,
             sev,
             "SKIP",
             "inconclusive: output matched, but server omitted prompt_tokens and system_fingerprint",
+            dur,
+            frames,
+            tot_tok,
+            ref,
+            tpaths,
+            findings,
+            [d1, d2],
+        )
+
+    if txt1 != txt2:
+        return ProbeResult(
+            "C8",
+            code,
+            sev,
+            "PASS",
+            f"consistent backend identity & tokenization (prompt_tokens={p1}/{p2}; minor text variance under seed=42)",
             dur,
             frames,
             tot_tok,

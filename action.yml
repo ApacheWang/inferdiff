@@ -1,0 +1,134 @@
+name: "inferdiff — Streaming LLM Wire Validator"
+description: "Zero-dep streaming LLM canary doctor & frame-level regression diff gate (llama-server, vLLM, SGLang, Ollama & relays)."
+author: "ApacheWang"
+
+branding:
+  icon: "activity"
+  color: "red"
+
+inputs:
+  url:
+    description: "Live endpoint base URL for `inferdiff doctor` (e.g. http://127.0.0.1:8080/v1)"
+    required: false
+    default: ""
+  model:
+    description: "Optional model ID for `inferdiff doctor` (auto-discovered if omitted)"
+    required: false
+    default: ""
+  api-key:
+    description: "Optional API key for `inferdiff doctor` (recommended via GitHub Secrets)"
+    required: false
+    default: ""
+  profile:
+    description: "Canary profile for `inferdiff doctor` (`quick`, `full`, or `relay`)"
+    required: false
+    default: "quick"
+  strict:
+    description: "Exit 3 on P1 warnings in `inferdiff doctor` (`true` or `false`)"
+    required: false
+    default: "false"
+  before-trace:
+    description: "Baseline `.trace.jsonl` path for offline `inferdiff diff` mode"
+    required: false
+    default: ""
+  after-trace:
+    description: "Target `.trace.jsonl` path for offline `inferdiff diff` mode"
+    required: false
+    default: ""
+  fail-on:
+    description: "Gate threshold for `inferdiff diff` (`p0`, `p1`, `any-diff`, or `never`)"
+    required: false
+    default: "p0"
+  html-out:
+    description: "Output path for the single-file offline HTML frame waterfall (<80 KiB)"
+    required: false
+    default: "inferdiff-report.html"
+  upload-artifact:
+    description: "Upload the generated HTML waterfall as a workflow artifact (`true` or `false`)"
+    required: false
+    default: "true"
+  artifact-name:
+    description: "Artifact name when `upload-artifact` is true"
+    required: false
+    default: "inferdiff-waterfall"
+  version:
+    description: "inferdiff PyPI version to install (empty installs latest)"
+    required: false
+    default: "0.1.1"
+
+outputs:
+  exit-code:
+    description: "Deterministic inferdiff exit code (0=pass, 1=usage/IO, 2=P0 breach, 3=P1 regression)"
+    value: ${{ steps.run.outputs.exit_code }}
+  html-report:
+    description: "Path to the generated single-file HTML frame waterfall"
+    value: ${{ inputs.html-out }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install inferdiff
+      shell: bash
+      env:
+        INFERDIFF_VERSION: ${{ inputs.version }}
+      run: |
+        if [[ -n "${INFERDIFF_VERSION}" ]]; then
+          python -m pip install --quiet "inferdiff==${INFERDIFF_VERSION}"
+        else
+          python -m pip install --quiet inferdiff
+        fi
+
+    - name: Run inferdiff gate
+      id: run
+      shell: bash
+      env:
+        INPUT_URL: ${{ inputs.url }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_API_KEY: ${{ inputs.api-key }}
+        INPUT_PROFILE: ${{ inputs.profile }}
+        INPUT_STRICT: ${{ inputs.strict }}
+        INPUT_BEFORE: ${{ inputs.before-trace }}
+        INPUT_AFTER: ${{ inputs.after-trace }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_HTML_OUT: ${{ inputs.html-out }}
+      run: |
+        set +e
+        if [[ -n "${INPUT_URL}" ]]; then
+          args=(doctor "${INPUT_URL}" --profile "${INPUT_PROFILE}" --html "${INPUT_HTML_OUT}" --no-color)
+          [[ -n "${INPUT_MODEL}" ]] && args+=(--model "${INPUT_MODEL}")
+          [[ "${INPUT_STRICT}" == "true" ]] && args+=(--strict)
+          if [[ -n "${INPUT_API_KEY}" ]]; then
+            OPENAI_API_KEY="${INPUT_API_KEY}" inferdiff "${args[@]}"
+          else
+            inferdiff "${args[@]}"
+          fi
+          rc=$?
+        elif [[ -n "${INPUT_BEFORE}" && -n "${INPUT_AFTER}" ]]; then
+          inferdiff diff "${INPUT_BEFORE}" "${INPUT_AFTER}" --fail-on "${INPUT_FAIL_ON}" --html "${INPUT_HTML_OUT}" --no-color
+          rc=$?
+        else
+          echo "::error::Provide either 'url' (doctor mode) or both 'before-trace' and 'after-trace' (diff mode)."
+          rc=1
+        fi
+        echo "exit_code=${rc}" >> "${GITHUB_OUTPUT}"
+        exit 0
+
+    - name: Upload HTML frame waterfall artifact
+      if: always() && inputs.upload-artifact == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ inputs.html-out }}
+        if-no-files-found: ignore
+
+    - name: Enforce deterministic exit code
+      shell: bash
+      env:
+        GATE_RC: ${{ steps.run.outputs.exit_code }}
+      run: |
+        exit "${GATE_RC}"

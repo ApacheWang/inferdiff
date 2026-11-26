@@ -95,6 +95,20 @@ inferdiff diff examples/case3_sglang_8_of_8000_short_gen/baseline.trace.jsonl \
                examples/case3_sglang_8_of_8000_short_gen/target.trace.jsonl --fail-on p1
 ```
 
+## GitHub Action (CI Gate + HTML Waterfall Artifact)
+
+Use `ApacheWang/inferdiff@v0.1.1` directly in GitHub Actions to run a live `doctor` check or offline `diff` regression gate and automatically attach the `<80 KiB` HTML waterfall artifact:
+
+```yaml
+- name: Run inferdiff wire gate
+  uses: ApacheWang/inferdiff@v0.1.1
+  with:
+    url: http://127.0.0.1:8080/v1
+    profile: full
+    strict: "true"
+    html-out: inferdiff-report.html
+```
+
 ## Wire Health Grades & Deterministic CI Exit Codes
 
 - **Doctor grades**: `A+` (all executed probes pass with zero skips/warnings), `A` (zero P0/P1 issues, advisory P2 warning or inconclusive/skipped probe), `B` (1 P1 warning), `C` (2+ P1 warnings), `F` (any P0 silent protocol breach or transport/HTTP error).

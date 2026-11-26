@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/ApacheWang/inferdiff/actions/workflows/ci.yml/badge.svg)](https://github.com/ApacheWang/inferdiff/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://github.com/ApacheWang/inferdiff)
-[![Zero Dependencies](https://img.shields.io/badge/dependencies-0%20(stdlib%20only)-2ea043)](https://github.com/ApacheWang/inferdiff/blob/main/pyproject.toml)
+[![Zero Dependencies](https://img.shields.io/badge/dependencies-0%20stdlib%20only-2ea043)](https://github.com/ApacheWang/inferdiff/blob/main/pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/ApacheWang/inferdiff/blob/main/LICENSE)
 
 **Wireshark & protocol bill-checker for streaming LLM APIs.**

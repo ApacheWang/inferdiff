@@ -20,10 +20,12 @@ from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple, Union
 from .dialects import detect_dialect, normalize_payload
 from .probes.base import BackendProbe
 from .redact import (
+    extract_header_secret_values,
     has_control_chars,
     redact_headers,
     sanitize_url_for_error,
     sanitize_url_for_export,
+    scrub_known_secrets,
 )
 from .schema import (
     TraceDocument,
@@ -758,6 +760,14 @@ def record_stream(
         )
 
     redacted_req_headers = redact_headers(send_headers)
+    outgoing_secrets = extract_header_secret_values(send_headers)
+    # Also capture any non-allowlisted query param values as secrets to scrub if reflected
+    if parsed.query:
+        for qk, qv in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
+            if len(qv) >= 6 and qk.lower() not in ("api-version", "version", "alt", "stream"):
+                outgoing_secrets.append(qv)
+        outgoing_secrets = sorted(set(outgoing_secrets), key=len, reverse=True)
+
     safe_stored_url = sanitize_url_for_export(url)
     header = TraceHeader(
         trace_id=trace_id,
@@ -799,6 +809,17 @@ def record_stream(
 
     def _emit_chunk(wc: WireChunk) -> None:
         nonlocal prev_rel_ms, sglang_prev, probe_ttft_sampled
+        # Scrub any reflected outgoing credential (e.g. echoed API key) BEFORE normalization or persistence
+        if outgoing_secrets:
+            wc = WireChunk(
+                t_mono_ns=wc.t_mono_ns,
+                sse_event=scrub_known_secrets(wc.sse_event, outgoing_secrets) if wc.sse_event else None,
+                payload_text=scrub_known_secrets(wc.payload_text, outgoing_secrets),
+                raw_wire=scrub_known_secrets(wc.raw_wire, outgoing_secrets),
+                is_incomplete=wc.is_incomplete,
+                invalid_utf8=wc.invalid_utf8,
+                framing_error=wc.framing_error,
+            )
         tf, sglang_prev = build_frame_from_chunk(
             wc,
             seq=len(frames),

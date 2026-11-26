@@ -148,6 +148,32 @@ def redact_headers(headers: Mapping[str, str] | Sequence[Tuple[str, str]]) -> Di
     return out
 
 
+def extract_header_secret_values(headers: Mapping[str, str]) -> list[str]:
+    """Return raw sensitive header/token values (len >= 6) so echoed secrets can be scrubbed."""
+    secrets_out: list[str] = []
+    for k, v in headers.items():
+        if not is_sensitive_header(k) or not isinstance(v, str):
+            continue
+        raw = v.strip()
+        if len(raw) >= 6:
+            secrets_out.append(raw)
+        parts = raw.split(None, 1)
+        if len(parts) == 2 and parts[0].lower() in RECOGNIZED_AUTH_SCHEMES and len(parts[1].strip()) >= 6:
+            secrets_out.append(parts[1].strip())
+    return sorted(set(secrets_out), key=len, reverse=True)
+
+
+def scrub_known_secrets(text: str, known_secrets: Sequence[str] = ()) -> str:
+    """Scrub exact known outgoing secret strings plus standard secret patterns from text."""
+    if not text:
+        return text
+    out = text
+    for sec in sorted(set(s for s in known_secrets if isinstance(s, str) and len(s) >= 6), key=len, reverse=True):
+        if sec in out:
+            out = out.replace(sec, f"$REDACTED_sha256:{fingerprint8(sec)}")
+    return redact_secret_text(out)
+
+
 def redact_secret_text(text: str) -> str:
     """Scrub recognized credential patterns from free-form text or wire excerpts."""
     if not text:

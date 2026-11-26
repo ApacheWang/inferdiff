@@ -1,59 +1,67 @@
 # inferdiff
 
-**Wire-level regression diff, silent-failure forensics, and <=25-line GitHub Issue reproducer for LLM serving upgrades.**
+**Wireshark & protocol bill-checker for streaming LLM APIs.**
 
-> Catches HTTP 200 OK regressions that slip past standard evals: truncated tool-call JSON claiming `completed`, ghost reasoning tokens swallowing the output budget, fixed-length benchmark short-generation clipping, premature stream EOF, and benchmark prefix-cache / burst illusions.
+Catch silent `HTTP 200 OK` failures — truncated tool JSON, ghost thinking starvation, buffered nonconformant SSE relays, and illusory benchmark speedups — with **zero third-party runtime dependencies** (Python 3.11+ standard library only).
 
-## Why `inferdiff`?
+[中文文档 (README.zh-CN.md)](README.zh-CN.md)
 
-- **Zero heavy runtime dependencies**: Pure Python 3.11+ standard library (`http.client`, `json`, `hashlib`, `dataclasses`, `time.monotonic_ns`) — fast `uvx inferdiff` cold start (< 80 ms) with zero dependency conflicts in CI.
-- **4 native streaming dialects**:
-  - `openai-chat` (`/v1/chat/completions` SSE — `llama-server`, `vLLM` incl. `stream_options.include_usage` empty-`choices` tails, `SGLang`, `LiteLLM`)
-  - `openai-responses` (`/v1/responses` typed SSE events — tracks `function_call_arguments.delta` / `.done` / `response.completed|incomplete|failed`)
-  - `sglang-native` (`/generate` cumulative SSE + textless terminal `meta_info`)
-  - `ollama-ndjson` (`/api/chat` & `/api/generate` NDJSON — `thinking`, `eval_count`, `done_reason`, multi-chunk tool calls)
-- **Chunk-jitter-proof two-layer diff**: Aligns normalized visible text, reasoning (unifying inline `<think>` and dedicated `reasoning_content`), structural JSON tool arguments, and dialect-aware closure — then maps the exact earliest divergence back to physical frame sequences `before#seq` and `after#seq`.
-- **Safe-by-default shareable exports**: Sanitizes auth headers (SHA-256 8-char fingerprints), URL query params, and secrets; omits arbitrary prompt bodies and raw wire excerpts unless explicitly opted in via `--include-body` / `--include-wire`; emits POSIX shell-quoted `curl --globoff --url ...` commands strictly within **25 lines**.
+## Why `inferdiff`? (`HTTP 200 OK` != Your Stream Worked)
 
-## Quickstart (Zero-GPU Bundled Golden Examples)
+Standard uptime monitors and latency benchmarks only check HTTP status codes and wall-clock speed. In production, streaming LLM upgrades and third-party OpenAI-compatible relays routinely return `200 OK` while silently corrupting wire contracts:
+
+| Who Gets Burned | What Breaks Silently Under `HTTP 200 OK` | Real-World Bug Anchors | How `inferdiff` Catches It |
+| :--- | :--- | :--- | :--- |
+| **Agent & App Engineers** | Tool-call JSON arguments are cut off mid-string by token budgets yet reported as `completed` / `stop`, reasoning tokens starve `content` to empty, or chunk splits emit `U+FFFD` replacement chars — sending agents into retry loops. | [`llama.cpp #30773`](https://github.com/ggml-org/llama.cpp/issues/30773), [`Ollama #17274`](https://github.com/ollama/ollama/issues/17274), [`vLLM #68324`](https://github.com/vllm-project/vllm/issues/68324) | Rules `D1`, `D2` & Canary `C1`, `C2`, `C6` validate strict JSON syntax trees, UTF-8 multibyte boundaries, and terminal state honesty. |
+| **API Relay & Gateway Users** | Proxies buffer upstream non-streaming responses and dump them as a fake SSE burst, strip trailing `include_usage` chunks, undercount tool-schema tokens, strip initial `delta.role`, or route across mixed-quantization pools. | [`LiteLLM #5803`](https://github.com/BerriAI/litellm/issues/5803), [`LiteLLM #16112`](https://github.com/BerriAI/litellm/issues/16112), [`LiteLLM #24221`](https://github.com/BerriAI/litellm/issues/24221), [vLLM Streaming Usage](https://docs.vllm.ai/en/latest/serving/online_serving/derenderer/) | `inferdiff doctor --profile relay` runs low-budget canary probes (`C1–C8`) and grades wire health from `A+` to `F`. |
+| **AI Infra & Perf Engineers** | Engine upgrades report massive throughput/TTFT jumps because fixed-length `ignore_eos` runs stopped at `8 / 8000` tokens, prefix caches leaked across runs, or empty handshake frames gamed first-frame timers. | [`SGLang #53119`](https://github.com/sgl-project/sglang/pull/53119), [`SGLang #50443`](https://github.com/sgl-project/sglang/issues/50443), [vLLM Benchmarking CLI](https://docs.vllm.ai/en/stable/benchmarking/cli/) | Separates empty handshake `ttff_ms` from real `ttft_effective_ms` and flags short-generation & cache-pollution illusions (`D3`, `D5`). |
+| **OSS Contributors & Release CI** | SSE chunk boundaries shift between runs, making raw `curl` logs impossible to diff by eye — while noisy log dumps get closed upstream. | [rusefi LLM Policy](https://github.com/rusefi/rusefi/wiki/LLM-policy) | Normalizes chunk jitter, pins the **exact first divergent wire frame**, and exports an airgapped `<80 KiB` HTML waterfall or a `<=25`-line redacted `curl` reproducer. |
+
+## Quickstart
 
 ```bash
-# Install editable locally (Python 3.11+)
+# Install locally from source (Python 3.11+, zero third-party dependencies)
 pip install -e .
 
-# Case 1 (D1 P0 -> exits 2): llama.cpp #30773 truncated /v1/responses tool call claiming completed
+# 1. Zero-setup live health check on a local engine (llama-server, vLLM, SGLang, Ollama)
+inferdiff doctor http://127.0.0.1:8080/v1 --html doctor.html
+
+# 2. Audit an OpenAI-compatible relay API + generate shareable single-file HTML scorecard
+OPENAI_API_KEY=sk-... inferdiff doctor https://api.your-relay.example/v1 \
+  --model qwen3-32b --profile relay --html relay-report.html
+
+# 3. Try offline immediately with bundled golden examples (no GPU or server needed)
 inferdiff diff \
   examples/case1_responses_truncated_tool/baseline.trace.jsonl \
-  examples/case1_responses_truncated_tool/target.trace.jsonl
+  examples/case1_responses_truncated_tool/target.trace.jsonl \
+  --html case1-waterfall.html
 
-# Export a compact <=25-line GitHub Issue report (safe redacted defaults)
 inferdiff export \
   examples/case1_responses_truncated_tool/baseline.trace.jsonl \
   examples/case1_responses_truncated_tool/target.trace.jsonl \
   --format github-issue
-
-# Case 2 (D2 P0 -> exits 2): Ollama #17274 ghost thinking tokens with 0 B visible output
-inferdiff diff \
-  examples/case2_ollama_ghost_thinking_tokens/baseline.trace.jsonl \
-  examples/case2_ollama_ghost_thinking_tokens/target.trace.jsonl
-
-# Case 3 (D3 + D5b P1 -> exits 3 under --fail-on p1): SGLang #53119 8/8000 short generation illusion
-inferdiff diff \
-  examples/case3_sglang_8_of_8000_short_gen/baseline.trace.jsonl \
-  examples/case3_sglang_8_of_8000_short_gen/target.trace.jsonl \
-  --fail-on p1
 ```
 
-## Live Recording & Side-by-Side Comparison
+> **Auth note**: If neither `--api-key` nor `-H "Authorization: ..."` is passed, `inferdiff doctor` falls back to `OPENAI_API_KEY` from the environment and sends it to the target URL (use `https://` for production keys). Reflected secrets are scrubbed from terminal output, saved traces, JSON, and HTML exports.
+
+## Canary Probe Matrix (`inferdiff doctor`)
+
+| Probe | Target Failure Mode | Profiles | Upstream Anchor |
+| :--- | :--- | :--- | :--- |
+| `C1` (P0) | Truncated tool-call JSON claiming `stop`/`completed` (plus `/v1/responses` cross-check in `full`) | `quick`, `full`, `relay` | [`llama.cpp #30773`](https://github.com/ggml-org/llama.cpp/issues/30773) |
+| `C2` (P0) | Reasoning swallows budget -> empty visible output claiming `stop` | `full`, `relay` | [`Ollama #17274`](https://github.com/ollama/ollama/issues/17274) |
+| `C3` (P1) | `ignore_eos=true` fixed-length budget mismatch (auto-`SKIP` on HTTP 400/422) | `full` | [`SGLang #53119`](https://github.com/sgl-project/sglang/pull/53119) |
+| `C4` (P1) | Stripped trailing empty-`choices` `include_usage` chunk or omitted tool-schema tokens | `quick`, `full`, `relay` | [`LiteLLM #16112`](https://github.com/BerriAI/litellm/issues/16112), [`#28553`](https://github.com/BerriAI/litellm/issues/28553) |
+| `C5` (P1/P0) | Missing initial `delta.role`, omitted/invalid raw indices, or parallel tool index collision | `quick`, `full`, `relay` | [`LiteLLM #24221`](https://github.com/BerriAI/litellm/issues/24221) |
+| `C6` (P0) | Multi-byte UTF-8 / 4-byte emoji `U+FFFD` corruption or swallowed stream tail | `quick`, `full`, `relay` | [`vLLM #68324`](https://github.com/vllm-project/vllm/issues/68324), [`#47161`](https://github.com/vllm-project/vllm/issues/47161) |
+| `C7` (P1) | Buffered non-streaming response dumped as a fake SSE burst | `quick`, `full`, `relay` | [`LiteLLM #5803`](https://github.com/BerriAI/litellm/issues/5803) |
+| `C8` (P2) | Randomized-prefix same-seed heterogeneous backend pool drift (advisory) | `full`, `relay` | [vLLM Benchmarking CLI](https://docs.vllm.ai/en/stable/benchmarking/cli/) |
+
+## Recording, Side-by-Side Comparison & Bundled Examples
 
 ```bash
-# Record a single request or multi-line .jsonl request suite (per-frame flush)
-inferdiff record \
-  --url http://127.0.0.1:8080/v1/responses \
-  -d request.json \
-  -H "Authorization: Bearer $API_KEY" \
-  --label llama-v1.1.0 \
-  -o target.trace.jsonl
+# Record one request or a multi-line .jsonl suite (strict RFC 9112 framing + per-frame flush)
+inferdiff record --url http://127.0.0.1:8080/v1/responses -d request.json -o target.trace.jsonl
 
 # Compare two live endpoints sequentially with per-target scoped credentials
 inferdiff compare \
@@ -61,30 +69,34 @@ inferdiff compare \
   --after-url  http://127.0.0.1:8081/v1/chat/completions \
   --before-header "Authorization: Bearer $KEY_A" \
   --after-header  "Authorization: Bearer $KEY_B" \
-  -d request.json \
-  --save-dir ./traces \
-  --fail-on p1
+  -d request.json --save-dir ./traces --html compare.html --fail-on p1
+
+# Additional bundled golden examples
+inferdiff diff examples/case2_ollama_ghost_thinking_tokens/baseline.trace.jsonl \
+               examples/case2_ollama_ghost_thinking_tokens/target.trace.jsonl
+inferdiff diff examples/case3_sglang_8_of_8000_short_gen/baseline.trace.jsonl \
+               examples/case3_sglang_8_of_8000_short_gen/target.trace.jsonl --fail-on p1
 ```
 
-## Deterministic CI Exit Codes
+## Wire Health Grades & Deterministic CI Exit Codes
+
+- **Doctor grades**: `A+` (all executed probes pass with zero skips/warnings), `A` (zero P0/P1 issues, advisory P2 warning or inconclusive/skipped probe), `B` (1 P1 warning), `C` (2+ P1 warnings), `F` (any P0 silent protocol breach or transport/HTTP error).
 
 | Exit Code | Constant | Meaning |
 | :--- | :--- | :--- |
-| `0` | `EXIT_OK` | Gate passed (no blocking findings at configured `--fail-on` / `--strict` level) |
-| `1` | `EXIT_USAGE_OR_IO_ERROR` | Invalid CLI args, malformed trace schema, connection error, or non-200 HTTP status |
-| `2` | `EXIT_SILENT_PROTOCOL_BREACH` | P0 silent corruption (`D1` unclosed tool success, `D2` ghost empty output, `D4` premature EOF / framing breach) |
-| `3` | `EXIT_SEMANTIC_REGRESSION` | P1 regression (`D3` fixed-length short gen, `D5` benchmark illusion, terminal drift, TTFT regression, or content diff under `--fail-on any-diff`) |
+| `0` | `EXIT_OK` | Gate passed (`doctor` grades `A+` / `A` / `B` / `C` without `--strict`) |
+| `1` | `EXIT_USAGE_OR_IO_ERROR` | CLI usage error, malformed trace schema, unreachable endpoint, or non-200 HTTP failure |
+| `2` | `EXIT_SILENT_PROTOCOL_BREACH` | Confirmed P0 silent protocol breach (`D1`, `D2`, `D4`, or `doctor` P0 `FAIL`) |
+| `3` | `EXIT_SEMANTIC_REGRESSION` | P1 regression (`D3`, `D5`, terminal drift, TTFT regression, `--fail-on any-diff`, or `doctor --strict` P1 warn) |
 
-> Note on `--ignore-timing`: suppresses TTFT latency regression checks and D5 timing/benchmark-illusion alerts while preserving all D1–D4 protocol checks and semantic diffs.
+## Airgap-Safe HTML Waterfall & Privacy Defaults
+
+- Single-file HTML5 + inline SVG reports use a hash-locked CSP (`default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-...'; img-src data:;`) with zero external scripts, fonts, or stylesheets, and adaptive folding to stay strictly under `80 KiB`.
+- Shareable exports (`export --format github-issue|json|html`, `diff --html`, `audit --html`, `doctor --html`) omit arbitrary request bodies and raw wire payloads by default; pass `--include-body` or `--include-wire` to `export` only after reviewing your trace.
 
 ## Roadmap (v0.2: Non-Intrusive KV & Storage Probes)
 
-The `inferdiff.trace.v1` schema and `inferdiff.probes.base.BackendProbe` already expose the zero-overhead three-point snapshot lifecycle (`T_pre -> T_ttft -> T_eof`) for v0.2 plugins:
-
-- `LmcacheMpProbe` (`http://<host>:8080/metrics` — token + key-level L1/L2 hit and staging OOM failure deltas)
-- `MooncakeStoreProbe` (Master `:9003` + Client `:9300` `/version` & `/metrics` with graceful 503 degradation)
-- `LinuxProcIoProbe` (same-UID `/proc/<pid>/io` isolating Prefill `[T_pre, T_ttft]` physical `read_bytes` vs `rchar`)
-- Storage × inference detectors: `D6 PAGE_CACHE_WARM_ILLUSION`, `D7 LOOKUP_HIT_PREFETCH_DROP`, `D8 OFFLOAD_SLOWER_THAN_RECOMPUTE`.
+`inferdiff.trace.v1` and `inferdiff.probes.base.BackendProbe` already expose the three-point snapshot lifecycle (`T_pre -> T_ttft -> T_eof`) for optional v0.2 plugins (`LmcacheMpProbe`, `MooncakeStoreProbe`, `LinuxProcIoProbe`) and storage × inference rules `D6`–`D8`.
 
 ## License
 

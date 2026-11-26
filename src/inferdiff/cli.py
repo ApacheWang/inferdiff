@@ -1,4 +1,4 @@
-"""Argparse CLI entrypoint for inferdiff (record, audit, diff, compare, export)."""
+"""Argparse CLI entrypoint for inferdiff (doctor, record, audit, diff, compare, export)."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from . import __version__
+from .canary import render_doctor_terminal, run_doctor
 from .detectors import VALID_AUDIT_DETECTORS, audit_trace
 from .differ import diff_traces
 from .exporter import (
@@ -29,6 +30,7 @@ from .schema import (
     load_trace,
     strict_json_loads,
 )
+from .waterfall import render_audit_html, render_diff_html, render_doctor_html
 
 
 def _configure_stdio() -> None:
@@ -38,6 +40,27 @@ def _configure_stdio() -> None:
                 stream.reconfigure(encoding="utf-8", errors="backslashreplace", newline="\n")
             except Exception:
                 pass
+
+
+def _norm_path_key(path: str | Path) -> str:
+    resolved = str(Path(path).resolve())
+    return resolved.lower() if sys.platform == "win32" else resolved
+
+
+def _assert_distinct_output_path(out_path: str, protected_paths: Sequence[str | Path]) -> None:
+    """Reject writing HTML/export output over an input trace, captured trace, or doctor_summary.json."""
+    if not out_path:
+        return
+    out_key = _norm_path_key(out_path)
+    for prot in protected_paths:
+        if prot and _norm_path_key(prot) == out_key:
+            raise ValueError(f"Output path {out_path!r} would overwrite trace/evidence file {str(prot)!r}.")
+
+
+def _write_text_file(path: str, content: str) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8", newline="\n")
 
 
 def _parse_headers(raw_headers: Optional[Sequence[str]]) -> Dict[str, str]:
@@ -66,7 +89,6 @@ def _load_request_bodies(source: str, *, allow_jsonl: bool = False) -> List[Dict
     if not stripped:
         raise ValueError("Request input is empty.")
 
-    # Try single JSON document first
     try:
         obj = strict_json_loads(stripped)
     except json.JSONDecodeError:
@@ -90,7 +112,6 @@ def _load_request_bodies(source: str, *, allow_jsonl: bool = False) -> List[Dict
 
 
 def _derive_suite_out_path(base_out: str, idx: int) -> Path:
-    """Derive a distinct .trace.jsonl filename for request `idx` (1-based) in a JSONL suite."""
     p = Path(base_out)
     if base_out.endswith(("/", "\\")) or p.is_dir():
         return p / f"req_{idx:03d}.trace.jsonl"
@@ -110,12 +131,42 @@ def _audit_exit_code(findings: List[Any], *, strict: bool) -> int:
 
 
 def _aggregate_exit_code(current: int, new_rc: int) -> int:
-    """Combine exit codes across a recorded suite: P0 (2) > P1 (3) > OK (0)."""
     if current == EXIT_SILENT_PROTOCOL_BREACH or new_rc == EXIT_SILENT_PROTOCOL_BREACH:
         return EXIT_SILENT_PROTOCOL_BREACH
     if current == EXIT_SEMANTIC_REGRESSION or new_rc == EXIT_SEMANTIC_REGRESSION:
         return EXIT_SEMANTIC_REGRESSION
     return EXIT_OK
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    headers = _parse_headers(args.header)
+    if args.html and args.save_dir:
+        _assert_distinct_output_path(args.html, [Path(args.save_dir) / "doctor_summary.json"])
+    report = run_doctor(
+        base_url=args.base_url,
+        model=args.model or None,
+        api_key=args.api_key,
+        headers=headers,
+        profile=args.profile,
+        timeout=args.timeout,
+        save_dir=args.save_dir,
+        strict=args.strict,
+    )
+    if args.html:
+        protected: List[str | Path] = []
+        if report.save_dir:
+            protected.append(Path(report.save_dir) / "doctor_summary.json")
+        for r in report.results:
+            protected.extend(r.trace_paths)
+        _assert_distinct_output_path(args.html, protected)
+        _write_text_file(args.html, render_doctor_html(report))
+    if args.json:
+        sys.stdout.write(json.dumps(report.to_dict(), ensure_ascii=True, separators=(",", ":")) + "\n")
+    else:
+        sys.stdout.write(render_doctor_terminal(report, no_color=args.no_color))
+        if args.html:
+            sys.stdout.write(f"Saved HTML waterfall report: {args.html}\n")
+    return report.exit_code
 
 
 def _cmd_record(args: argparse.Namespace) -> int:
@@ -160,9 +211,13 @@ def _parse_only_detectors(raw_only: Optional[str]) -> Optional[set[str]]:
 
 def _cmd_audit(args: argparse.Namespace) -> int:
     only = _parse_only_detectors(args.only)
+    if args.html:
+        _assert_distinct_output_path(args.html, [args.trace_path])
     doc = load_trace(args.trace_path)
     findings = audit_trace(doc, only=only)
     rc = _audit_exit_code(findings, strict=args.strict)
+    if args.html:
+        _write_text_file(args.html, render_audit_html(doc, findings))
     if args.json:
         safe = sanitize_trace_for_json_export(doc, include_body=False, include_wire=False)
         payload = {
@@ -173,10 +228,14 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         sys.stdout.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n")
     else:
         sys.stdout.write(render_audit_terminal(doc, findings, no_color=args.no_color))
+        if args.html:
+            sys.stdout.write(f"Saved HTML waterfall report: {args.html}\n")
     return rc
 
 
 def _cmd_diff(args: argparse.Namespace) -> int:
+    if args.html:
+        _assert_distinct_output_path(args.html, [args.before_trace, args.after_trace])
     before = load_trace(args.before_trace)
     after = load_trace(args.after_trace)
     report = diff_traces(
@@ -186,10 +245,14 @@ def _cmd_diff(args: argparse.Namespace) -> int:
         ttft_regress_pct=args.ttft_regress_pct,
         fail_on=args.fail_on,
     )
+    if args.html:
+        _write_text_file(args.html, render_diff_html(before, after, report))
     if args.json:
         sys.stdout.write(json.dumps(report.to_dict(include_wire=False), ensure_ascii=True, separators=(",", ":")) + "\n")
     else:
         sys.stdout.write(render_diff_terminal(report, no_color=args.no_color))
+        if args.html:
+            sys.stdout.write(f"Saved HTML waterfall report: {args.html}\n")
     return report.exit_code
 
 
@@ -203,6 +266,11 @@ def _cmd_compare(args: argparse.Namespace) -> int:
     save_dir = Path(args.save_dir) if args.save_dir else None
     b_out = (save_dir / "before.trace.jsonl") if save_dir else None
     a_out = (save_dir / "after.trace.jsonl") if save_dir else None
+    if args.html:
+        protected = [p for p in (b_out, a_out) if p is not None]
+        if args.request not in ("-", "@-"):
+            protected.append(args.request)
+        _assert_distinct_output_path(args.html, protected)
 
     before = record_stream(
         url=args.before_url,
@@ -229,14 +297,20 @@ def _cmd_compare(args: argparse.Namespace) -> int:
         ttft_regress_pct=args.ttft_regress_pct,
         fail_on=args.fail_on,
     )
+    if args.html:
+        _write_text_file(args.html, render_diff_html(before, after, report))
     if args.json:
         sys.stdout.write(json.dumps(report.to_dict(include_wire=False), ensure_ascii=True, separators=(",", ":")) + "\n")
     else:
         sys.stdout.write(render_diff_terminal(report, no_color=args.no_color))
+        if args.html:
+            sys.stdout.write(f"Saved HTML waterfall report: {args.html}\n")
     return report.exit_code
 
 
 def _cmd_export(args: argparse.Namespace) -> int:
+    if args.out:
+        _assert_distinct_output_path(args.out, [p for p in (args.before, args.after) if p])
     before = load_trace(args.before)
     after = load_trace(args.after) if args.after else None
 
@@ -255,6 +329,8 @@ def _cmd_export(args: argparse.Namespace) -> int:
             )
         elif args.format == "ci-summary":
             rendered = render_ci_summary(before, after, diff_report=report)
+        elif args.format == "html":
+            rendered = render_diff_html(before, after, report, include_body=args.include_body, include_wire=args.include_wire)
         else:
             rendered = json.dumps(report.to_dict(include_wire=args.include_wire), ensure_ascii=True, indent=2) + "\n"
     else:
@@ -271,6 +347,8 @@ def _cmd_export(args: argparse.Namespace) -> int:
             )
         elif args.format == "ci-summary":
             rendered = render_ci_summary(before, None, audit_findings=findings)
+        elif args.format == "html":
+            rendered = render_audit_html(before, findings, include_body=args.include_body, include_wire=args.include_wire)
         else:
             safe = sanitize_trace_for_json_export(
                 before,
@@ -291,9 +369,7 @@ def _cmd_export(args: argparse.Namespace) -> int:
             )
 
     if args.out:
-        out_p = Path(args.out)
-        out_p.parent.mkdir(parents=True, exist_ok=True)
-        out_p.write_text(rendered, encoding="utf-8", newline="\n")
+        _write_text_file(args.out, rendered)
     else:
         sys.stdout.write(rendered)
     return rc
@@ -302,10 +378,25 @@ def _cmd_export(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="inferdiff",
-        description="Wire-level regression diff and silent-failure forensics for LLM serving upgrades.",
+        description="Wire-level canary doctor, regression diff, and silent-failure forensics for LLM serving & API relays.",
     )
     parser.add_argument("--version", action="version", version=f"inferdiff {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    # doctor (primary zero-setup entry point per Spec §2.1)
+    p_doc = sub.add_parser("doctor", help="Zero-setup C1..C8 canary health check for local engines or API relays")
+    p_doc.add_argument("base_url", help="Target base URL (e.g. http://127.0.0.1:8080/v1 or https://api.example.com/v1)")
+    p_doc.add_argument("--model", "-m", default="", help="Model ID (auto-discovers /models or /api/tags if omitted)")
+    p_doc.add_argument("--api-key", default=None, help="API key or $ENV_VAR (defaults to OPENAI_API_KEY, always redacted)")
+    p_doc.add_argument("--header", "-H", action="append", default=[], help="Extra HTTP header 'Name: value' (repeatable)")
+    p_doc.add_argument("--profile", choices=("quick", "full", "relay"), default="quick", help="Canary profile (quick/full/relay)")
+    p_doc.add_argument("--timeout", type=float, default=60.0, help="Per-probe socket timeout in seconds")
+    p_doc.add_argument("--save-dir", default="", help="Directory to save canary .trace.jsonl files (default ./.inferdiff-doctor/<ts>/)")
+    p_doc.add_argument("--html", default="", help="Write single-file airgap-safe HTML scorecard & SVG waterfall")
+    p_doc.add_argument("--strict", action="store_true", help="Exit 3 on P1 warnings (P0 breaches always exit 2)")
+    p_doc.add_argument("--json", action="store_true", help="Emit JSON canary matrix report")
+    p_doc.add_argument("--no-color", action="store_true")
+    p_doc.set_defaults(func=_cmd_doctor)
 
     # record
     p_rec = sub.add_parser("record", help="Record live streaming LLM request (or JSONL suite) to .trace.jsonl")
@@ -323,6 +414,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_aud = sub.add_parser("audit", help="Audit a single .trace.jsonl for D1..D4 silent failures")
     p_aud.add_argument("trace_path", help="Path to .trace.jsonl")
     p_aud.add_argument("--only", default=None, help="Comma-separated detector subset from D1,D2,D3,D4")
+    p_aud.add_argument("--html", default="", help="Write single-file airgap-safe HTML frame waterfall")
     p_aud.add_argument("--json", action="store_true", help="Emit sanitized JSON audit report")
     p_aud.add_argument("--strict", action="store_true", help="Treat P1 warnings as non-zero exit code 3")
     p_aud.add_argument("--no-color", action="store_true")
@@ -339,6 +431,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_diff.add_argument("--ttft-regress-pct", type=float, default=50.0)
     p_diff.add_argument("--fail-on", choices=("p0", "p1", "any-diff"), default="p0")
+    p_diff.add_argument("--html", default="", help="Write dual-lane single-file HTML frame waterfall")
     p_diff.add_argument("--json", action="store_true")
     p_diff.add_argument("--no-color", action="store_true")
     p_diff.set_defaults(func=_cmd_diff)
@@ -363,15 +456,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_cmp.add_argument("--ttft-regress-pct", type=float, default=50.0)
     p_cmp.add_argument("--fail-on", choices=("p0", "p1", "any-diff"), default="p0")
+    p_cmp.add_argument("--html", default="", help="Write dual-lane single-file HTML frame waterfall")
     p_cmp.add_argument("--json", action="store_true")
     p_cmp.add_argument("--no-color", action="store_true")
     p_cmp.set_defaults(func=_cmd_compare)
 
     # export
-    p_exp = sub.add_parser("export", help="Export compact <=25-line sanitized GitHub Issue or CI summary")
+    p_exp = sub.add_parser("export", help="Export compact <=25-line sanitized GitHub Issue, HTML waterfall, or CI summary")
     p_exp.add_argument("before", help="Single trace (audit) or baseline trace (diff)")
     p_exp.add_argument("after", nargs="?", default=None, help="Optional target trace for diff export")
-    p_exp.add_argument("--format", choices=("github-issue", "ci-summary", "json"), default="github-issue")
+    p_exp.add_argument("--format", choices=("github-issue", "ci-summary", "html", "json"), default="github-issue")
     p_exp.add_argument("--include-body", action="store_true", help="Include sanitized request body in export")
     p_exp.add_argument("--include-wire", action="store_true", help="Include sanitized raw wire frame excerpts in export")
     p_exp.add_argument("--out", "-o", default="", help="Output file path (defaults to stdout)")

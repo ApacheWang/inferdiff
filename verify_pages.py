@@ -26,6 +26,7 @@ ASSET_ATTRS = {
 JS_TYPES = {"", "module", "text/javascript", "application/javascript", "text/ecmascript"}
 CSS_REFERENCE = re.compile(r"url\(\s*(['\"]?)(.*?)\1\s*\)|@import\s*(['\"])(.*?)\3", re.I | re.S)
 SENSITIVE = {
+    "machine-local account": re.compile(r"\bbc15[5]\b", re.I),
     "possible credential": re.compile(
         r"-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:gh[pousr]_[A-Za-z0-9]{30,}|"
         r"github_pat_[A-Za-z0-9_]{30,}|sk-[A-Za-z0-9_-]{24,}|"
@@ -178,6 +179,286 @@ assert.notEqual(malformedResponses.verdict, 'pass', 'malformed tool frames canno
 assert.equal(inspect('').frames.length, 0, 'clear the inspection on empty input');
 """
 
+MOCK_DOM_TESTS = r"""
+const assert = require('node:assert/strict');
+const { readFileSync } = require('node:fs');
+const { join } = require('node:path');
+const vm = require('node:vm');
+const read = name => readFileSync(join(process.argv[1], name), 'utf8');
+const html = read('index.html');
+const voidTags = new Set('area base br col embed hr img input link meta param source track wbr'.split(' '));
+const decode = text => text.replace(/&(amp|quot|apos|lt|gt|#\d+);/g, (_, entity) =>
+  entity.startsWith('#') ? String.fromCodePoint(Number(entity.slice(1))) :
+    ({ amp: '&', quot: '"', apos: "'", lt: '<', gt: '>' })[entity]
+);
+
+// Model the selectors, event bubbling and editing operations used by the page.
+// Parse its real static HTML and the replay templates inserted through innerHTML.
+class Element {
+  constructor(tag = '', text = '') {
+    this.tag = tag;
+    this.text = text;
+    this.children = [];
+    this.attributes = new Map();
+    this.listeners = new Map();
+    this.style = { setProperty() {} };
+    this.value = '';
+    this.selectionStart = this.selectionEnd = 0;
+    this.dataset = new Proxy({}, {
+      get: (_, key) => this.getAttribute(Element.dataAttr(key)) ?? undefined,
+      set: (_, key, value) => (this.setAttribute(Element.dataAttr(key), value), true),
+    });
+  }
+  static dataAttr(key) { return 'data-' + key.replace(/[A-Z]/g, letter => '-' + letter.toLowerCase()); }
+  setAttribute(name, value) { this.attributes.set(name, String(value)); }
+  getAttribute(name) { return this.attributes.get(name) ?? null; }
+  hasAttribute(name) { return this.attributes.has(name); }
+  removeAttribute(name) { this.attributes.delete(name); }
+  toggleAttribute(name, force) { if (force) this.setAttribute(name, ''); else this.removeAttribute(name); }
+  get firstChild() { return this.children[0] ?? null; }
+  get textContent() { return this.text + this.children.map(node => node.textContent).join(''); }
+  set textContent(text) { this.children = []; this.text = text == null ? '' : String(text); }
+  set innerHTML(text) { this.replaceChildren(...parse(text).children); }
+  append(...nodes) {
+    for (const node of nodes) {
+      if (node.tag === '#fragment') { this.append(...node.children); continue; }
+      node.parentElement = this;
+      this.children.push(node);
+    }
+  }
+  replaceChildren(...nodes) { this.textContent = ''; this.append(...nodes); }
+  matches(selector) {
+    const attr = selector.match(/^\[([\w-]+)(?:="([^"]*)")?\]$/);
+    if (attr) return attr[2] == null ? this.hasAttribute(attr[1]) : this.getAttribute(attr[1]) === attr[2];
+    if (selector.startsWith('.')) return this.className.split(/\s+/).includes(selector.slice(1));
+    if (selector.startsWith('#')) return this.getAttribute('id') === selector.slice(1);
+    return this.tag === selector;
+  }
+  closest(selector) {
+    return this.matches(selector) ? this : this.parentElement?.closest(selector) ?? null;
+  }
+  querySelectorAll(selector) {
+    const terms = selector.split(/\s+/);
+    const collect = (node, index) => node.children.flatMap(child => {
+      const descendants = collect(child, index);
+      if (!child.matches(terms[index])) return descendants;
+      return index === terms.length - 1 ? [child, ...descendants] : collect(child, index + 1).concat(descendants);
+    });
+    return collect(this, 0);
+  }
+  querySelector(selector) { return this.querySelectorAll(selector)[0] ?? null; }
+  addEventListener(type, listener) {
+    if (!this.listeners.has(type)) this.listeners.set(type, []);
+    this.listeners.get(type).push(listener);
+  }
+  emit(type, attributes = {}) {
+    const event = { target: this, ...attributes, preventDefault() { this.defaultPrevented = true; } };
+    for (let node = this; node; node = node.parentElement) {
+      for (const listener of node.listeners.get(type) || []) listener(event);
+    }
+    return event;
+  }
+  click() { if (!this.disabled) this.emit('click'); }
+  focus() { document.activeElement = this; }
+  setSelectionRange(start, end) { this.selectionStart = start; this.selectionEnd = end; }
+  setRangeText(text, start, end) {
+    this.value = this.value.slice(0, start) + text + this.value.slice(end);
+    this.setSelectionRange(start + text.length, start + text.length);
+  }
+  getBoundingClientRect() { return { left: 0, right: 0, width: 0 }; }
+}
+
+for (const [property, attr] of Object.entries({ className: 'class', href: 'href', rel: 'rel', target: 'target' })) {
+  Object.defineProperty(Element.prototype, property, {
+    get() { return this.getAttribute(attr) ?? ''; }, set(value) { this.setAttribute(attr, value); },
+  });
+}
+for (const attribute of ['hidden', 'disabled', 'open']) {
+  Object.defineProperty(Element.prototype, attribute, {
+    get() { return this.hasAttribute(attribute); }, set(value) { this.toggleAttribute(attribute, value); },
+  });
+}
+
+function parse(markup) {
+  const root = new Element('#document');
+  const parents = [root];
+  for (const part of markup.match(/<!--[\s\S]*?-->|<![^>]*>|<\/?[\w-]+(?:[^>"']|"[^"]*"|'[^']*')*>|[^<]+|</g) || []) {
+    if (part.startsWith('<!')) continue;
+    if (part.startsWith('</')) { parents.pop(); continue; }
+    const tag = part.match(/^<([\w-]+)/)?.[1];
+    if (!tag) { parents.at(-1).append(new Element('#text', decode(part))); continue; }
+    const node = new Element(tag);
+    const rawAttrs = part.slice(tag.length + 1);
+    for (const [, attr, double, single, bare] of rawAttrs.matchAll(/([\w:-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/g)) {
+      node.setAttribute(attr, decode(double ?? single ?? bare ?? ''));
+    }
+    parents.at(-1).append(node);
+    if (!voidTags.has(tag) && !part.endsWith('/>')) parents.push(node);
+  }
+  return root;
+}
+
+const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)];
+const document = parse(html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ''));
+const query = selector => {
+  const element = document.querySelector(selector);
+  assert.ok(element, 'missing ' + selector);
+  return element;
+};
+Object.assign(document, {
+  documentElement: query('html'), body: query('body'), getElementById: id => document.querySelector('#' + id),
+  createElement: tag => new Element(tag), createTextNode: text => new Element('#text', text),
+  createDocumentFragment: () => new Element('#fragment'), getSelection: () => null,
+});
+
+const requests = [];
+function unexpectedRequest(api) {
+  return function () { requests.push(api); throw new Error('Unexpected network API: ' + api); };
+}
+let clipboard = '';
+const storage = new Map();
+let animation;
+const context = vm.createContext({
+  document, localStorage: { getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value) },
+  navigator: { language: 'en', clipboard: { writeText: async text => { clipboard = text; } }, sendBeacon: unexpectedRequest('sendBeacon') },
+  fetch: unexpectedRequest('fetch'), XMLHttpRequest: unexpectedRequest('XMLHttpRequest'),
+  WebSocket: unexpectedRequest('WebSocket'), EventSource: unexpectedRequest('EventSource'),
+  setTimeout: () => 0, clearTimeout() {}, performance: { now: () => 0 },
+  requestAnimationFrame: callback => (animation = callback, 1), cancelAnimationFrame: () => { animation = null; },
+});
+context.window = context;
+for (const [, attributes, inline] of scripts) {
+  const name = attributes.match(/\bsrc="([^"]+)"/)?.[1];
+  vm.runInContext(name ? read(name) : inline, context, { filename: name || 'index.html inline script' });
+}
+
+const click = selector => query(selector).click();
+const replay = selector => query('#replay-app ' + selector);
+const scenario = id => `[data-scenario="${id}"]`;
+const finding = () => replay('.replay-finding').textContent;
+
+async function testPage() {
+  assert.equal(document.documentElement.lang, 'en');
+  assert.equal(document.querySelectorAll('.replay-tab').length, 6, 'six replay tabs');
+  assert.match(replay('[data-variant="before"]').textContent, /Before Fix.*Grade F/);
+  assert.match(finding(), /P0 BREACH/);
+  assert.equal(replay('.inspector-event').textContent, 'response.completed');
+  click('[data-variant="after"]');
+  assert.match(finding(), /GRADE A\+ · 8\/8/);
+  assert.match(finding(), /protocol_violations: \[\]/);
+  assert.equal(replay('.inspector-event').textContent, 'response.incomplete');
+  click('[data-variant="before"]');
+  assert.match(finding(), /P0 BREACH/);
+
+  for (const [id, event] of [['C5', 'tool_calls[1]'], ['C7', 'delta.content'], ['C9', 'message_delta'], ['C10', 'finishReason']]) {
+    click(scenario(id));
+    assert.equal(query(scenario(id)).getAttribute('aria-pressed'), 'true');
+    assert.equal(replay('.inspector-event').textContent, event);
+    replay('.replay-reset').click();
+    assert.match(replay('.replay-progress').textContent, /0\//);
+    replay('.replay-step').click();
+    assert.match(replay('.inspector-meta').textContent, /#01/);
+    replay('.replay-play').click();
+    assert.equal(typeof animation, 'function');
+    animation(100000);
+    assert.equal(animation, null);
+    assert.match(finding(), /PASS|P1 WARN|P0 BREACH/);
+  }
+
+  click(scenario('PROXY'));
+  assert.match(query(scenario('PROXY')).textContent, /Proxy Live Wire-Tap/);
+  assert.match(query(scenario('PROXY')).textContent, /D1–D4/);
+  assert.match(finding(), /P0/);
+  assert.match(replay('.inspector-meta').textContent, /#05/);
+  const report = replay('.proxy-issue');
+  const markdown = replay('.proxy-issue-preview');
+  assert.equal(report.hidden, false);
+  assert.match(markdown.textContent, /UNCLOSED_TOOL_CALL_SUCCESS/);
+  assert.doesNotMatch(markdown.textContent, /lookup_service_status|\[REDACTED\]/, 'report omits tool payloads');
+  replay('.proxy-copy').click();
+  await new Promise(setImmediate);
+  assert.equal(clipboard, markdown.textContent);
+  assert.match(query('#replay-app').textContent, /\/_inferdiff\//);
+  const proxyLinks = replay('.replay-source').querySelectorAll('a');
+  replay('.replay-reset').click();
+  assert.equal(report.hidden, true);
+  const proxyFrames = document.querySelectorAll('#replay-app .frame-dot');
+  assert.equal(proxyFrames.length, 7, 'six SSE frames and the transport EOF');
+  for (const frame of proxyFrames) {
+    assert.equal(report.hidden, true, 'report is revealed when the stream ends');
+    replay('.replay-step').click();
+    const label = frame.dataset.event === 'transport EOF' ? 'Transport EOF' : frame.dataset.event;
+    assert.equal(replay('.inspector-event').textContent, label);
+  }
+  assert.equal(replay('.inspector-event').textContent, 'Transport EOF');
+  assert.equal(report.hidden, false);
+  assert.match(markdown.textContent, /UNCLOSED_TOOL_CALL_SUCCESS/);
+
+  click('[data-language="zh"]');
+  assert.equal(document.documentElement.lang, 'zh-CN');
+  assert.equal(query('[data-language="zh"]').getAttribute('aria-pressed'), 'true');
+  for (const node of document.querySelectorAll('[data-i18n]')) {
+    assert.ok(node.textContent.trim(), 'Chinese translation for ' + node.dataset.i18n);
+  }
+  assert.match(query(scenario('PROXY')).textContent, /[\u3400-\u9fff]/);
+  assert.match(finding(), /P0.*违约/s);
+  assert.match(replay('.proxy-issue-preview').textContent, /UNCLOSED_TOOL_CALL_SUCCESS/);
+  click(scenario('C1'));
+  click('[data-variant="after"]');
+  assert.match(finding(), /A\+ 评级 · 8\/8/);
+  click('[data-language="en"]');
+  assert.equal(document.documentElement.lang, 'en');
+  assert.match(finding(), /GRADE A\+ · 8\/8/);
+
+  click('#quick-copy');
+  await new Promise(setImmediate);
+  assert.equal(clipboard, query('#quick-command').textContent);
+  assert.match(clipboard, /^uvx inferdiff doctor /);
+  assert.equal(query('#copy-status').textContent, 'Copied');
+
+  const input = query('#stream-input');
+  const pasted = input.emit('paste', { clipboardData: { getData: () => breachedSse } });
+  assert.equal(pasted.defaultPrevented, true);
+  assert.match(query('#stream-finding').textContent, /P0 BREACH/);
+  assert.equal(query('#stream-count').textContent, '4');
+  assert.ok(!input.value.includes(fakeKey) && !input.value.includes(fakeBearer), 'paste is redacted');
+  const payload = trace(true);
+  const file = { name: 'fixture.trace.jsonl', size: Buffer.byteLength(payload), text: async () => payload };
+  const drop = query('#stream-editor').emit('drop', { dataTransfer: { files: [file] } });
+  assert.equal(drop.defaultPrevented, true);
+  await new Promise(setImmediate);
+  assert.equal(query('#stream-protocol').textContent, 'inferdiff trace');
+  assert.equal(query('#stream-count').textContent, '5');
+  assert.match(query('#stream-finding').textContent, /INCOMPLETE/);
+  assert.match(query('#stream-timing').textContent, /43\.5/);
+  click('[data-language="zh"]');
+  assert.equal(query('#stream-verdict').textContent, '如实中断');
+  click('#stream-clear');
+  assert.equal(query('#stream-results').hidden, true);
+
+  const owner = 'https://github.com/ApacheWang/';
+  const repos = ['inferdiff', 'inferdiff-mcp', 'inferdiff-js', 'inferdiff-extension', 'inferdiff-bot', 'inferdiff-bench', 'inferdiff-chaos'];
+  const hubLinks = document.querySelectorAll('.product-card a');
+  for (const repo of repos) {
+    assert.ok(hubLinks.some(link => link.href === owner + repo), repo + ' hub link');
+  }
+  assert.ok(hubLinks.some(link => link.href === '#quickstart'), 'Cloud links to the local CLI quickstart');
+  for (const link of [...document.querySelectorAll('a'), ...proxyLinks]) {
+    if (!link.href || link.href.startsWith('#')) continue;
+    assert.ok(repos.some(repo => link.href === owner + repo || link.href.startsWith(owner + repo + '/')), link.href);
+    assert.equal(link.target, '_blank');
+    assert.ok(['noopener', 'noreferrer'].every(token => link.rel.split(/\s+/).includes(token)), link.href);
+  }
+  assert.deepEqual(requests, [], 'no network API used during local interactions');
+  console.log('PASS: mocked DOM in EN and 中文, all six replays, C1 comparison, D1 report, hero copy, SSE paste, trace drop, and outbound link policy.');
+}
+
+testPage().catch(error => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+
 BROWSER_TESTS = r"""
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -293,9 +574,22 @@ async function main() {
       await click('[data-scenario="C10"]');
       assert.ok(await evaluate(probe('[data-scenario="C10"]') + '.getAttribute("aria-pressed") === "true"'));
       assert.match(await evaluate(probe('#replay-app .finding-copy') + '.textContent'), /STOP|MAX_TOKENS/);
+      await click('[data-scenario="PROXY"]');
+      assert.match(await evaluate(probe('.proxy-issue-preview') + '.textContent'), /UNCLOSED_TOOL_CALL_SUCCESS/);
+      assert.ok(await evaluate('document.documentElement.scrollWidth <= innerWidth'), 'proxy replay overflows at ' + width);
+      await click('.replay-reset');
+      assert.equal(await evaluate(probe('.proxy-issue') + '.hidden'), true);
+      await click('.replay-play');
+      await waitFor('!' + probe('.proxy-issue') + '.hidden', 'D1 incident at EOF');
+      await click('[data-language="zh"]');
+      assert.match(await evaluate(probe('#replay-app .finding-copy') + '.textContent'), /违约|结束/);
+      await click('[data-language="en"]');
       await click('[data-scenario="C1"]');
       await click('[data-variant="before"]');
 
+      await click('#quick-copy');
+      await waitFor(probe('#copy-status') + '.textContent === "Copied"', 'hero command copy');
+      assert.equal(await evaluate('navigator.clipboard.readText()'), await evaluate(probe('#quick-command') + '.textContent'));
       await click('[data-stream-sample="healthy"]');
       await waitFor(probe('.stream-frame'), 'healthy sample frames');
       assert.notEqual(await evaluate(probe('#stream-finding') + '.dataset.tone'), 'crimson');
@@ -358,7 +652,7 @@ async function main() {
       assert.deepEqual(external, [], 'no external requests at ' + width);
       assert.deepEqual(requests(ready), [], 'no network during local interactions at ' + width);
       console.log('PASS: Chrome ' + width + 'px, clipboard-pasted crimson P0, ' +
-        (mobile ? 'file picker' : 'file drop') + ', replay, C10, localization, zero external requests.');
+        (mobile ? 'file picker' : 'file drop') + ', C1 comparison, C10, D1 replay, hero copy, localization, zero external requests.');
     }
 
     const offlineCheckpoint = observed.length;
@@ -401,6 +695,7 @@ class Page(HTMLParser):
         self.dependencies = []
         self.scripts = []
         self.styles = []
+        self.csp = []
         self.errors = []
 
     def error(self, message):
@@ -446,6 +741,8 @@ class Page(HTMLParser):
                 self.dependencies.append((tag, reference))
         if tag == "meta" and (attributes.get("http-equiv") or "").lower() == "refresh":
             self.error("meta refresh can navigate away from the offline site")
+        if tag == "meta" and (attributes.get("http-equiv") or "").lower() == "content-security-policy":
+            self.csp.append(attributes.get("content") or "")
         if attributes.get("style"):
             self.styles.append(attributes["style"])
         if tag not in VOID:
@@ -537,6 +834,13 @@ def check_stream_inspector(root, errors):
         errors.append(f"stream inspector regression failed: {detail[0] if detail else 'Node test failed'}")
 
 
+def check_page_interactions(root, errors):
+    result = run_node(STREAM_FIXTURES + MOCK_DOM_TESTS, [root])
+    if result.returncode:
+        detail = re.search(r"^\w*Error(?: \[[^\]]+\])?: .+$", result.stderr, re.MULTILINE)
+        errors.append(f"mocked DOM test failed: {detail[0] if detail else 'Node test failed'}")
+
+
 def verify(root):
     page_path = root / "index.html"
     if not page_path.is_file():
@@ -558,6 +862,10 @@ def verify(root):
     for tag in ("html", "head", "title", "body", "main"):
         if page.counts[tag] != 1:
             errors.append(f"index.html: expected one <{tag}>")
+    if len(page.csp) != 1 or not {
+        "connect-src 'none'", "form-action 'none'", "object-src 'none'", "base-uri 'none'",
+    }.issubset({directive.strip() for policy in page.csp for directive in policy.split(";")}):
+        errors.append("index.html: expected the offline Content Security Policy")
 
     for tag, reference in page.dependencies:
         path = asset_path(root, reference, tag != "script", errors, f"index.html <{tag}>")
@@ -594,6 +902,7 @@ def verify(root):
     if not errors:
         check_javascript(scripts, errors)
         check_stream_inspector(root, errors)
+        check_page_interactions(root, errors)
     return errors
 
 
@@ -697,7 +1006,8 @@ def main():
         for error in errors:
             print(f"FAIL: {error}")
         return 1
-    print("PASS: HTML structure, local assets, JavaScript syntax, bilingual strings, leak scan, and offline parser fixtures.")
+    print("PASS: HTML structure, local assets, CSP, JavaScript syntax, leak scan, and offline parser fixtures.")
+    print("PASS: mocked DOM in EN and 中文, all six replays, C1 comparison, D1 report, hero copy, SSE paste, trace drop, and outbound link policy.")
     if options.chrome:
         try:
             result = verify_browser(root, options.chrome.resolve(), options.screenshot, options.chrome_no_sandbox)

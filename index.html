@@ -7,16 +7,6 @@
   <meta http-equiv="Content-Security-Policy" content="connect-src 'none'; form-action 'none'; object-src 'none'; base-uri 'none'">
   <meta name="description" content="Inspect streaming LLM API failures frame by frame with inferdiff, the zero-dependency contract verifier.">
   <title>inferdiff | Streaming LLM contract verifier</title>
-  <script>
-    // Public launch URLs. Leave blank to display a disabled CTA.
-    const SITE_CONFIG = Object.freeze({
-      cloudCheckUrl: "",
-      relayPkUrl: "",
-      watchdogUrl: "",
-      selfHostUrl: "",
-      githubStars: 1 // Offline snapshot from GitHub
-    });
-  </script>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='10' fill='%23132a30'/%3E%3Cpath d='M7 20h7l6-10 7 20 5-10h3' fill='none' stroke='%235ee7ca' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="styles.css">
   <script src="stream-inspector.js" defer></script>
@@ -49,14 +39,14 @@
         <a href="#replay" data-i18n="navReplay">Waterfall</a>
         <a href="#inspect" data-i18n="navInspect">Inspect</a>
         <a href="#probes" data-i18n="navProbes">Probes</a>
-        <a href="#cloud" data-i18n="navCloud">Cloud</a>
+        <a href="#cloud" data-i18n="navCloud">Ecosystem</a>
       </nav>
       <div class="header-actions">
         <div class="language-toggle" role="group" aria-label="Language" data-i18n-aria="language">
           <button type="button" data-language="en" lang="en" aria-pressed="true">EN</button>
           <button type="button" data-language="zh" lang="zh-CN" aria-pressed="false">中文</button>
         </div>
-        <a class="github-link" href="https://github.com/ApacheWang/inferdiff" aria-label="View on GitHub" data-i18n-aria="github"><svg class="icon" aria-hidden="true"><use href="#icon-github"/></svg></a>
+        <a class="github-link" href="https://github.com/ApacheWang/inferdiff" target="_blank" rel="noopener noreferrer" aria-label="View on GitHub" data-i18n-aria="github"><svg class="icon" aria-hidden="true"><use href="#icon-github"/></svg></a>
       </div>
     </div>
   </header>
@@ -70,8 +60,8 @@
             <h1 id="hero-heading"><span data-i18n="heroLineOne">See where your</span><span class="hero-accent" data-i18n="heroLineTwo">LLM stream breaks.</span></h1>
             <p class="hero-description" data-i18n="heroDescription">Find truncated tool calls, buffered SSE, and other protocol failures hiding behind HTTP 200. Inspect the exact frame where the stream went wrong.</p>
             <div class="badges" aria-label="Project details" data-i18n-aria="projectDetails">
-              <a class="badge" href="https://github.com/ApacheWang/inferdiff/stargazers"><svg class="icon badge-star" aria-hidden="true"><use href="#icon-star"/></svg><span data-i18n="stars">GitHub Stars</span><span class="badge-value" id="github-stars">1</span></a>
-              <a class="badge" href="https://pypi.org/project/inferdiff/0.1.1/"><svg class="icon badge-pypi" aria-hidden="true"><use href="#icon-package"/></svg><span>PyPI</span><span class="badge-value">0.1.1</span></a>
+              <a class="badge" href="https://github.com/ApacheWang/inferdiff/stargazers" target="_blank" rel="noopener noreferrer"><svg class="icon badge-star" aria-hidden="true"><use href="#icon-star"/></svg><span data-i18n="stars">GitHub Stars</span><span class="badge-value" id="github-stars">1</span></a>
+              <span class="badge"><svg class="icon badge-pypi" aria-hidden="true"><use href="#icon-package"/></svg><span>PyPI</span><span class="badge-value">0.1.1</span></span>
               <span class="badge"><svg class="icon badge-deps" aria-hidden="true"><use href="#icon-bolt"/></svg><span data-i18n="zeroDeps">Zero-Deps</span></span>
             </div>
           </div>
@@ -111,7 +101,7 @@
           </a>
         </div>
 
-        <div class="quickstart">
+        <div class="quickstart" id="quickstart">
           <span class="quickstart-label"><svg class="icon" aria-hidden="true"><use href="#icon-terminal"/></svg><span data-i18n="quickstart">Quickstart</span></span>
           <code id="quick-command"><span class="command-exec">uvx inferdiff doctor</span> http://127.0.0.1:8080/v1 --model Qwen3-0.6B-Q8_0.gguf --profile full</code>
           <button type="button" class="copy-button quick-copy" id="quick-copy"><svg class="icon" aria-hidden="true"><use href="#icon-copy"/></svg><span data-copy-label data-i18n="copy">Copy</span></button>
@@ -233,48 +223,64 @@
       <div class="section-header">
         <div>
           <h2 id="cloud-heading" data-i18n="cloudHeading">The inferdiff ecosystem</h2>
-          <p data-i18n="cloudIntro">Run a check from your terminal, from agent chat, or on a schedule.</p>
+          <p data-i18n="cloudIntro">Find the right open-source tool to check your relay, build an integration, or reproduce a streaming failure.</p>
         </div>
       </div>
       <div class="product-grid">
         <article class="product-card">
-          <div class="product-top"><span class="product-icon"><svg class="icon" aria-hidden="true"><use href="#icon-terminal"/></svg></span><span class="product-tag">MIT</span></div>
-          <h3 data-i18n="cliTitle">Open-Source CLI</h3>
-          <p><span data-i18n="cliDescription">Run locally or in CI with zero runtime dependencies.</span> <code>uvx inferdiff doctor</code></p>
-          <ul class="product-features">
-            <li data-i18n="cliFeatureOne">Check a live endpoint with canary probes.</li>
-            <li data-i18n="cliFeatureTwo">Record SSE traces and compare them frame by frame.</li>
-            <li data-i18n="cliFeatureThree">Export an offline HTML waterfall for a regression report.</li>
-          </ul>
-          <a class="product-cta primary-cta" href="https://github.com/ApacheWang/inferdiff"><svg class="icon" aria-hidden="true"><use href="#icon-github"/></svg><span data-i18n="github">View on GitHub</span></a>
+          <span class="product-icon"><svg class="icon" aria-hidden="true"><use href="#icon-terminal"/></svg></span>
+          <h3 id="product-cli">inferdiff</h3>
+          <p data-i18n="cliDescription">Zero-dependency Python CLI with HTML and SVG waterfalls and a GitHub Action for CI.</p>
+          <p class="product-command"><code>uvx inferdiff doctor …</code></p>
+          <div class="product-actions"><a class="product-cta primary-cta" href="https://github.com/ApacheWang/inferdiff" target="_blank" rel="noopener noreferrer" aria-describedby="product-cli"><svg class="icon" aria-hidden="true"><use href="#icon-github"/></svg><span data-i18n="github">View on GitHub</span></a></div>
         </article>
         <article class="product-card product-mcp">
-          <div class="product-top"><span class="product-icon"><svg class="icon" aria-hidden="true"><use href="#icon-agent"/></svg></span><span class="product-tag"><code>inferdiff-mcp</code></span></div>
-          <h3 data-i18n="mcpTitle">MCP Server for AI Agents</h3>
-          <p data-i18n="mcpDescription">Check endpoints in Claude Code, Cursor, Windsurf, or Antigravity chat.</p>
-          <ul class="product-features mcp-features">
-            <li><code>doctor_endpoint</code></li>
-            <li><code>compare_endpoints</code></li>
-            <li><code>rank_endpoints</code></li>
-          </ul>
-          <button type="button" class="product-cta copy-button" id="mcp-copy"><svg class="icon" aria-hidden="true"><use href="#icon-copy"/></svg><span data-copy-label data-i18n="mcpCopy">Copy MCP config</span></button>
-          <small class="cloud-note" data-i18n="mcpNote">Install inferdiff-mcp before adding it to your client.</small>
+          <span class="product-icon"><svg class="icon" aria-hidden="true"><use href="#icon-agent"/></svg></span>
+          <h3 id="product-mcp">inferdiff-mcp</h3>
+          <p data-i18n="mcpDescription">MCP server to check, compare, and rank endpoints from Claude Code, Cursor, or Codex.</p>
+          <p class="product-command"><code>pip install inferdiff-mcp</code></p>
+          <div class="product-actions">
+            <a class="product-cta" href="https://github.com/ApacheWang/inferdiff-mcp" target="_blank" rel="noopener noreferrer" aria-describedby="product-mcp"><svg class="icon" aria-hidden="true"><use href="#icon-github"/></svg><span data-i18n="github">View on GitHub</span></a>
+            <button type="button" class="product-cta copy-button" id="mcp-copy"><svg class="icon" aria-hidden="true"><use href="#icon-copy"/></svg><span data-copy-label data-i18n="mcpCopy">Copy MCP config</span></button>
+          </div>
+        </article>
+        <article class="product-card">
+          <span class="product-icon"><svg class="icon" aria-hidden="true"><use href="#icon-package"/></svg></span>
+          <h3 id="product-js">inferdiff-js</h3>
+          <p data-i18n="jsDescription">Zero-dependency Node.js 20+ CLI and SDK with ESM and TypeScript support.</p>
+          <p class="product-command"><code>npx inferdiff-js …</code></p>
+          <div class="product-actions"><a class="product-cta" href="https://github.com/ApacheWang/inferdiff-js" target="_blank" rel="noopener noreferrer" aria-describedby="product-js"><svg class="icon" aria-hidden="true"><use href="#icon-github"/></svg><span data-i18n="github">View on GitHub</span></a></div>
+        </article>
+        <article class="product-card">
+          <span class="product-icon"><svg class="icon" aria-hidden="true"><use href="#icon-wave"/></svg></span>
+          <h3 id="product-extension">inferdiff-extension</h3>
+          <p data-i18n="extensionDescription">Relay Radar, a Manifest V3 extension for Chrome and Edge.</p>
+          <div class="product-actions"><a class="product-cta" href="https://github.com/ApacheWang/inferdiff-extension" target="_blank" rel="noopener noreferrer" aria-describedby="product-extension"><svg class="icon" aria-hidden="true"><use href="#icon-github"/></svg><span data-i18n="github">View on GitHub</span></a></div>
+        </article>
+        <article class="product-card">
+          <span class="product-icon"><svg class="icon" aria-hidden="true"><use href="#icon-agent"/></svg></span>
+          <h3 id="product-bot">inferdiff-bot</h3>
+          <p data-i18n="botDescription">Interactive relay checks and watchdog alerts in Telegram and Feishu.</p>
+          <div class="product-actions"><a class="product-cta" href="https://github.com/ApacheWang/inferdiff-bot" target="_blank" rel="noopener noreferrer" aria-describedby="product-bot"><svg class="icon" aria-hidden="true"><use href="#icon-github"/></svg><span data-i18n="github">View on GitHub</span></a></div>
+        </article>
+        <article class="product-card">
+          <span class="product-icon"><svg class="icon" aria-hidden="true"><use href="#icon-file"/></svg></span>
+          <h3 id="product-bench">inferdiff-bench</h3>
+          <p data-i18n="benchDescription">Reproducible benchmarks for testing whether inference engines and relays report protocol failures honestly.</p>
+          <div class="product-actions"><a class="product-cta" href="https://github.com/ApacheWang/inferdiff-bench" target="_blank" rel="noopener noreferrer" aria-describedby="product-bench"><svg class="icon" aria-hidden="true"><use href="#icon-github"/></svg><span data-i18n="github">View on GitHub</span></a></div>
+        </article>
+        <article class="product-card">
+          <span class="product-icon"><svg class="icon" aria-hidden="true"><use href="#icon-bolt"/></svg></span>
+          <h3 id="product-chaos">inferdiff-chaos</h3>
+          <p data-i18n="chaosDescription">Programmable local mock server that injects faults into LLM SSE streams.</p>
+          <p class="product-command"><code>inferdiff-chaos --scenario c1-responses-lie</code></p>
+          <div class="product-actions"><a class="product-cta" href="https://github.com/ApacheWang/inferdiff-chaos" target="_blank" rel="noopener noreferrer" aria-describedby="product-chaos"><svg class="icon" aria-hidden="true"><use href="#icon-github"/></svg><span data-i18n="github">View on GitHub</span></a></div>
         </article>
         <article class="product-card product-cloud">
-          <div class="product-top"><span class="product-icon"><svg class="icon" aria-hidden="true"><use href="#icon-cloud"/></svg></span><span class="product-tag" data-i18n="hosting">Hosted / Self-hosted</span></div>
+          <div class="product-top"><span class="product-icon"><svg class="icon" aria-hidden="true"><use href="#icon-cloud"/></svg></span><span class="product-tag" data-i18n="cloudSoon">Coming soon</span></div>
           <h3>inferdiff Cloud</h3>
-          <p data-i18n="cloudDescription">Check and compare relays from a browser.</p>
-          <ul class="product-features cloud-features">
-            <li><span class="tier tier-free" data-i18n="free">Free</span><span data-i18n="freeFeatures">Web Check, Relay PK, Multi-Relay Ranker, and shareable links</span></li>
-            <li><span class="tier tier-pro" data-i18n="pro">Pro</span><span data-i18n="proFeatures">24/7 Watchdog, Feishu, Telegram, and WeChat alerts, and live SVG badges</span></li>
-          </ul>
-          <div class="cloud-actions">
-            <a class="product-cta primary-cta" data-cloud="cloudCheckUrl" data-i18n="webCheck" role="link" aria-disabled="true">Web Check</a>
-            <a class="product-cta" data-cloud="relayPkUrl" data-i18n="relayPk" role="link" aria-disabled="true">Relay PK</a>
-            <a class="product-cta" data-cloud="watchdogUrl" data-i18n="watchdog" role="link" aria-disabled="true">Watchdog</a>
-            <a class="product-cta" data-cloud="selfHostUrl" data-i18n="selfHost" role="link" aria-disabled="true">Self-host</a>
-          </div>
-          <small class="cloud-note" id="cloud-note" data-i18n="cloudNote">Cloud links are configurable in this showcase.</small>
+          <p data-i18n="cloudDescription">Hosted relay checks and scheduled watchdog alerts are in development. You can run relay checks locally with the CLI today.</p>
+          <div class="product-actions"><a class="product-cta" href="#quickstart"><svg class="icon" aria-hidden="true"><use href="#icon-terminal"/></svg><span data-i18n="cloudQuickstart">CLI quickstart</span></a></div>
         </article>
       </div>
     </section>
@@ -284,7 +290,7 @@
     <div class="shell footer-inner">
       <a class="brand" href="#top" aria-label="inferdiff"><span class="brand-mark"><svg class="icon" aria-hidden="true"><use href="#icon-wave"/></svg></span><span>inferdiff<span class="brand-period">.</span></span></a>
       <span data-i18n="footerCopy">Streaming LLM contract verification</span>
-      <div><a href="https://github.com/ApacheWang/inferdiff">GitHub</a><a href="https://github.com/ApacheWang/inferdiff/blob/main/LICENSE" data-i18n="license">MIT License</a></div>
+      <div><a href="https://github.com/ApacheWang/inferdiff" target="_blank" rel="noopener noreferrer">GitHub</a><a href="https://github.com/ApacheWang/inferdiff/blob/main/LICENSE" target="_blank" rel="noopener noreferrer" data-i18n="license">MIT License</a></div>
     </div>
   </footer>
   <div class="sr-only" id="copy-status" role="status"></div>

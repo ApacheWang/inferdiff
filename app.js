@@ -23,6 +23,14 @@
       tool: "Tool call",
       text: "UTF-8 / pass",
       breach: "P0 breach",
+      proxyEvents: "events",
+      proxyDashboard: "Local proxy dashboard",
+      proxyForwarding: "Forwards each chunk as it arrives · no buffering",
+      proxyEof: "Transport EOF",
+      proxyWaiting: "Forwarding the stream. D1–D4 checks run at EOF.",
+      proxyIssue: "Redacted Issue Markdown",
+      proxyPrivacy: "Request metadata and findings only. Credentials, prompts and tool arguments are omitted.",
+      proxyCopy: "Copy",
     },
     zh: {
       scenarios: "回放场景",
@@ -44,6 +52,14 @@
       tool: "工具调用",
       text: "UTF-8 / 通过",
       breach: "P0 违约",
+      proxyEvents: "个事件",
+      proxyDashboard: "本地代理面板",
+      proxyForwarding: "收到数据块即转发 · 无缓冲",
+      proxyEof: "传输结束（EOF）",
+      proxyWaiting: "正在转发数据流。流结束后运行 D1–D4 检查。",
+      proxyIssue: "脱敏后的 Issue Markdown",
+      proxyPrivacy: "仅包含请求元数据和检测结果，省略凭据、提示词及工具参数。",
+      proxyCopy: "复制",
     },
   };
 
@@ -139,8 +155,7 @@
       'Responses 的工具参数 JSON 被截断，缺少 response.function_call_arguments.done，却声称 status: "completed"。Chat Completions 如实报告 finish_reason: "length"。',
     ],
     tone: "crimson",
-    source: "https://github.com/ggml-org/llama.cpp/issues/30773",
-    sourceLabel: ["Recorded upstream run · report #30773", "上游实测记录 · 问题报告 #30773"],
+    sourceLabel: ["Recorded upstream run · llama.cpp #30773", "上游实测记录 · llama.cpp #30773"],
   };
 
   const afterC1 = {
@@ -162,7 +177,6 @@
     ],
     tone: "emerald",
     protocolViolations: [],
-    source: null,
     sourceLabel: ["Verified local patch run · inferdiff v0.1.1 full profile", "本地补丁实测 · inferdiff v0.1.1 full 配置"],
   };
 
@@ -217,6 +231,57 @@
   }
 
   const previewSource = ["v0.2 preview · simulated frames and timing", "v0.2 预览 · 模拟帧与时间"];
+
+  const proxyResponse = { id: "resp_proxy_demo", object: "response", status: "in_progress" };
+  const proxyTool = { id: "fc_proxy_demo", type: "function_call", call_id: "call_proxy_demo", name: "lookup_service_status", arguments: "", status: "in_progress" };
+  const proxyArgs = ['{"service":"', '[REDACTED]","window":"5'];
+  const proxyClosedTool = { ...proxyTool, arguments: proxyArgs.join(""), status: "completed" };
+  const proxyTtft = 192;
+  const proxyEof = 548;
+  const proxyEofEvent = "transport EOF";
+  const proxyFinding = "UNCLOSED_TOOL_CALL_SUCCESS";
+  const proxyFrame = (ms, tone, event, data) => [ms, 0, tone, event, { type: event, ...data }];
+  const proxyFrames = [
+    proxyFrame(44, "slate", "response.created", { response: proxyResponse }),
+    proxyFrame(108, "violet", "response.output_item.added", { output_index: 0, item: proxyTool }),
+    ...proxyArgs.map((delta, index) => proxyFrame(proxyTtft + index * 126, "violet", "response.function_call_arguments.delta", {
+      delta, output_index: 0, item_id: proxyTool.id,
+    })),
+    proxyFrame(428, "violet", "response.output_item.done", { output_index: 0, item: proxyClosedTool }),
+    proxyFrame(506, "crimson", "response.completed", { response: { ...proxyResponse, status: "completed", output: [proxyClosedTool] } }),
+  ];
+  const proxyIssueMarkdown = [
+    `## inferdiff proxy incident
+
+### Request and stream
+
+- Request: \`POST /v1/responses\`
+- HTTP status: 200
+- Dialect: openai-responses
+- Finish: completed
+- TTFT: ${proxyTtft} ms
+- Total time: ${proxyEof} ms
+- Frames: ${proxyFrames.length}
+
+### Findings
+
+- **P0 D1** \`${proxyFinding}\` at frame ${proxyFrames.length - 1}. The stream reported success with an incomplete or inconsistent tool call.`,
+    `## inferdiff 代理故障
+
+### 请求与数据流
+
+- 请求：\`POST /v1/responses\`
+- HTTP 状态：200
+- 协议：openai-responses
+- 结束状态：completed
+- 首 token 耗时：${proxyTtft} ms
+- 总耗时：${proxyEof} ms
+- SSE 帧数：${proxyFrames.length}
+
+### 检测结果
+
+- **P0 D1** \`${proxyFinding}\`，帧序号 ${proxyFrames.length - 1}。工具调用不完整或前后不一致，流却报告成功。`,
+  ];
 
   const scenarios = [
     beforeC1,
@@ -314,6 +379,25 @@
       tone: "crimson",
       sourceLabel: previewSource,
     },
+    {
+      id: "PROXY",
+      tabLabel: "D1–D4",
+      title: ["Proxy Live Wire-Tap", "代理实时抓流"],
+      range: 600,
+      rate: 0.35,
+      tracks: [["/v1/responses", ["Agent tool call · HTTP 200", "智能体工具调用 · HTTP 200"], "violet", proxyEof / 600]],
+      frames: [...proxyFrames, [proxyEof, 0, "slate", proxyEofEvent, { eof_clean: true }]],
+      inspect: "response.completed",
+      verdict: ["D1 · P0 BREACH", "D1 · P0 违约"],
+      finding: [
+        'At EOF, D1 flags response.completed: tool arguments were truncated and response.function_call_arguments.done never arrived.',
+        '流结束时，D1 标记了 response.completed：工具参数已截断，且一直未收到 response.function_call_arguments.done。',
+      ],
+      tone: "crimson",
+      issue: proxyIssueMarkdown,
+      source: "https://github.com/ApacheWang/inferdiff/tree/feat/v02-storage-probes",
+      sourceLabel: ["v0.2 branch · simulated capture and timing", "v0.2 分支 · 模拟抓流与时间"],
+    },
   ];
 
   for (const scenario of [...scenarios, afterC1]) {
@@ -334,6 +418,7 @@
 
   function buildTimeline() {
     const { id, frames, tracks, range } = state.scenario;
+    const words = copy[state.language];
     const ruler = ticks.map((tick) => `<span class="timeline-tick" style="--position:${tick * 25}%">${formatMs(tick * range / 4)}${tick === 4 ? " ms" : ""}</span>`).join("");
     const rails = tracks.map(([label, detail, tone, end], track) => {
       const trackFrames = frames.map((frame, index) => ({ frame, index })).filter(({ frame }) => frame[1] === track);
@@ -343,7 +428,8 @@
         const row = available < 0 ? rowTimes.length : available;
         rowTimes[row] = ms;
         const offset = Math.ceil(row / 2) * (row % 2 === 0 ? 1 : -1) * 16;
-        return `<button type="button" class="frame-dot" data-frame="${index}" data-track="${track}" data-event="${event}" data-tone="${color}" data-arrived="false" style="--position:${ms / range * 100}%;--offset:${offset}px" title="${event} · ${formatMs(ms)} ms" aria-label="${label}, ${event}, ${formatMs(ms)} ms" aria-pressed="false" disabled></button>`;
+        const eventLabel = event === proxyEofEvent ? words.proxyEof : event;
+        return `<button type="button" class="frame-dot" data-frame="${index}" data-track="${track}" data-event="${event}" data-tone="${color}" data-arrived="false" style="--position:${ms / range * 100}%;--offset:${offset}px" title="${eventLabel} · ${formatMs(ms)} ms" aria-label="${label}, ${eventLabel}, ${formatMs(ms)} ms" aria-pressed="false" disabled></button>`;
       }).join("");
       const height = Math.max(55, 2 * Math.floor(rowTimes.length / 2) * 16 + 20);
       return `<div class="timeline-track" data-tone="${tone}">
@@ -380,15 +466,16 @@
   }
 
   function paint(elapsed) {
-    const { frames, range } = state.scenario;
+    const { frames, range, issue } = state.scenario;
+    const words = copy[state.language];
     state.elapsed = elapsed;
     view.timeline.style.setProperty("--elapsed", `${elapsed / range * 100}%`);
-    view.progress.textContent = `${formatMs(elapsed)} ms · ${state.count}/${frames.length} ${copy[state.language].frames}`;
+    view.progress.textContent = `${formatMs(elapsed)} ms · ${state.count}/${frames.length} ${issue ? words.proxyEvents : words.frames}`;
   }
 
   function updateFrameView() {
     const words = copy[state.language];
-    const { frames, tracks, tone, verdict, finding, protocolViolations } = state.scenario;
+    const { frames, tracks, tone, verdict, finding, protocolViolations, issue } = state.scenario;
     const done = state.count === frames.length;
     view.dots.forEach((dot) => {
       const index = Number(dot.dataset.frame);
@@ -400,9 +487,13 @@
     view.next.disabled = state.selected >= state.count - 1;
     view.finding.dataset.tone = done ? tone : "slate";
     view.badge.textContent = done ? local(verdict) : words.waiting;
-    view.note.textContent = done ? local(finding) : words.listening;
+    view.note.textContent = done ? local(finding) : issue ? words.proxyWaiting : words.listening;
     view.protocol.hidden = !done || !protocolViolations;
     view.protocol.textContent = view.protocol.hidden ? "" : `protocol_violations: ${JSON.stringify(protocolViolations)}`;
+    if (issue) {
+      view.issue.hidden = !done;
+      view.issuePreview.textContent = done ? local(issue) : "";
+    }
 
     if (state.selected < 0) {
       view.meta.textContent = words.waiting;
@@ -413,8 +504,10 @@
     }
 
     const [ms, track, color, event, payload] = frames[state.selected];
-    view.meta.textContent = `#${String(state.selected + 1).padStart(2, "0")} · +${formatMs(ms)} ms · ${tracks[track][0]}`;
-    view.event.textContent = event;
+    const sequence = state.selected + (issue ? 0 : 1);
+    const frameLabel = event === proxyEofEvent ? "" : `#${String(sequence).padStart(2, "0")} · `;
+    view.meta.textContent = `${frameLabel}+${formatMs(ms)} ms · ${tracks[track][0]}`;
+    view.event.textContent = event === proxyEofEvent ? words.proxyEof : event;
     view.event.dataset.tone = color;
     highlightPayload(view.code, payload);
     view.code.parentElement.scrollTop = 0;
@@ -495,14 +588,18 @@
     const mount = document.querySelector("#replay-app");
     if (!mount) return;
     const words = copy[state.language];
-    const { id, source, sourceLabel } = state.scenario;
+    const { id, source, sourceLabel, issue } = state.scenario;
 
     mount.innerHTML = `
       <div class="replay-tabs" role="group" aria-label="${words.scenarios}">
-        ${scenarios.map((scenario) => `<button type="button" class="replay-tab" data-scenario="${scenario.id}" aria-pressed="${scenario.id === id}"><span class="replay-tab-id">${scenario.id}</span><span class="replay-tab-title">${local(scenario.title)}</span></button>`).join("")}
+        ${scenarios.map((scenario) => `<button type="button" class="replay-tab" data-scenario="${scenario.id}" aria-pressed="${scenario.id === id}"><span class="replay-tab-id">${scenario.tabLabel ?? scenario.id}</span><span class="replay-tab-title">${local(scenario.title)}</span></button>`).join("")}
       </div>
       ${id === "C1" ? `<div class="replay-variants" role="group" aria-label="${words.variants}">
         ${Object.entries(c1Variants).map(([variant, { label }]) => `<button type="button" class="replay-variant" data-variant="${variant}" aria-pressed="${state.c1Variant === variant}">${local(label)}</button>`).join("")}
+      </div>` : ""}
+      ${issue ? `<div class="proxy-dashboard">
+        <div><strong>${words.proxyDashboard}</strong><code>/_inferdiff/</code></div>
+        <div><code>inferdiff proxy</code><span>${words.proxyForwarding}</span></div>
       </div>` : ""}
       <div class="replay-toolbar">
         <div class="replay-controls">
@@ -523,10 +620,17 @@
           <pre class="inspector-code" tabindex="0"><code></code></pre>
         </section>
       </div>
-      <div class="replay-finding">
+      <div class="replay-finding"${issue ? ' role="status"' : ""}>
         <span class="finding-badge"></span><div class="finding-copy"><span class="finding-note"></span><code class="finding-protocol" hidden></code></div>
       </div>
-      <div class="replay-source">${source ? `<a href="${source}">${local(sourceLabel)}</a>` : sourceLabel ? local(sourceLabel) : words.sample}</div>`;
+      ${issue ? `<section class="proxy-issue" aria-label="${words.proxyIssue}" hidden>
+        <div class="inspector-heading"><strong>${words.proxyIssue}</strong>
+          <button type="button" class="copy-button proxy-copy"><svg class="icon" aria-hidden="true"><use href="#icon-copy"/></svg><span data-copy-label>${words.proxyCopy}</span></button>
+        </div>
+        <p>${words.proxyPrivacy}</p>
+        <pre tabindex="0"><code class="proxy-issue-preview"></code></pre>
+      </section>` : ""}
+      <div class="replay-source">${source ? `<a href="${source}" target="_blank" rel="noopener noreferrer">${local(sourceLabel)}</a>` : sourceLabel ? local(sourceLabel) : words.sample}</div>`;
 
     const find = (selector) => mount.querySelector(selector);
     view = {
@@ -538,6 +642,12 @@
     find(".replay-play").addEventListener("click", play);
     find(".replay-step").addEventListener("click", step);
     find(".replay-reset").addEventListener("click", reset);
+    if (issue) {
+      view.issue = find(".proxy-issue");
+      view.issuePreview = find(".proxy-issue-preview");
+      const button = find(".proxy-copy");
+      button.addEventListener("click", () => window.copyCommand(view.issuePreview.textContent, button, view.issuePreview));
+    }
     view.previous.addEventListener("click", () => inspect(state.selected - 1));
     view.next.addEventListener("click", () => inspect(state.selected + 1));
     view.dots.forEach((dot) => dot.addEventListener("click", () => inspect(Number(dot.dataset.frame))));
@@ -750,6 +860,9 @@
       if (probe.replay) {
         link.dataset.replayLink = probe.id;
         link.setAttribute('aria-label', `${t.replay} ${probe.id}`);
+      } else {
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
       }
       actions.append(link);
     }
@@ -797,7 +910,7 @@
     navReplay: '瀑布图',
     navInspect: '离线诊断',
     navProbes: '探针',
-    navCloud: '云服务',
+    navCloud: '生态',
     language: '语言',
     github: '在 GitHub 上查看',
     heroLabel: '流式 LLM API 协议校验工具',
@@ -847,27 +960,18 @@
     probesHeading: '探针矩阵',
     probesIntro: '按故障类型查找探针，并复制对应的排查命令。',
     cloudHeading: 'inferdiff 工具生态',
-    cloudIntro: '在终端或 AI 智能体对话中运行检查，也可定时监控。',
-    cliTitle: '开源 CLI',
-    cliDescription: '在本地或 CI 中运行，无需额外的运行时依赖。',
-    cliFeatureOne: '运行金丝雀探针，检查线上端点。',
-    cliFeatureTwo: '录制 SSE 流并逐帧对比。',
-    cliFeatureThree: '导出离线 HTML 瀑布图，附到回归报告中。',
-    mcpTitle: '面向 AI 智能体的 MCP 服务',
-    mcpDescription: '直接在 Claude Code、Cursor、Windsurf 或 Antigravity 对话中检查端点。',
+    cloudIntro: '用开源工具检查中转服务、搭建集成或复现流式故障。',
+    cliDescription: '零依赖 Python CLI，支持导出 HTML 和 SVG 瀑布图，也可通过 GitHub Action 接入 CI。',
+    mcpDescription: '通过 MCP 在 Claude Code、Cursor 或 Codex 中检查端点、对比结果并生成排名。',
     mcpCopy: '复制 MCP 配置',
-    mcpNote: '先安装 inferdiff-mcp，再添加到客户端配置。',
-    hosting: '托管版 / 自托管版',
-    cloudDescription: '在浏览器中检查和对比中转服务。',
-    free: '免费',
-    freeFeatures: '网页检查、中转对比、多中转排行和可分享链接',
-    pro: '专业版',
-    proFeatures: '全天候监控、飞书 / Telegram / 微信告警和实时 SVG 徽章',
-    webCheck: '网页检查',
-    relayPk: '中转对比',
-    watchdog: '持续监控',
-    selfHost: '自托管',
-    cloudNote: '可在展示站配置中填写云服务链接。',
+    jsDescription: '适用于 Node.js 20+ 的零依赖 CLI 与 SDK，支持 ESM 和 TypeScript。',
+    extensionDescription: '适用于 Chrome 和 Edge 的 Relay Radar 扩展，支持 Manifest V3。',
+    botDescription: '在 Telegram 和飞书中交互式检查中转服务、接收持续监控告警。',
+    benchDescription: '可复现的基准测试，验证不同推理引擎和中转服务能否如实报告协议错误。',
+    chaosDescription: '可编程的本地模拟服务，用于向 LLM 的 SSE 流注入故障。',
+    cloudSoon: '即将推出',
+    cloudDescription: '托管版的中转检查与定时监控告警正在开发中。现在即可用 CLI 在本地检查中转服务。',
+    cloudQuickstart: 'CLI 快速开始',
     footerCopy: '流式 LLM 协议校验',
     license: 'MIT 许可证',
   };
@@ -955,7 +1059,7 @@
       range.selectNodeContents(command);
       selection.removeAllRanges();
       selection.addRange(range);
-      message = language === 'zh' ? '命令已选中，请手动复制' : 'Command selected for manual copy';
+      message = language === 'zh' ? '已选中文本，请手动复制' : 'Text selected for manual copy';
     }
     const status = document.getElementById('copy-status');
     status.textContent = message;
@@ -993,17 +1097,5 @@
     if (link) window.selectReplayScenario(link.dataset.replayLink);
   });
 
-  let hasPlaceholder = false;
-  for (const link of document.querySelectorAll('[data-cloud]')) {
-    const url = SITE_CONFIG[link.dataset.cloud];
-    if (url) {
-      link.href = url;
-      link.removeAttribute('aria-disabled');
-    } else {
-      hasPlaceholder = true;
-    }
-  }
-  document.getElementById('cloud-note').hidden = !hasPlaceholder;
-  document.getElementById('github-stars').textContent = SITE_CONFIG.githubStars;
   setLanguage(preferredLanguage());
 })();

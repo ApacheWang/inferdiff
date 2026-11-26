@@ -789,16 +789,30 @@
     },
   ];
 
+  const groups = {
+    all: probes,
+    openai: probes.filter(({ id }) => /^C[1-8]$/.test(id)),
+    'anthropic-gemini': probes.filter(({ id }) => id === 'C9' || id === 'C10'),
+    'proxy-storage': probes.filter(({ id }) => id.startsWith('D')),
+  };
   const messages = {
     en: {
-      filters: { all: 'All', C: 'Canary', D: 'Deep' }, filterLabel: 'Filter probes',
+      filters: {
+        all: 'All', openai: 'OpenAI C1–C8',
+        'anthropic-gemini': 'Anthropic & Gemini C9–C10', 'proxy-storage': 'Live Proxy & Storage D1–D8',
+      },
+      families: { C: 'Canary', D: 'Deep' }, filterLabel: 'Filter probes',
       copy: 'Copy', copyLabel: 'Copy command for', replay: 'View replay', roadmap: 'View roadmap',
       preview: 'v0.2 Preview', planned: 'v0.2 Roadmap', previewScope: 'Simulated replay · v0.1.1 runs C1–C8',
       profile: 'Runs all probes in the selected profile.', audit: 'Needs a recorded target trace.',
       diff: 'Needs baseline and target traces.',
     },
     zh: {
-      filters: { all: '全部', C: '金丝雀探针', D: '深度检测' }, filterLabel: '筛选探针',
+      filters: {
+        all: '全部', openai: 'OpenAI C1–C8',
+        'anthropic-gemini': 'Anthropic 与 Gemini C9–C10', 'proxy-storage': '实时代理与存储 D1–D8',
+      },
+      families: { C: '金丝雀探针', D: '深度检测' }, filterLabel: '筛选探针',
       copy: '复制', copyLabel: '复制命令', replay: '查看回放', roadmap: '查看路线图',
       preview: 'v0.2 预览', planned: 'v0.2 路线图', previewScope: '模拟回放 · v0.1.1 运行 C1–C8',
       profile: '运行所选配置的整套探针。', audit: '需要已录制的目标 trace。',
@@ -807,7 +821,7 @@
   };
 
   let language = 'en';
-  let family = 'all';
+  let category = 'all';
 
   function element(tag, className, text) {
     const node = document.createElement(tag);
@@ -829,7 +843,7 @@
     item.dataset.probeId = probe.id;
 
     const meta = element('div', 'probe-meta');
-    meta.append(element('span', 'probe-id', probe.id), element('span', 'probe-family', t.filters[probe.id[0]]));
+    meta.append(element('span', 'probe-id', probe.id), element('span', 'probe-family', t.families[probe.id[0]]));
     if (probe.kind === 'preview' || probe.kind === 'roadmap') {
       meta.append(element('span', 'probe-stage', probe.kind === 'roadmap' ? t.planned : t.preview));
     }
@@ -872,8 +886,7 @@
 
   function renderCards() {
     const grid = document.getElementById('probe-grid');
-    const shown = probes.filter((probe) => family === 'all' || probe.id.startsWith(family));
-    grid.replaceChildren(...shown.map(card));
+    grid.replaceChildren(...groups[category].map(card));
   }
 
   window.renderProbeMatrix = (locale = 'en') => {
@@ -882,14 +895,15 @@
     const t = messages[language];
     filters.setAttribute('role', 'group');
     filters.setAttribute('aria-label', t.filterLabel);
-    const choices = Object.entries(t.filters);
-    filters.replaceChildren(...choices.map(([value, label]) => {
-      const count = probes.filter((probe) => value === 'all' || probe.id.startsWith(value)).length;
-      const button = element('button', 'filter-button', `${label} ${count}`);
+    filters.replaceChildren(...Object.entries(t.filters).map(([value, label]) => {
+      const button = element('button', 'filter-button', `${label} ${groups[value].length}`);
       button.type = 'button';
-      button.setAttribute('aria-pressed', String(value === family));
+      button.dataset.probeFilter = value;
+      button.setAttribute('aria-controls', 'probe-grid');
+      button.setAttribute('aria-pressed', String(value === category));
       button.addEventListener('click', () => {
-        family = value;
+        if (category === value) return;
+        category = value;
         filters.querySelector('[aria-pressed="true"]').setAttribute('aria-pressed', 'false');
         button.setAttribute('aria-pressed', 'true');
         renderCards();
@@ -928,6 +942,12 @@
     truncationReported: '如实报告截断',
     openReplay: '打开逐帧回放',
     quickstart: '快速开始',
+    quickPython: 'Python 命令行',
+    quickPipe: 'Unix 管道',
+    quickNode: 'Node / TS 代理',
+    quickPytest: 'pytest 测试',
+    quickActions: 'GitHub 工作流',
+    quickChaos: '本地故障模拟',
     copy: '复制',
     replayHeading: '帧级瀑布图',
     replayIntro: '播放记录或逐帧查看。选择已收到的帧，检查它的 SSE 载荷。',
@@ -958,17 +978,17 @@
     streamNextPage: '下一组帧',
     streamAssembled: '拼接后的文本与工具调用 JSON',
     probesHeading: '探针矩阵',
-    probesIntro: '按故障类型查找探针，并复制对应的排查命令。',
+    probesIntro: '按协议类别筛选探针，复制对应的排查命令。',
     cloudHeading: 'inferdiff 工具生态',
     cloudIntro: '用开源工具检查中转服务、搭建集成或复现流式故障。',
-    cliDescription: '零依赖 Python CLI，支持导出 HTML 和 SVG 瀑布图，也可通过 GitHub Action 接入 CI。',
-    mcpDescription: '通过 MCP 在 Claude Code、Cursor 或 Codex 中检查端点、对比结果并生成排名。',
+    cliDescription: 'Python CLI、pytest 断言与 CI 检查，支持离线 HTML 瀑布图。',
+    mcpDescription: '通过 MCP 实时检测并排名端点、离线审计 SSE 和回放追踪记录。',
     mcpCopy: '复制 MCP 配置',
-    jsDescription: '适用于 Node.js 20+ 的零依赖 CLI 与 SDK，支持 ESM 和 TypeScript。',
-    extensionDescription: '适用于 Chrome 和 Edge 的 Relay Radar 扩展，支持 Manifest V3。',
-    botDescription: '在 Telegram 和飞书中交互式检查中转服务、接收持续监控告警。',
-    benchDescription: '可复现的基准测试，验证不同推理引擎和中转服务能否如实报告协议错误。',
-    chaosDescription: '可编程的本地模拟服务，用于向 LLM 的 SSE 流注入故障。',
+    jsDescription: '零依赖 Node.js 代理，内置 /_inferdiff/ 仪表板及 Prometheus 指标。',
+    extensionDescription: 'Chrome 和 Edge 扩展，支持双端点 PK 对比和离线 SSE 审计。',
+    botDescription: '在 Telegram 和飞书中实时检查中转服务、离线审计 SSE 并接收监控告警。',
+    benchDescription: '中转服务基准测试，支持离线 --demo 与 --previous 回归对比。',
+    chaosDescription: '本地 SSE 故障注入，支持 /_chaos/ 控制面板和 --replay 回放。',
     cloudSoon: '即将推出',
     cloudDescription: '托管版的中转检查与定时监控告警正在开发中。现在即可用 CLI 在本地检查中转服务。',
     cloudQuickstart: 'CLI 快速开始',
@@ -1046,6 +1066,8 @@
       }
     }
 
+    if (command && command.textContent !== text) return;
+
     const label = button.querySelector('[data-copy-label]') || button;
     const key = label.dataset.i18n || 'copy';
     const english = translatedText.find(([node]) => node === label)?.[1] || 'Copy';
@@ -1073,8 +1095,45 @@
     }, 1600));
   };
 
+  const quickTabs = [...document.querySelectorAll('[data-quickstart]')];
+  const quickPanel = document.getElementById('quick-panel');
+  const quickCommand = document.getElementById('quick-command');
   const quickCopy = document.getElementById('quick-copy');
-  quickCopy.addEventListener('click', () => window.copyCommand(document.getElementById('quick-command').textContent, quickCopy));
+  const quickCopyLabel = quickCopy.querySelector('[data-copy-label]');
+  let activeQuickTab = quickTabs[0];
+
+  function selectQuickTab(tab) {
+    if (tab === activeQuickTab) return;
+    activeQuickTab.setAttribute('aria-selected', 'false');
+    activeQuickTab.setAttribute('tabindex', '-1');
+    tab.setAttribute('aria-selected', 'true');
+    tab.setAttribute('tabindex', '0');
+    activeQuickTab = tab;
+
+    quickPanel.setAttribute('aria-labelledby', tab.getAttribute('id'));
+    quickCommand.textContent = tab.dataset.command;
+    clearTimeout(copyTimers.get(quickCopy));
+    quickCopy.removeAttribute('data-copied');
+    quickCopyLabel.textContent = language === 'zh' ? chinese.copy : 'Copy';
+  }
+
+  for (const [index, tab] of quickTabs.entries()) {
+    const keyboardTargets = {
+      ArrowLeft: quickTabs[(index + quickTabs.length - 1) % quickTabs.length],
+      ArrowRight: quickTabs[(index + 1) % quickTabs.length],
+      Home: quickTabs[0],
+      End: quickTabs.at(-1),
+    };
+    tab.addEventListener('click', () => selectQuickTab(tab));
+    tab.addEventListener('keydown', (event) => {
+      if (!Object.hasOwn(keyboardTargets, event.key)) return;
+      event.preventDefault();
+      const next = keyboardTargets[event.key];
+      selectQuickTab(next);
+      next.focus();
+    });
+  }
+  quickCopy.addEventListener('click', () => window.copyCommand(quickCommand.textContent, quickCopy, quickCommand));
   const mcpCopy = document.getElementById('mcp-copy');
   const mcpConfig = { mcpServers: { 'inferdiff-mcp': { type: 'stdio', command: 'inferdiff-mcp', args: [] } } };
   mcpCopy.addEventListener('click', () => window.copyCommand(JSON.stringify(mcpConfig, null, 2), mcpCopy, null));

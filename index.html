@@ -102,9 +102,21 @@
         </div>
 
         <div class="quickstart" id="quickstart">
-          <span class="quickstart-label"><svg class="icon" aria-hidden="true"><use href="#icon-terminal"/></svg><span data-i18n="quickstart">Quickstart</span></span>
-          <code id="quick-command"><span class="command-exec">uvx inferdiff doctor</span> http://127.0.0.1:8080/v1 --model Qwen3-0.6B-Q8_0.gguf --profile full</code>
-          <button type="button" class="copy-button quick-copy" id="quick-copy"><svg class="icon" aria-hidden="true"><use href="#icon-copy"/></svg><span data-copy-label data-i18n="copy">Copy</span></button>
+          <div class="quickstart-header">
+            <span class="quickstart-label" id="quickstart-label"><svg class="icon" aria-hidden="true"><use href="#icon-terminal"/></svg><span data-i18n="quickstart">Quickstart</span></span>
+            <div class="quickstart-tabs" role="tablist" aria-labelledby="quickstart-label">
+              <button type="button" class="quickstart-tab" role="tab" id="quick-tab-python" aria-selected="true" aria-controls="quick-panel" tabindex="0" data-quickstart="python" data-command="uvx inferdiff doctor http://127.0.0.1:8080/v1 --html report.html" data-i18n="quickPython">Python CLI</button>
+              <button type="button" class="quickstart-tab" role="tab" id="quick-tab-pipe" aria-selected="false" aria-controls="quick-panel" tabindex="-1" data-quickstart="pipe" data-command="curl -sN https://api.example/v1/chat/completions ... | inferdiff audit -" data-i18n="quickPipe">Unix Pipe</button>
+              <button type="button" class="quickstart-tab" role="tab" id="quick-tab-node" aria-selected="false" aria-controls="quick-panel" tabindex="-1" data-quickstart="node" data-command="npx inferdiff-js proxy --upstream https://api.example/v1" data-i18n="quickNode">Node / TS</button>
+              <button type="button" class="quickstart-tab" role="tab" id="quick-tab-pytest" aria-selected="false" aria-controls="quick-panel" tabindex="-1" data-quickstart="pytest" data-command="from inferdiff.testing import assert_sse_honest, assert_endpoint_honest" data-i18n="quickPytest">pytest SDK</button>
+              <button type="button" class="quickstart-tab" role="tab" id="quick-tab-actions" aria-selected="false" aria-controls="quick-panel" tabindex="-1" data-quickstart="actions" data-command="uses: ApacheWang/inferdiff@v0" data-i18n="quickActions">GitHub Actions</button>
+              <button type="button" class="quickstart-tab" role="tab" id="quick-tab-chaos" aria-selected="false" aria-controls="quick-panel" tabindex="-1" data-quickstart="chaos" data-command="inferdiff-chaos --scenario c1-responses-lie" data-i18n="quickChaos">Local Chaos</button>
+            </div>
+          </div>
+          <div class="quickstart-panel" id="quick-panel" role="tabpanel" aria-labelledby="quick-tab-python" tabindex="0">
+            <code id="quick-command">uvx inferdiff doctor http://127.0.0.1:8080/v1 --html report.html</code>
+            <button type="button" class="copy-button quick-copy" id="quick-copy"><svg class="icon" aria-hidden="true"><use href="#icon-copy"/></svg><span data-copy-label data-i18n="copy">Copy</span></button>
+          </div>
         </div>
       </div>
     </section>
@@ -212,7 +224,7 @@
       <div class="section-header">
         <div>
           <h2 id="probes-heading" data-i18n="probesHeading">Probe matrix</h2>
-          <p data-i18n="probesIntro">Find the check for a silent failure and copy the command to investigate it.</p>
+          <p data-i18n="probesIntro">Filter by protocol layer to find a check and copy its command.</p>
         </div>
       </div>
       <div id="probe-filters"></div>
@@ -230,14 +242,14 @@
         <article class="product-card">
           <span class="product-icon"><svg class="icon" aria-hidden="true"><use href="#icon-terminal"/></svg></span>
           <h3 id="product-cli">inferdiff</h3>
-          <p data-i18n="cliDescription">Zero-dependency Python CLI with HTML and SVG waterfalls and a GitHub Action for CI.</p>
+          <p data-i18n="cliDescription">Python CLI, pytest assertions, and CI gates with offline HTML waterfalls.</p>
           <p class="product-command"><code>uvx inferdiff doctor …</code></p>
           <div class="product-actions"><a class="product-cta primary-cta" href="https://github.com/ApacheWang/inferdiff" target="_blank" rel="noopener noreferrer" aria-describedby="product-cli"><svg class="icon" aria-hidden="true"><use href="#icon-github"/></svg><span data-i18n="github">View on GitHub</span></a></div>
         </article>
         <article class="product-card product-mcp">
           <span class="product-icon"><svg class="icon" aria-hidden="true"><use href="#icon-agent"/></svg></span>
           <h3 id="product-mcp">inferdiff-mcp</h3>
-          <p data-i18n="mcpDescription">MCP server to check, compare, and rank endpoints from Claude Code, Cursor, or Codex.</p>
+          <p data-i18n="mcpDescription">Live endpoint rankings, offline SSE audits, and trace replay via MCP.</p>
           <p class="product-command"><code>pip install inferdiff-mcp</code></p>
           <div class="product-actions">
             <a class="product-cta" href="https://github.com/ApacheWang/inferdiff-mcp" target="_blank" rel="noopener noreferrer" aria-describedby="product-mcp"><svg class="icon" aria-hidden="true"><use href="#icon-github"/></svg><span data-i18n="github">View on GitHub</span></a>
@@ -247,32 +259,32 @@
         <article class="product-card">
           <span class="product-icon"><svg class="icon" aria-hidden="true"><use href="#icon-package"/></svg></span>
           <h3 id="product-js">inferdiff-js</h3>
-          <p data-i18n="jsDescription">Zero-dependency Node.js 20+ CLI and SDK with ESM and TypeScript support.</p>
+          <p data-i18n="jsDescription">Zero-dependency Node.js proxy with a /_inferdiff/ dashboard and Prometheus metrics.</p>
           <p class="product-command"><code>npx inferdiff-js …</code></p>
           <div class="product-actions"><a class="product-cta" href="https://github.com/ApacheWang/inferdiff-js" target="_blank" rel="noopener noreferrer" aria-describedby="product-js"><svg class="icon" aria-hidden="true"><use href="#icon-github"/></svg><span data-i18n="github">View on GitHub</span></a></div>
         </article>
         <article class="product-card">
           <span class="product-icon"><svg class="icon" aria-hidden="true"><use href="#icon-wave"/></svg></span>
           <h3 id="product-extension">inferdiff-extension</h3>
-          <p data-i18n="extensionDescription">Relay Radar, a Manifest V3 extension for Chrome and Edge.</p>
+          <p data-i18n="extensionDescription">Chrome and Edge extension with PK Compare and offline SSE audits.</p>
           <div class="product-actions"><a class="product-cta" href="https://github.com/ApacheWang/inferdiff-extension" target="_blank" rel="noopener noreferrer" aria-describedby="product-extension"><svg class="icon" aria-hidden="true"><use href="#icon-github"/></svg><span data-i18n="github">View on GitHub</span></a></div>
         </article>
         <article class="product-card">
           <span class="product-icon"><svg class="icon" aria-hidden="true"><use href="#icon-agent"/></svg></span>
           <h3 id="product-bot">inferdiff-bot</h3>
-          <p data-i18n="botDescription">Interactive relay checks and watchdog alerts in Telegram and Feishu.</p>
+          <p data-i18n="botDescription">Live relay checks, offline SSE audits, and watchdog alerts in Telegram and Feishu.</p>
           <div class="product-actions"><a class="product-cta" href="https://github.com/ApacheWang/inferdiff-bot" target="_blank" rel="noopener noreferrer" aria-describedby="product-bot"><svg class="icon" aria-hidden="true"><use href="#icon-github"/></svg><span data-i18n="github">View on GitHub</span></a></div>
         </article>
         <article class="product-card">
           <span class="product-icon"><svg class="icon" aria-hidden="true"><use href="#icon-file"/></svg></span>
           <h3 id="product-bench">inferdiff-bench</h3>
-          <p data-i18n="benchDescription">Reproducible benchmarks for testing whether inference engines and relays report protocol failures honestly.</p>
+          <p data-i18n="benchDescription">Relay benchmarks with an offline --demo and --previous regression diffs.</p>
           <div class="product-actions"><a class="product-cta" href="https://github.com/ApacheWang/inferdiff-bench" target="_blank" rel="noopener noreferrer" aria-describedby="product-bench"><svg class="icon" aria-hidden="true"><use href="#icon-github"/></svg><span data-i18n="github">View on GitHub</span></a></div>
         </article>
         <article class="product-card">
           <span class="product-icon"><svg class="icon" aria-hidden="true"><use href="#icon-bolt"/></svg></span>
           <h3 id="product-chaos">inferdiff-chaos</h3>
-          <p data-i18n="chaosDescription">Programmable local mock server that injects faults into LLM SSE streams.</p>
+          <p data-i18n="chaosDescription">Local SSE fault injection with the /_chaos/ control panel and --replay.</p>
           <p class="product-command"><code>inferdiff-chaos --scenario c1-responses-lie</code></p>
           <div class="product-actions"><a class="product-cta" href="https://github.com/ApacheWang/inferdiff-chaos" target="_blank" rel="noopener noreferrer" aria-describedby="product-chaos"><svg class="icon" aria-hidden="true"><use href="#icon-github"/></svg><span data-i18n="github">View on GitHub</span></a></div>
         </article>

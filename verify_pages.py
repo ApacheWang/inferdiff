@@ -1,4 +1,4 @@
-"""Verify the static site with Python and Node. Add --chrome for browser tests."""
+"""Verify the static site with Python, Node.js 22+, and headless Chrome or Chromium."""
 
 import argparse
 from collections import Counter
@@ -6,6 +6,7 @@ from functools import partial
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -25,6 +26,7 @@ ASSET_ATTRS = {
 }
 JS_TYPES = {"", "module", "text/javascript", "application/javascript", "text/ecmascript"}
 CSS_REFERENCE = re.compile(r"url\(\s*(['\"]?)(.*?)\1\s*\)|@import\s*(['\"])(.*?)\3", re.I | re.S)
+OFFLINE_CSP = ("connect-src 'none'", "form-action 'none'", "object-src 'none'", "base-uri 'none'")
 SENSITIVE = {
     "machine-local account": re.compile(r"\bbc15[5]\b", re.I),
     "possible credential": re.compile(
@@ -177,6 +179,28 @@ assert.equal(malformedResponses.frames.length, 3, 'retain malformed payloads for
 assert.deepEqual(malformedResponses.frames[0].payload.output_index, unusualIndex, 'retain the malformed frame evidence');
 assert.notEqual(malformedResponses.verdict, 'pass', 'malformed tool frames cannot count as a pass');
 assert.equal(inspect('').frames.length, 0, 'clear the inspection on empty input');
+"""
+
+CONTROL_FIXTURES = r"""
+const quickstarts = [
+  ['python', 'Python CLI', 'uvx inferdiff doctor http://127.0.0.1:8080/v1 --html report.html', 'Python 命令行'],
+  ['pipe', 'Unix Pipe', 'curl -sN https://api.example/v1/chat/completions ... | inferdiff audit -', 'Unix 管道'],
+  ['node', 'Node / TS', 'npx inferdiff-js proxy --upstream https://api.example/v1', 'Node / TS 代理'],
+  ['pytest', 'pytest SDK', 'from inferdiff.testing import assert_sse_honest, assert_endpoint_honest', 'pytest 测试'],
+  ['actions', 'GitHub Actions', 'uses: ApacheWang/inferdiff@v0', 'GitHub 工作流'],
+  ['chaos', 'Local Chaos', 'inferdiff-chaos --scenario c1-responses-lie', '本地故障模拟'],
+];
+const openaiProbes = Array.from({ length: 8 }, (_, index) => 'C' + (index + 1));
+const anthropicGeminiProbes = ['C9', 'C10'];
+const proxyStorageProbes = Array.from({ length: 8 }, (_, index) => 'D' + (index + 1));
+const filters = [
+  ['all', 'All', [...openaiProbes, ...anthropicGeminiProbes, ...proxyStorageProbes], '全部'],
+  ['openai', 'OpenAI C1–C8', openaiProbes, 'OpenAI C1–C8'],
+  ['anthropic-gemini', 'Anthropic & Gemini C9–C10', anthropicGeminiProbes, 'Anthropic 与 Gemini C9–C10'],
+  ['proxy-storage', 'Live Proxy & Storage D1–D8', proxyStorageProbes, '实时代理与存储 D1–D8'],
+];
+const quickTab = id => `[data-quickstart="${id}"]`;
+const probeFilter = id => `[data-probe-filter="${id}"]`;
 """
 
 MOCK_DOM_TESTS = r"""
@@ -337,8 +361,67 @@ const replay = selector => query('#replay-app ' + selector);
 const scenario = id => `[data-scenario="${id}"]`;
 const finding = () => replay('.replay-finding').textContent;
 
+async function testControls() {
+  const tabs = document.querySelectorAll('[data-quickstart]');
+  const chips = () => document.querySelectorAll('[data-probe-filter]');
+  const selected = (nodes, attr) => nodes.filter(node => node.getAttribute(attr) === 'true');
+  const visibleProbes = () => document.querySelectorAll('#probe-grid [data-probe-id]')
+    .filter(node => !node.hidden).map(node => node.dataset.probeId);
+  assert.equal(tabs.length, quickstarts.length, 'six quickstart tabs');
+  assert.deepEqual(selected(tabs, 'aria-selected'), [query(quickTab('python'))]);
+  assert.equal(query('#quick-command').textContent, quickstarts[0][2]);
+  for (const [current, key, next] of [['python', 'ArrowLeft', 'chaos'], ['chaos', 'Home', 'python'],
+    ['python', 'ArrowRight', 'pipe'], ['pipe', 'End', 'chaos']]) {
+    const event = query(quickTab(current)).emit('keydown', { key });
+    assert.ok(event.defaultPrevented);
+    assert.equal(document.activeElement, query(quickTab(next)));
+    assert.deepEqual(selected(tabs, 'aria-selected'), [document.activeElement]);
+  }
+  for (const [id, label, snippet] of quickstarts) {
+    const tab = query(quickTab(id));
+    assert.equal(tab.getAttribute('role'), 'tab');
+    assert.equal(tab.textContent.trim(), label);
+    tab.click();
+    assert.deepEqual(selected(tabs, 'aria-selected'), [tab]);
+    assert.deepEqual(tabs.filter(node => node.getAttribute('tabindex') === '0'), [tab]);
+    assert.equal(query('#quick-panel').getAttribute('aria-labelledby'), tab.getAttribute('id'));
+    assert.equal(query('#quick-command').textContent, snippet);
+    click('#quick-copy');
+    await new Promise(setImmediate);
+    assert.equal(clipboard, snippet, 'copied exact ' + label + ' snippet');
+    assert.equal(query('#copy-status').textContent, 'Copied');
+  }
+
+  assert.equal(chips().length, filters.length, 'four probe filter chips');
+  assert.deepEqual(selected(chips(), 'aria-pressed'), [query(probeFilter('all'))]);
+  assert.deepEqual(visibleProbes(), filters[0][2]);
+  for (const [id, label, ids] of filters) {
+    const chip = query(probeFilter(id));
+    assert.ok(chip.textContent.trim().startsWith(label), label + ' filter label');
+    chip.click();
+    assert.deepEqual(selected(chips(), 'aria-pressed'), [chip]);
+    assert.deepEqual(visibleProbes(), ids, label + ' probe IDs');
+  }
+
+  click('[data-language="zh"]');
+  for (const [id, , , label] of quickstarts) assert.equal(query(quickTab(id)).textContent.trim(), label);
+  for (const [id, , , label] of filters) assert.ok(query(probeFilter(id)).textContent.trim().startsWith(label));
+  assert.deepEqual(selected(tabs, 'aria-selected'), [query(quickTab('chaos'))]);
+  assert.deepEqual(selected(chips(), 'aria-pressed'), [query(probeFilter('proxy-storage'))]);
+  assert.deepEqual(visibleProbes(), proxyStorageProbes);
+  assert.equal(query('#quick-command').textContent, quickstarts.at(-1)[2]);
+  click('#quick-copy');
+  await new Promise(setImmediate);
+  assert.equal(clipboard, quickstarts.at(-1)[2]);
+  assert.equal(query('#copy-status').textContent, '已复制');
+  click('[data-language="en"]');
+  click(probeFilter('all'));
+  assert.deepEqual(visibleProbes(), filters[0][2], 'All restores all 18 probes');
+}
+
 async function testPage() {
   assert.equal(document.documentElement.lang, 'en');
+  await testControls();
   assert.equal(document.querySelectorAll('.replay-tab').length, 6, 'six replay tabs');
   assert.match(replay('[data-variant="before"]').textContent, /Before Fix.*Grade F/);
   assert.match(finding(), /P0 BREACH/);
@@ -410,12 +493,6 @@ async function testPage() {
   assert.equal(document.documentElement.lang, 'en');
   assert.match(finding(), /GRADE A\+ · 8\/8/);
 
-  click('#quick-copy');
-  await new Promise(setImmediate);
-  assert.equal(clipboard, query('#quick-command').textContent);
-  assert.match(clipboard, /^uvx inferdiff doctor /);
-  assert.equal(query('#copy-status').textContent, 'Copied');
-
   const input = query('#stream-input');
   const pasted = input.emit('paste', { clipboardData: { getData: () => breachedSse } });
   assert.equal(pasted.defaultPrevented, true);
@@ -450,7 +527,6 @@ async function testPage() {
     assert.ok(['noopener', 'noreferrer'].every(token => link.rel.split(/\s+/).includes(token)), link.href);
   }
   assert.deepEqual(requests, [], 'no network API used during local interactions');
-  console.log('PASS: mocked DOM in EN and 中文, all six replays, C1 comparison, D1 report, hero copy, SSE paste, trace drop, and outbound link policy.');
 }
 
 testPage().catch(error => {
@@ -467,6 +543,7 @@ const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const probe = selector => 'document.querySelector(' + JSON.stringify(selector) + ')';
 
 async function connect() {
+  assert.equal(typeof WebSocket, 'function', 'browser verification requires Node.js 22+');
   const tabs = await (await fetch(debugURL + '/json/list')).json();
   const target = tabs.find(tab => tab.type === 'page');
   assert.ok(target?.webSocketDebuggerUrl, 'Chrome must open a debuggable page');
@@ -512,8 +589,8 @@ async function connect() {
 
 async function main() {
   const { socket, command, observed } = await connect();
-  async function evaluate(expression) {
-    const result = await command('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
+  async function evaluate(expression, userGesture = false) {
+    const result = await command('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true, userGesture });
     if (result.exceptionDetails) throw new Error(result.result?.description || result.exceptionDetails.text);
     return result.result.value;
   }
@@ -527,6 +604,109 @@ async function main() {
   async function click(selector) {
     await evaluate(probe(selector) + '.click()');
   }
+  async function pressKey(key, code, windowsVirtualKeyCode, modifiers = 0) {
+    const event = { key, code, windowsVirtualKeyCode, modifiers };
+    await command('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...event });
+    await command('Input.dispatchKeyEvent', { type: 'keyUp', ...event });
+  }
+  async function pasteClipboard() {
+    await pressKey('v', 'KeyV', 86, process.platform === 'darwin' ? 4 : 2);
+  }
+  async function readClipboard() {
+    await evaluate(`(() => {
+      const field = document.createElement('textarea');
+      field.id = 'verify-clipboard';
+      document.body.append(field);
+      field.focus({ preventScroll: true });
+    })()`);
+    try {
+      await pasteClipboard();
+      const value = probe('#verify-clipboard') + '.value';
+      await waitFor(value + '.length > 0', 'clipboard paste in standalone page');
+      return await evaluate(value);
+    } finally {
+      await evaluate(probe('#verify-clipboard') + '.remove()');
+    }
+  }
+  async function testControls(width, offline) {
+    const values = (selector, expression) => evaluate(
+      'Array.from(document.querySelectorAll(' + JSON.stringify(selector) + '), node => ' + expression + ')'
+    );
+    const tabs = '[data-quickstart]';
+    const chips = '[data-probe-filter]';
+    const selectedTabs = () => values(tabs + '[aria-selected="true"]', 'node.dataset.quickstart');
+    const selectedChips = () => values(chips + '[aria-pressed="true"]', 'node.dataset.probeFilter');
+    const visibleProbes = () => evaluate(`Array.from(document.querySelectorAll('#probe-grid [data-probe-id]'))
+      .filter(node => node.getClientRects().length).map(node => node.dataset.probeId)`);
+    const copied = async (snippet, status) => {
+      const message = await evaluate(`new Promise(resolve => {
+        const status = document.getElementById('copy-status');
+        const observer = new MutationObserver(() => {
+          observer.disconnect();
+          resolve(status.textContent);
+        });
+        observer.observe(status, { childList: true });
+        document.getElementById('quick-copy').click();
+      })`, true);
+      assert.equal(message, status);
+      const actual = offline ? await readClipboard() : await evaluate('navigator.clipboard.readText()');
+      assert.equal(actual, snippet);
+    };
+
+    assert.deepEqual(await values(tabs, 'node.textContent.trim()'), quickstarts.map(([, label]) => label));
+    assert.deepEqual(await selectedTabs(), ['python']);
+    assert.equal(await evaluate(probe('#quick-command') + '.textContent'), quickstarts[0][2]);
+    await evaluate(probe(quickTab('python')) + '.focus()');
+    for (const [key, code, id] of [['ArrowLeft', 37, 'chaos'], ['Home', 36, 'python'],
+      ['ArrowRight', 39, 'pipe'], ['End', 35, 'chaos']]) {
+      await pressKey(key, key, code);
+      assert.equal(await evaluate('document.activeElement.dataset.quickstart'), id);
+      assert.deepEqual(await selectedTabs(), [id]);
+    }
+    for (const [id, , snippet] of quickstarts) {
+      await click(quickTab(id));
+      assert.deepEqual(await selectedTabs(), [id]);
+      assert.equal(await evaluate(probe('#quick-command') + '.textContent'), snippet);
+      assert.ok(await evaluate('document.documentElement.scrollWidth <= innerWidth'), id + ' quickstart overflows at ' + width);
+      await copied(snippet, 'Copied');
+    }
+
+    assert.equal((await values(chips, 'node.dataset.probeFilter')).length, filters.length);
+    assert.deepEqual(await selectedChips(), ['all']);
+    assert.deepEqual(await visibleProbes(), filters[0][2]);
+    for (const [id, label, ids] of filters) {
+      assert.ok((await evaluate(probe(probeFilter(id)) + '.textContent.trim()')).startsWith(label));
+      await click(probeFilter(id));
+      assert.deepEqual(await selectedChips(), [id]);
+      assert.deepEqual(await visibleProbes(), ids, label + ' probe IDs');
+      assert.ok(await evaluate('document.documentElement.scrollWidth <= innerWidth'), id + ' filter overflows at ' + width);
+    }
+
+    await click('[data-language="zh"]');
+    assert.deepEqual(await values(tabs, 'node.textContent.trim()'), quickstarts.map(([, , , label]) => label));
+    for (const [id, , , label] of filters) {
+      assert.ok((await evaluate(probe(probeFilter(id)) + '.textContent.trim()')).startsWith(label));
+    }
+    assert.deepEqual(await selectedTabs(), ['chaos']);
+    assert.deepEqual(await selectedChips(), ['proxy-storage']);
+    assert.deepEqual(await visibleProbes(), proxyStorageProbes);
+    assert.equal(await evaluate(probe('#quick-command') + '.textContent'), quickstarts.at(-1)[2]);
+    await copied(quickstarts.at(-1)[2], '已复制');
+    assert.ok(await evaluate('document.documentElement.scrollWidth <= innerWidth'), 'localized controls overflow at ' + width);
+    await click('[data-language="en"]');
+    await click(quickTab('python'));
+    await click(probeFilter('all'));
+    assert.deepEqual(await visibleProbes(), filters[0][2]);
+  }
+  async function assertPolicyAndPrivacy() {
+    const policies = await evaluate(`Array.from(document.querySelectorAll('meta[http-equiv="Content-Security-Policy"]'), node => node.content)`);
+    assert.equal(policies.length, 1);
+    const directives = policies[0].split(';').map(value => value.trim());
+    for (const expected of offlineCsp) {
+      assert.deepEqual(directives.filter(value => value.split(/\s+/)[0] === expected.split(' ')[0]), [expected]);
+    }
+    assert.doesNotMatch(await evaluate('document.body.innerText'), /\b[a-z]:[\\/]+|\bfile:\/+|\\\\[\w.-]+\\+[\w.-]+|\bbc15[5]\b/i, 'no local Windows paths in rendered content');
+  }
   async function navigate(url) {
     const { errorText } = await command('Page.navigate', { url });
     assert.ok(!errorText, errorText);
@@ -535,28 +715,39 @@ async function main() {
   }
   function requests(checkpoint) {
     return observed.slice(checkpoint).flatMap(({ method, params }) => {
-      if (method === 'Network.requestWillBeSent') return [params.request.url];
-      if (method === 'Network.webSocketCreated') return [params.url];
+      if (method === 'Network.requestWillBeSent') return [{ url: params.request.url, type: params.type }];
+      if (method === 'Network.webSocketCreated') return [{ url: params.url, type: 'WebSocket' }];
       return [];
-    }).filter(url => /^(https?|wss?):/i.test(url));
+    }).filter(({ url }) => /^(https?|wss?):/i.test(url));
   }
 
   try {
     for (const domain of ['Page', 'Runtime', 'Network', 'Log', 'DOM']) await command(domain + '.enable');
+    await command('Page.addScriptToEvaluateOnNewDocument', {
+      source: `document.addEventListener('securitypolicyviolation', event => console.error('CSP violation: ' + event.violatedDirective));`,
+    });
     await command('Page.bringToFront');
     await command('Emulation.setFocusEmulationEnabled', { enabled: true });
     await command('Browser.grantPermissions', { origin, permissions: ['clipboardReadWrite', 'clipboardSanitizedWrite'] });
     let screenshot;
-    for (const [width, height, mobile] of [[1440, 960, false], [390, 844, true]]) {
-      const checkpoint = observed.length;
+    const viewports = [[1440, 960, false], [390, 844, true]];
+    const staticAssets = new Map([
+      ['/index.html', 'Document'], ['/styles.css', 'Stylesheet'], ['/app.js', 'Script'],
+      ['/stream-inspector.js', 'Script'], ['/inspector-ui.js', 'Script'],
+    ]);
+    async function viewport(width, height, mobile) {
       await command('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile });
       await command('Emulation.setTouchEmulationEnabled', { enabled: mobile });
+    }
+    for (const [width, height, mobile] of viewports) {
+      const checkpoint = observed.length;
+      await viewport(width, height, mobile);
       await navigate(origin + '/index.html');
       await click('[data-language="en"]');
       const ready = observed.length;
       assert.equal(await evaluate('innerWidth'), width);
       assert.ok(await evaluate('document.documentElement.scrollWidth <= innerWidth'), 'page overflows at ' + width);
-      assert.equal(await evaluate('document.querySelectorAll("#probe-grid .probe-card").length'), 18);
+      await testControls(width, false);
       assert.match(await evaluate(probe('[data-probe-id="C10"]') + '.textContent'), /v0\.2.*Preview/i);
       assert.ok(await evaluate(probe('[data-variant="before"]') + '.getAttribute("aria-pressed") === "true"'));
       assert.equal(await evaluate(probe('#replay-app .inspector-event') + '.textContent'), 'response.completed');
@@ -587,9 +778,6 @@ async function main() {
       await click('[data-scenario="C1"]');
       await click('[data-variant="before"]');
 
-      await click('#quick-copy');
-      await waitFor(probe('#copy-status') + '.textContent === "Copied"', 'hero command copy');
-      assert.equal(await evaluate('navigator.clipboard.readText()'), await evaluate(probe('#quick-command') + '.textContent'));
       await click('[data-stream-sample="healthy"]');
       await waitFor(probe('.stream-frame'), 'healthy sample frames');
       assert.notEqual(await evaluate(probe('#stream-finding') + '.dataset.tone'), 'crimson');
@@ -615,9 +803,7 @@ async function main() {
 
       await evaluate('navigator.clipboard.writeText(' + JSON.stringify(breachedSse) + ')');
       await evaluate(probe('#stream-input') + '.focus(); ' + probe('#stream-input') + '.select()');
-      const paste = { modifiers: 2, key: 'v', code: 'KeyV', windowsVirtualKeyCode: 86 };
-      await command('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...paste });
-      await command('Input.dispatchKeyEvent', { type: 'keyUp', ...paste });
+      await pasteClipboard();
       await waitFor(probe('#stream-protocol') + '.textContent.includes("Responses") && ' +
         probe('#stream-finding') + '.dataset.tone === "crimson"', 'pasted Responses P0 breach');
       assert.match(await evaluate(probe('#stream-finding') + '.textContent'), /P0 BREACH/);
@@ -638,6 +824,7 @@ async function main() {
       assert.match(await evaluate(probe('#inspect h2') + '.textContent'), /粘贴日志离线诊断/);
       assert.match(await evaluate(probe('#stream-finding') + '.textContent'), /P0/);
       await click('[data-language="en"]');
+      await assertPolicyAndPrivacy();
       if (!mobile && screenshotPath) {
         await evaluate('document.activeElement.blur(); ' + probe('#stream-input') +
           '.scrollTop = 0; window.scrollTo({ top: 0, behavior: "instant" })');
@@ -648,21 +835,33 @@ async function main() {
           },
         }));
       }
-      const external = requests(checkpoint).filter(url => new URL(url).origin !== origin);
+      const browserRequests = requests(checkpoint);
+      const external = browserRequests.filter(({ url }) => new URL(url).origin !== origin);
       assert.deepEqual(external, [], 'no external requests at ' + width);
+      assert.deepEqual(browserRequests.filter(({ url, type }) => staticAssets.get(url.slice(origin.length)) !== type),
+        [], 'page requests only its static dependencies at ' + width);
       assert.deepEqual(requests(ready), [], 'no network during local interactions at ' + width);
       console.log('PASS: Chrome ' + width + 'px, clipboard-pasted crimson P0, ' +
-        (mobile ? 'file picker' : 'file drop') + ', C1 comparison, C10, D1 replay, hero copy, localization, zero external requests.');
+        (mobile ? 'file picker' : 'file drop') + ', C1 comparison, C10, D1 replay, all quickstart copies and probe filters, EN/中文, strict CSP, no local paths, zero external requests.');
     }
 
-    const offlineCheckpoint = observed.length;
     await command('Network.emulateNetworkConditions', {
       offline: true, latency: 0, downloadThroughput: 0, uploadThroughput: 0,
     });
-    await navigate(fileURL);
-    await click('[data-stream-sample="breach"]');
-    await waitFor(probe('#stream-finding') + '.dataset.tone === "crimson"', 'standalone offline inspection');
-    assert.deepEqual(requests(offlineCheckpoint), [], 'standalone page requires no HTTP');
+    for (const [width, height, mobile] of viewports) {
+      const checkpoint = observed.length;
+      await viewport(width, height, mobile);
+      await navigate(fileURL);
+      await click('[data-language="en"]');
+      assert.equal(await evaluate('innerWidth'), width);
+      assert.ok(await evaluate('document.documentElement.scrollWidth <= innerWidth'), 'standalone page overflows at ' + width);
+      await testControls(width, true);
+      await click('[data-stream-sample="breach"]');
+      await waitFor(probe('#stream-finding') + '.dataset.tone === "crimson"', 'standalone offline inspection');
+      await assertPolicyAndPrivacy();
+      assert.deepEqual(requests(checkpoint), [], 'standalone page requires no HTTP at ' + width);
+      console.log('PASS: Chrome standalone ' + width + 'px with networking disabled, all quickstart copies and probe filters, EN/中文, SSE inspector, strict CSP, no local paths, zero external requests.');
+    }
     const faults = observed.filter(({ method, params }) =>
       method === 'Runtime.exceptionThrown' ||
       (method === 'Runtime.consoleAPICalled' && params.type === 'error') ||
@@ -670,7 +869,7 @@ async function main() {
     );
     assert.deepEqual(faults, [], 'Chrome reports zero console or JavaScript errors');
     if (screenshot) fs.writeFileSync(screenshotPath, Buffer.from(screenshot, 'base64'));
-    console.log('PASS: Chrome standalone file with networking disabled, zero console or JavaScript errors.');
+    console.log('PASS: Chrome reports zero console or JavaScript errors across all four runs.');
   } finally {
     await command('Browser.close').catch(() => {});
     socket.close();
@@ -835,7 +1034,7 @@ def check_stream_inspector(root, errors):
 
 
 def check_page_interactions(root, errors):
-    result = run_node(STREAM_FIXTURES + MOCK_DOM_TESTS, [root])
+    result = run_node(STREAM_FIXTURES + CONTROL_FIXTURES + MOCK_DOM_TESTS, [root])
     if result.returncode:
         detail = re.search(r"^\w*Error(?: \[[^\]]+\])?: .+$", result.stderr, re.MULTILINE)
         errors.append(f"mocked DOM test failed: {detail[0] if detail else 'Node test failed'}")
@@ -862,9 +1061,9 @@ def verify(root):
     for tag in ("html", "head", "title", "body", "main"):
         if page.counts[tag] != 1:
             errors.append(f"index.html: expected one <{tag}>")
-    if len(page.csp) != 1 or not {
-        "connect-src 'none'", "form-action 'none'", "object-src 'none'", "base-uri 'none'",
-    }.issubset({directive.strip() for policy in page.csp for directive in policy.split(";")}):
+    directives = [directive.strip() for policy in page.csp for directive in policy.split(";") if directive.strip()]
+    names = [directive.split()[0] for directive in directives]
+    if len(page.csp) != 1 or len(set(names)) != len(names) or not set(OFFLINE_CSP).issubset(directives):
         errors.append("index.html: expected the offline Content Security Policy")
 
     for tag, reference in page.dependencies:
@@ -948,6 +1147,28 @@ def chrome_endpoint(profile, process):
     raise RuntimeError("headless Chrome did not open its DevTools port")
 
 
+def find_chrome():
+    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome"):
+        executable = shutil.which(name)
+        if executable:
+            return Path(executable)
+
+    if os.name == "nt":
+        for directory in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+            if root := os.environ.get(directory):
+                for brand in (("Google", "Chrome"), ("Chromium",)):
+                    executable = Path(root, *brand, "Application", "chrome.exe")
+                    if executable.is_file():
+                        return executable
+    else:
+        for directory in (Path("/Applications"), Path.home() / "Applications"):
+            for name in ("Google Chrome", "Chromium"):
+                executable = directory / f"{name}.app" / "Contents" / "MacOS" / name
+                if executable.is_file():
+                    return executable
+    return None
+
+
 def verify_browser(root, chrome, screenshot, chrome_no_sandbox=False):
     handler = partial(PageHandler, directory=root)
     with tempfile.TemporaryDirectory(prefix="inferdiff-pages-") as temporary, \
@@ -971,10 +1192,11 @@ def verify_browser(root, chrome, screenshot, chrome_no_sandbox=False):
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             ) as process:
                 try:
-                    result = run_node(STREAM_FIXTURES + BROWSER_TESTS, [
+                    browser_fixtures = f"const offlineCsp = {json.dumps(OFFLINE_CSP)};\n"
+                    result = run_node(STREAM_FIXTURES + CONTROL_FIXTURES + browser_fixtures + BROWSER_TESTS, [
                         chrome_endpoint(profile, process), origin, (root / "index.html").as_uri(),
                         Path(temporary) / "fixture.trace.jsonl", screenshot or "",
-                    ], timeout=45)
+                    ], timeout=60)
                 finally:
                     try:
                         process.wait(timeout=3)
@@ -988,14 +1210,10 @@ def verify_browser(root, chrome, screenshot, chrome_no_sandbox=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--chrome", type=Path, help="run interactive tests with this Chrome executable")
+    parser.add_argument("--chrome", type=Path, help="override the automatically detected Chrome or Chromium executable")
     parser.add_argument("--chrome-no-sandbox", action="store_true", help="run Chrome inside an existing OS sandbox")
     parser.add_argument("--screenshot", type=Path, help="save a full 1440px preview after the browser checks pass")
     options = parser.parse_args()
-    if options.screenshot and not options.chrome:
-        parser.error("--screenshot requires --chrome")
-    if options.chrome_no_sandbox and not options.chrome:
-        parser.error("--chrome-no-sandbox requires --chrome")
     root = Path(__file__).resolve().parent
     try:
         errors = verify(root)
@@ -1007,20 +1225,23 @@ def main():
             print(f"FAIL: {error}")
         return 1
     print("PASS: HTML structure, local assets, CSP, JavaScript syntax, leak scan, and offline parser fixtures.")
-    print("PASS: mocked DOM in EN and 中文, all six replays, C1 comparison, D1 report, hero copy, SSE paste, trace drop, and outbound link policy.")
-    if options.chrome:
-        try:
-            result = verify_browser(root, options.chrome.resolve(), options.screenshot, options.chrome_no_sandbox)
-        except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
-            print(f"FAIL: browser verification failed ({error})")
-            return 1
-        if result.stdout:
-            print(result.stdout.strip())
-        if result.returncode:
-            print(f"FAIL: {result.stderr.strip() or 'Chrome tests failed'}")
-            return 1
-        if options.screenshot:
-            print(f"PASS: saved {options.screenshot.name}.")
+    print("PASS: mocked DOM in EN and 中文, all six replays, C1 comparison, D1 report, all quickstart copies and probe filters, SSE paste, trace drop, and outbound link policy.")
+    chrome = options.chrome or find_chrome()
+    if not chrome:
+        print("FAIL: Chrome or Chromium is required. Use --chrome to specify its executable.")
+        return 1
+    try:
+        result = verify_browser(root, chrome.resolve(), options.screenshot, options.chrome_no_sandbox)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        print(f"FAIL: browser verification failed ({error})")
+        return 1
+    if result.stdout:
+        print(result.stdout.strip())
+    if result.returncode:
+        print(f"FAIL: {result.stderr.strip() or 'Chrome tests failed'}")
+        return 1
+    if options.screenshot:
+        print(f"PASS: saved {options.screenshot.name}.")
     return 0
 
 

@@ -11,8 +11,9 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 from urllib.parse import urlsplit
 
 from inferdiff.cli import main
@@ -108,6 +109,215 @@ class TestProxy(unittest.TestCase):
             if time.monotonic() >= deadline:
                 self.fail(f"Proxy status never recorded {events} completed requests")
             time.sleep(0.01)
+
+    def test_dashboard_serves_static_html_on_both_routes_without_credentials(self):
+        credentials = {
+            "Authorization": "Bearer private-dashboard-bearer",
+            "x-api-key": "private-dashboard-key",
+            "x-goog-api-key": "private-dashboard-google-key",
+        }
+        query_secret = "private-dashboard-query-token"
+        with _upstream(lambda h: _reply(h, FIRST + TERMINAL)) as (origin, requests), _proxy(origin) as (port, _):
+            with _response(port, "POST", f"{CHAT_PATH}?key={query_secret}", body=BODY, headers=credentials) as response:
+                self.assertEqual(response.read(), FIRST + TERMINAL)
+            self.status(port, events=1)
+
+            pages = []
+            for route in ("/_inferdiff/", "/_inferdiff"):
+                with _response(port, "GET", f"{route}?key={query_secret}", headers=credentials) as response:
+                    html = response.read().decode("utf-8")
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.headers.get_content_type(), "text/html")
+                    self.assertEqual(response.headers["Cache-Control"], "no-store")
+                    csp = {directive.strip() for directive in response.headers["Content-Security-Policy"].split(";")
+                           if directive.strip()}
+                    self.assertTrue({"default-src 'none'", "style-src 'unsafe-inline'",
+                                     "script-src 'unsafe-inline'", "connect-src 'self'"}.issubset(csp))
+                self.assertIn("Copy Redacted Issue Report", html)
+                self.assertIn("\u4e2d\u6587", html)
+                self.assertNotRegex(html, r"(?i)(?:https?:)?//[\w.-]+\.[a-z]{2,}")
+                for secret in (*credentials.values(), "private-dashboard-bearer", query_secret):
+                    self.assertNotIn(secret, html)
+                pages.append(html)
+            self.assertEqual(pages[0], pages[1])
+            status, _ = self.status(port, events=1)
+            self.assertEqual(status["requests_total"], 1)
+        self.assertEqual(len(requests), 1)
+
+    def test_dashboard_event_contains_redacted_frames_findings_and_issue_markdown(self):
+        bearer, api_key, google_key, query_key, response_key = (
+            "odd-bearer-secret", "odd-api-secret", "odd-google-secret", "odd-query-secret", "odd-response-secret",
+        )
+        credentials = {"Authorization": f"Bearer {bearer}", "x-api-key": api_key, "x-goog-api-key": google_key}
+        path = f"{CHAT_PATH}?key={query_key}"
+        echo = f"Authorization: Bearer {bearer}\nx-api-key: {api_key}\nx-goog-api-key: {google_key}\n"
+        echo += f"/other/path?key={response_key} {query_key}"
+        content = json.dumps({"choices": [{"index": 0, "delta": {"content": echo}}]}).encode("ascii")
+        wire = b"data: " + content + b"\n\n" + _breach(echo)
+        with _upstream(lambda h: _reply(h, wire)) as (origin, requests), _proxy(origin) as (port, _):
+            with _response(port, "POST", path, body=BODY, headers=credentials) as response:
+                self.assertEqual(response.read(), wire)
+            status, status_raw = self.status(port, events=1)
+            summary = status["recent_events"][0]
+            self.assertEqual(status["median_ttft_ms"], summary["ttft_ms"])
+            self.assertGreaterEqual(summary["ttft_ms"], 0)
+            self.assertGreaterEqual(summary["p0_breaches"], 1)
+            self.assertTrue(summary["streaming"])
+            self.assertNotIn("frames", summary)
+            self.assertNotIn("issue_markdown", summary)
+
+            with _response(port, "GET", f"/_inferdiff/event/{summary['id']}") as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.headers.get_content_type(), "application/json")
+                self.assertEqual(response.headers["Cache-Control"], "no-store")
+                event_raw = response.read().decode("utf-8")
+            with _response(port, "GET", "/_inferdiff/event/unknown") as response:
+                self.assertEqual(response.status, 404)
+                response.read()
+
+        self.assertEqual(len(requests), 1)
+        event = strict_json_loads(event_raw)
+        self.assertEqual(event["id"], summary["id"])
+        self.assertEqual((event["method"], event["path"], event["status"]), ("POST", CHAT_PATH, 200))
+        self.assertEqual(event["dialect"], "openai-chat")
+        self.assertEqual(event["finish_reason"], "stop")
+        self.assertGreaterEqual(event["total_ms"], event["ttft_ms"])
+        self.assertIn(("D1", "P0"), [(item["detector_id"], item["severity"]) for item in event["findings"]])
+        self.assertEqual(event["frame_count"], 4)
+        self.assertEqual([frame["seq"] for frame in event["frames"]], list(range(event["frame_count"])))
+        arrivals = [frame["t_rel_ms"] for frame in event["frames"]]
+        self.assertEqual(arrivals, sorted(arrivals))
+        self.assertIn("stop", [frame["finish_reason"] for frame in event["frames"]])
+        self.assertTrue(any(frame["terminal"] for frame in event["frames"]))
+        report = event["issue_markdown"]
+        self.assertIn("inferdiff", report)
+        self.assertIn("D1", report)
+        self.assertIn("P0", report)
+        for source, output in (("status", status_raw), ("event", event_raw), ("report", report)):
+            with self.subTest(source=source):
+                for secret in (bearer, api_key, google_key, query_key, response_key):
+                    self.assertNotIn(secret, output)
+
+    def test_dashboard_evicts_old_event_and_inspector_data_at_ring_capacity(self):
+        def no_content(handler):
+            _reply(handler, b"", status=204, content_type="application/json")
+
+        with redirect_stdout(io.StringIO()), _upstream(no_content) as (origin, _), _proxy(origin) as (port, _):
+            with _response(port, "GET", "/v1/models/0") as response:
+                self.assertEqual(response.status, 204)
+                response.read()
+            initial, _ = self.status(port, events=1)
+            old_id = initial["recent_events"][0]["id"]
+
+            # The final status request follows the last capture on the same downstream connection.
+            with closing(http.client.HTTPConnection("127.0.0.1", port, timeout=3)) as client:
+                for index in range(1, 101):
+                    client.request("GET", f"/v1/models/{index}")
+                    with client.getresponse() as response:
+                        self.assertEqual(response.status, 204)
+                        response.read()
+                client.request("GET", "/_inferdiff/status")
+                with client.getresponse() as response:
+                    self.assertEqual(response.status, 200)
+                    status = strict_json_loads(response.read())
+
+            self.assertEqual(status["requests_total"], 101)
+            self.assertEqual(len(status["recent_events"]), 100)
+            self.assertEqual(status["recent_events"][0]["path"], "/v1/models/100")
+            self.assertEqual(status["recent_events"][-1]["path"], "/v1/models/1")
+            self.assertIsNone(status["median_ttft_ms"])
+            with _response(port, "GET", f"/_inferdiff/event/{old_id}") as response:
+                self.assertEqual(response.status, 404)
+                response.read()
+
+    def test_dashboard_redacts_credentials_in_percent_encoded_path(self):
+        bearer, query_key = "odd-path-token-reflected", "odd-encoded-path-query"
+        path = f"/v1/models/{bearer}/nested%3Fkey%3D%27{query_key}%27"
+        headers = {"Authorization": f"Bearer {bearer}"}
+        with _upstream(lambda h: _reply(h, b"", status=204)) as (origin, requests), _proxy(origin) as (port, _):
+            with _response(port, "GET", path, headers=headers) as response:
+                self.assertEqual(response.status, 204)
+                response.read()
+            status, raw = self.status(port, events=1)
+            self.assertNotIn(bearer, raw)
+            self.assertNotIn(query_key, raw)
+            event_id = status["recent_events"][0]["id"]
+            with _response(port, "GET", f"/_inferdiff/event/{event_id}") as response:
+                self.assertEqual(response.status, 200)
+                detail = response.read().decode("utf-8")
+            self.assertNotIn(bearer, detail)
+            self.assertNotIn(query_key, detail)
+        self.assertEqual(requests[0][1], path)
+
+    def test_dashboard_clear_rejects_foreign_origins_and_releases_event_details(self):
+        with _upstream(lambda h: _reply(h, FIRST + TERMINAL)) as (origin, requests), _proxy(origin) as (port, _):
+            with _response(port, "POST", CHAT_PATH, body=BODY) as response:
+                response.read()
+            initial, _ = self.status(port, events=1)
+            event_id = initial["recent_events"][0]["id"]
+            valid_origin = f"http://127.0.0.1:{port}"
+            for foreign in ("https://evil.example", "null", f"http://localhost:{port}",
+                            f"https://127.0.0.1:{port}", f"{valid_origin}/another-path"):
+                with self.subTest(origin=foreign), _response(
+                    port, "POST", "/_inferdiff/clear", headers={"Origin": foreign},
+                ) as response:
+                    self.assertEqual(response.status, 403)
+                    response.read()
+            status, _ = self.status(port, events=1)
+            self.assertEqual(status, initial)
+
+            for count, headers in enumerate(({"Origin": valid_origin}, {}), 1):
+                if count == 2:
+                    with _response(port, "POST", CHAT_PATH, body=BODY) as response:
+                        response.read()
+                    status, _ = self.status(port, events=1)
+                    event_id = status["recent_events"][0]["id"]
+                with _response(port, "POST", "/_inferdiff/clear", headers=headers) as response:
+                    self.assertEqual(response.status, 204)
+                    self.assertEqual(response.read(), b"")
+                cleared, _ = self.status(port, events=0)
+                self.assertEqual(cleared["recent_events"], [])
+                self.assertIsNone(cleared["median_ttft_ms"])
+                self.assertEqual(cleared["requests_total"], count)
+                with _response(port, "GET", f"/_inferdiff/event/{event_id}") as response:
+                    self.assertEqual(response.status, 404)
+                    response.read()
+        self.assertEqual(len(requests), 2)
+
+    def test_proxy_no_ui_disables_local_routes_and_still_forwards_traffic(self):
+        with _upstream(lambda h: _reply(h, FIRST + TERMINAL)) as (origin, requests), _proxy(
+            origin, no_ui=True,
+        ) as (port, _):
+            for method, path in (("GET", "/_inferdiff/"), ("GET", "/_inferdiff"), ("GET", "/_inferdiff/status"),
+                                 ("GET", "/_inferdiff/event/unknown"), ("POST", "/_inferdiff/clear")):
+                with self.subTest(path=path), _response(port, method, path) as response:
+                    self.assertEqual(response.status, 404)
+                    response.read()
+            with _response(port, "POST", CHAT_PATH, body=BODY) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.read(), FIRST + TERMINAL)
+        self.assertEqual([path for _, path, _, _ in requests], [CHAT_PATH])
+
+    def test_proxy_cli_announces_dashboard_unless_no_ui_is_set(self):
+        from inferdiff.proxy import create_proxy_server
+
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled):
+                args = ["proxy", "--upstream", "http://127.0.0.1:8080", "--port", "0"]
+                if not enabled:
+                    args.append("--no-ui")
+                output = io.StringIO()
+                with (
+                    redirect_stdout(output), redirect_stderr(output),
+                    patch("inferdiff.cli.create_proxy_server", wraps=create_proxy_server) as create,
+                    patch("inferdiff.proxy.ProxyServer.serve_forever", autospec=True) as serve,
+                ):
+                    self.assertEqual(main(args), 0)
+                self.assertEqual(create.call_args.kwargs.get("no_ui", False), not enabled)
+                serve.assert_called_once()
+                server = serve.call_args.args[0]
+                dashboard = f"Dashboard: http://127.0.0.1:{server.server_port}/_inferdiff/"
+                self.assertEqual(dashboard in output.getvalue().splitlines(), enabled)
 
     def test_first_sse_chunk_reaches_client_before_upstream_releases_second(self):
         for chunked in (False, True):

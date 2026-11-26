@@ -5,9 +5,11 @@ from __future__ import annotations
 import datetime
 import http.client
 import http.server
+import ipaddress
 import json
 import math
 import re
+import statistics
 import sys
 import threading
 import time
@@ -15,11 +17,12 @@ import uuid
 import zlib
 from collections import deque
 from pathlib import Path
-from urllib.parse import SplitResult, unquote_plus
+from urllib.parse import SplitResult, unquote, unquote_plus, urlsplit
 
 from ._urls import RecorderError, validate_url
 from .detectors import Finding, audit_trace
 from .dialects import detect_dialect
+from .exporter import _md_code_span
 from .recorder import (
     NDJSONFramer,
     SSEFramer,
@@ -33,6 +36,8 @@ from .redact import (
     extract_body_secret_values,
     extract_header_secret_values,
     extract_url_secret_values,
+    is_protocol_enum,
+    is_protocol_event,
     sanitize_url_path,
     scrub_report_data,
     scrub_report_text,
@@ -55,8 +60,25 @@ _HOP_HEADERS = {
 _STREAM_TYPES = {"text/event-stream", "application/x-ndjson", "application/ndjson"}
 _SSE_PREFIXES = (b"data:", b"event:", b"id:", b"retry:", b":")
 _DETECTORS = {"D1", "D2", "D3", "D4"}
+_FINDING_DESCRIPTIONS = {
+    "D1": "The stream reported success with an incomplete or inconsistent tool call.",
+    "D2": "The stream returned empty visible output despite signs of generation.",
+    "D3": "The stream produced fewer tokens than the fixed generation budget.",
+    "D4": "The stream ended without a clean protocol or transport termination.",
+}
+_RECENT_EVENT_LIMIT = 100
+_FRAME_LIMIT = 200
+_FINDINGS_PER_DETECTOR = 25
+_DASHBOARD_CSP = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'"
+_UI_ROOT = "/_inferdiff"
+_UI_PAGES = {_UI_ROOT, _UI_ROOT + "/"}
+_UI_STATUS = _UI_ROOT + "/status"
+_UI_CLEAR = _UI_ROOT + "/clear"
+_UI_EVENT_PREFIX = _UI_ROOT + "/event/"
+_UI_ROUTES = _UI_PAGES | {_UI_STATUS, _UI_CLEAR}
 _READ_SIZE = 8192
 _URL_QUERY = re.compile(r"((?:https?://|(?<![\w/:])/)[^\s<>\"'\\?#]+)\?[^\s<>\"'\\#]+", re.IGNORECASE)
+_PATH_SUFFIX = re.compile(r"[?#]|%(?:25)*(?:3f|23)", re.IGNORECASE)
 
 
 def _end_to_end(headers):
@@ -129,6 +151,17 @@ def _query_secrets(query: str) -> list[str]:
 def _display(text: str, secrets: list[str]) -> str:
     clean = scrub_report_text(text, secrets)
     return "".join(char if char.isprintable() else ascii(char)[1:-1] for char in clean)
+
+
+def _display_path(path: str, secrets: list[str]) -> str:
+    path = sanitize_url_path(path)
+    decoded = unquote(path)
+    if decoded != path:
+        scrubbed = scrub_report_text(decoded, secrets)
+        if scrubbed != decoded:
+            path = scrubbed
+    # Encoded URL delimiters can disguise credential-bearing queries or fragments.
+    return _display(_PATH_SUFFIX.split(path, maxsplit=1)[0], secrets)
 
 
 def _scrub_capture_text(text: str, secrets: list[str]) -> str:
@@ -250,10 +283,73 @@ def _elapsed(start: int, end: int) -> float:
     return round((end - start) / 1_000_000, 3)
 
 
+def _frame_metadata(frame: TraceFrame, dialect: str) -> dict:
+    norm = frame.norm
+    event = frame.sse_event
+    if frame.is_done_sentinel:
+        event = "[DONE]"
+    elif not event or not is_protocol_event(dialect, event):
+        event = norm.get("phase", "UNKNOWN")
+    reason = norm.get("finish_reason")
+    return {
+        "seq": frame.seq, "t_rel_ms": frame.t_rel_ms, "dt_ms": frame.dt_ms, "event": event,
+        "finish_reason": reason if is_protocol_enum(dialect, "finish_reason", reason) else None,
+        "terminal": norm.get("phase") == "TERMINAL", "parse_error": bool(frame.parse_error),
+        "content_bytes": safe_utf8_len(norm.get("text_delta") or ""),
+        "tool_call_count": len(norm.get("tool_deltas") or []),
+    }
+
+
+def _dashboard_findings(findings: list[Finding]) -> list[dict]:
+    # Detector messages/evidence can include provider-supplied names and parse excerpts.
+    retained = []
+    counts: dict[str, int] = {}
+    for finding in findings:
+        detector = finding.detector_id
+        count = counts.get(detector, 0)
+        if count < _FINDINGS_PER_DETECTOR:
+            retained.append({
+                "detector_id": detector, "code": finding.code, "severity": finding.severity,
+                "message": _FINDING_DESCRIPTIONS[detector], "frame_seq": finding.frame_seq,
+            })
+            counts[detector] = count + 1
+    return retained
+
+
+def _issue_markdown(event: dict) -> str:
+    request = _md_code_span(f"{event['method']} {event['path']}")
+    ttft = event["ttft_ms"]
+    ttft_note = "Unavailable" if ttft is None else f"{ttft:g} ms"
+    lines = [
+        "## inferdiff proxy incident", "", "### Request and stream", "",
+        f"- Request: {request}",
+        f"- HTTP status: {event['status']}",
+        f"- Dialect: {event['dialect'] or 'Unknown'}",
+        f"- Finish: {event['finish_reason'] or event['terminal_status'] or 'Unknown'}",
+        f"- TTFT: {ttft_note}",
+        f"- Total time: {event['total_ms']:g} ms",
+        f"- Frames: {event['frame_count']}", "", "### Findings", "",
+    ]
+    for finding in event["findings"]:
+        seq = finding["frame_seq"]
+        frame = f" at frame {seq}" if seq is not None else ""
+        lines.append(f"- **{finding['severity']} {finding['detector_id']}** `{finding['code']}`{frame}. "
+                     f"{finding['message']}")
+    if not event["findings"]:
+        lines.append("No D1–D4 findings.")
+    elif event["findings_count"] > len(event["findings"]):
+        lines.append(f"\n{event['findings_count'] - len(event['findings'])} additional findings omitted.")
+    return "\n".join(lines) + "\n"
+
+
+def _json_bytes(data: dict) -> bytes:
+    return json.dumps(data, allow_nan=False).encode("utf-8")
+
+
 class ProxyServer(http.server.ThreadingHTTPServer):
     def __init__(
         self, address: tuple[str, int], upstream: SplitResult, *, save_dir: Path | None,
-        only_breaches: bool, timeout: float, max_requests: int, no_color: bool,
+        only_breaches: bool, timeout: float, max_requests: int, no_color: bool, no_ui: bool = False,
     ) -> None:
         self.upstream = upstream
         self.save_dir = save_dir
@@ -261,13 +357,14 @@ class ProxyServer(http.server.ThreadingHTTPServer):
         self.socket_timeout = timeout
         self.max_requests = max_requests
         self.no_color = no_color
+        self.ui_enabled = not no_ui
         self.lock = threading.Lock()
         self.requests_total = 0
         self.streaming_requests = 0
         self.p0_breaches = 0
         self.p1_warnings = 0
         self.active = 0
-        self.recent_events = deque(maxlen=20)
+        self.recent_events: deque[dict] = deque(maxlen=_RECENT_EVENT_LIMIT)
         super().__init__(address, _ProxyHandler)
 
     def handle_error(self, request, client_address) -> None:
@@ -291,10 +388,13 @@ class ProxyServer(http.server.ThreadingHTTPServer):
     def complete(self, event: dict, streaming: bool, findings: list[Finding], line: str) -> None:
         with self.lock:
             self.log(line)
-            self.recent_events.appendleft(event)
-            self.streaming_requests += streaming
-            self.p0_breaches += sum(f.severity == "P0" for f in findings)
-            self.p1_warnings += sum(f.severity == "P1" for f in findings)
+            if self.ui_enabled:
+                event["p0_breaches"] = sum(f.severity == "P0" for f in findings)
+                event["p1_warnings"] = sum(f.severity == "P1" for f in findings)
+                self.recent_events.appendleft(event)
+                self.streaming_requests += streaming
+                self.p0_breaches += event["p0_breaches"]
+                self.p1_warnings += event["p1_warnings"]
             self.active -= 1
             stop = self.requests_total == self.max_requests and self.active == 0
         if stop:
@@ -302,13 +402,26 @@ class ProxyServer(http.server.ThreadingHTTPServer):
 
     def status(self) -> bytes:
         with self.lock:
-            return json.dumps({
+            events = [{key: value for key, value in event.items() if key not in {"frames", "findings"}}
+                      for event in self.recent_events]
+            ttfts = [event["ttft_ms"] for event in events if event["ttft_ms"] is not None]
+            snapshot = {
                 "requests_total": self.requests_total,
                 "streaming_requests": self.streaming_requests,
                 "p0_breaches": self.p0_breaches,
                 "p1_warnings": self.p1_warnings,
-                "recent_events": list(self.recent_events),
-            }, allow_nan=False).encode("utf-8")
+                "median_ttft_ms": round(statistics.median(ttfts), 3) if ttfts else None,
+                "recent_events": events,
+            }
+        return _json_bytes(snapshot)
+
+    def event(self, event_id: str) -> dict | None:
+        with self.lock:
+            return next((event for event in self.recent_events if event["id"] == event_id), None)
+
+    def clear_events(self) -> None:
+        with self.lock:
+            self.recent_events.clear()
 
 
 class _ProxyHandler(http.server.BaseHTTPRequestHandler):
@@ -328,21 +441,74 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
             return self._forward
         raise AttributeError(name)
 
+    def _local_response(self, status: int, data: bytes = b"", *, content_type: str = "application/json") -> None:
+        self.close_connection = True
+        self.send_response_only(status)
+        if status != 204:
+            self.send_header("Content-Type", f"{content_type}; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        if content_type == "text/html":
+            self.send_header("Content-Security-Policy", _DASHBOARD_CSP)
+            self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if data and self.command != "HEAD":
+            self.wfile.write(data)
+
+    def _clear_origin_allowed(self) -> bool:
+        origins = self.headers.get_all("Origin", [])
+        if not origins:
+            return True
+        hosts = self.headers.get_all("Host", [])
+        if len(origins) != 1 or len(hosts) != 1:
+            return False
+        origin, host = origins[0].lower(), hosts[0].lower()
+        try:
+            parsed = urlsplit(origin)
+            hostname = parsed.hostname or ""
+            loopback = hostname == "localhost" or ipaddress.ip_address(hostname).is_loopback
+            name = f"[{hostname}]" if ":" in hostname else hostname
+            port = parsed.port
+        except ValueError:
+            return False
+        authority = f"{name}:{port}" if port is not None else name
+        host_matches = host == authority or (port in {None, 80} and host in {name, f"{name}:80"})
+        return loopback and host_matches and "%" not in hostname and origin == f"http://{authority}"
+
+    def _serve_local(self, path: str) -> None:
+        if self.server.ui_enabled:
+            if self.command == "GET":
+                if path in _UI_PAGES:
+                    from .proxy_ui import DASHBOARD_HTML
+
+                    self._local_response(200, DASHBOARD_HTML, content_type="text/html")
+                    return
+                if path == _UI_STATUS:
+                    self._local_response(200, self.server.status())
+                    return
+                if path.startswith(_UI_EVENT_PREFIX):
+                    event = self.server.event(path.removeprefix(_UI_EVENT_PREFIX))
+                    if event is not None:
+                        self._local_response(200, _json_bytes({**event, "issue_markdown": _issue_markdown(event)}))
+                        return
+            if self.command == "POST" and path == _UI_CLEAR:
+                if self._clear_origin_allowed():
+                    self.server.clear_events()
+                    self._local_response(204)
+                else:
+                    self._local_response(403, b'{"error":"Forbidden origin"}')
+                return
+        self._local_response(404, b'{"error":"Not found"}')
+
     def _forward(self) -> None:
         # BaseHTTPRequestHandler normalizes leading // for redirects. We send origin-form
         # targets to a fixed upstream, so retain the original path from the request line.
         target = self.requestline.split()[1]
         path, query_sep, query = target.partition("?")
-        if self.command == "GET" and path == "/_inferdiff/status":
-            data = self.server.status()
-            self.close_connection = True
-            self.send_response_only(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.wfile.write(data)
+        if path in _UI_ROUTES or path.startswith(_UI_EVENT_PREFIX):
+            self._serve_local(path)
             return
         star = self.command == "OPTIONS" and target == "*"
         if not (star or path.startswith("/")) or "#" in target or self.command == "CONNECT":
@@ -474,15 +640,18 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
                  "total_ms": _elapsed(start, end), "findings_count": 0}
         findings = []
         streaming = capture is not None and capture.streaming
+        if self.server.ui_enabled:
+            event.update(id=f"proxy_{uuid.uuid4().hex}", streaming=streaming, frame_count=0, finish_reason=None,
+                         terminal_status=None, dialect=capture.dialect if streaming else None, frames=[], findings=[])
         try:
             body = _request_metadata(raw_body)
             secrets.extend(extract_body_secret_values(body))
-            safe_path = _display(sanitize_url_path(path), secrets)
+            safe_path = _display_path(path, secrets)
             method = _display(self.command, secrets)
             event.update(method=method, path=safe_path)
             line = f"[HTTP {status}] {method} {safe_path}"
             if streaming and capture.framer is not None:
-                trace_id = f"proxy_{uuid.uuid4().hex}"
+                trace_id = event.get("id") or f"proxy_{uuid.uuid4().hex}"
                 header = TraceHeader(
                     trace_id, "proxy", datetime.datetime.now(datetime.timezone.utc).isoformat(), capture.dialect,
                     {"method": method, "url": _display(endpoint, secrets), "effective_params": scrub_report_data(
@@ -501,6 +670,18 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
                         write_trace(self.server.save_dir / f"{trace_id}.trace.jsonl", doc)
                     except (OSError, ValueError):
                         line += " [TRACE SAVE FAILED]"
+                if self.server.ui_enabled:
+                    frames = doc.frames
+                    if len(frames) > _FRAME_LIMIT:
+                        half = _FRAME_LIMIT // 2
+                        frames = frames[:half] + frames[-half:]
+                    assembled = doc.summary.assembled
+                    event.update(frame_count=len(doc.frames), findings=_dashboard_findings(findings),
+                                 frames=[_frame_metadata(frame, capture.dialect) for frame in frames])
+                    for field in ("finish_reason", "terminal_status"):
+                        value = assembled.get(field)
+                        if is_protocol_enum(capture.dialect, field, value):
+                            event[field] = value
             elif streaming:
                 line = f"[CAPTURE UNAVAILABLE] {method} {safe_path}"
         except (ValueError, TypeError, OverflowError, RecursionError):
@@ -532,6 +713,7 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
 def create_proxy_server(
     upstream: str, *, host: str = "127.0.0.1", port: int = 8787, save_dir: str | Path | None = None,
     only_breaches: bool = False, timeout: float = 120, max_requests: int = 0, no_color: bool = False,
+    no_ui: bool = False,
 ) -> ProxyServer:
     """Bind a proxy to an address. The caller owns the serving loop and cleanup."""
     target = validate_url(upstream)
@@ -551,6 +733,6 @@ def create_proxy_server(
             raise RecorderError("Could not create proxy trace directory.") from None
     try:
         return ProxyServer((host, port), target, save_dir=directory, only_breaches=only_breaches,
-                           timeout=timeout, max_requests=max_requests, no_color=no_color)
+                           timeout=timeout, max_requests=max_requests, no_color=no_color, no_ui=no_ui)
     except OSError:
         raise RecorderError("Could not bind proxy listener.") from None

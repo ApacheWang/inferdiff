@@ -287,9 +287,11 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
     with create_proxy_server(
         args.upstream, host=args.host, port=args.port, save_dir=args.save_dir,
         only_breaches=args.only_breaches, timeout=args.timeout, max_requests=args.max_requests,
-        no_color=args.no_color,
+        no_color=args.no_color, no_ui=args.no_ui,
     ) as server:
         server.log(f"inferdiff proxy listening on port {server.server_port}")
+        if server.ui_enabled:
+            server.log(f"Dashboard: http://127.0.0.1:{server.server_port}/_inferdiff/")
         try:
             server.serve_forever(poll_interval=0.1)
         except KeyboardInterrupt:
@@ -684,6 +686,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_proxy.add_argument("--timeout", type=float, default=120, help="Socket timeout in seconds (default: 120)")
     p_proxy.add_argument("--max-requests", type=int, default=0, help="Stop after this many proxied requests (default: unlimited)")
     p_proxy.add_argument("--no-color", action="store_true", help="Disable terminal colors")
+    p_proxy.add_argument("--no-ui", action="store_true", help="Disable the dashboard and in-memory event history")
     p_proxy.set_defaults(func=_cmd_proxy)
 
     # doctor (primary zero-setup entry point per Spec §2.1)

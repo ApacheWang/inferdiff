@@ -132,12 +132,16 @@ class WireChunk:
     framing_error: Optional[str] = None
 
 
-def _scrub_wire_chunk(wc: WireChunk, dialect: str, known_secrets: Sequence[str]) -> WireChunk:
-    payload = scrub_protocol_payload(wc.payload_text, dialect, known_secrets)
+def _scrub_wire_chunk(
+    wc: WireChunk, dialect: str, known_secrets: Sequence[str], *, scrub_text: Callable[[str], str] | None = None,
+) -> WireChunk:
+    payload = scrub_protocol_payload(wc.payload_text, dialect, known_secrets, scrub_text=scrub_text)
+
+    def clean(text: str) -> str:
+        return scrub_text(text) if scrub_text else scrub_known_secrets(text, known_secrets, min_length=1)
+
     if dialect == "ollama-ndjson":
-        wire = payload + wc.raw_wire[len(wc.payload_text):] if wc.payload_text else scrub_known_secrets(
-            wc.raw_wire, known_secrets, min_length=1,
-        )
+        wire = payload + wc.raw_wire[len(wc.payload_text):] if wc.payload_text else clean(wc.raw_wire)
         return dataclasses.replace(wc, raw_wire=wire, payload_text=payload)
 
     lines = iter(payload.split("\n"))
@@ -151,12 +155,12 @@ def _scrub_wire_chunk(wc: WireChunk, dialect: str, known_secrets: Sequence[str])
         if field == "event" and is_protocol_event(dialect, value.removeprefix(" ")):
             return line
         if separator and field in {"", "event", "id", "retry"}:
-            return field + separator + scrub_known_secrets(value, known_secrets, min_length=1)
-        return scrub_known_secrets(line, known_secrets, min_length=1)
+            return field + separator + clean(value)
+        return clean(line)
 
     event = wc.sse_event
     if event and not is_protocol_event(dialect, event):
-        event = scrub_known_secrets(event, known_secrets, min_length=1)
+        event = clean(event)
     wire = _SSE_LINE_RE.sub(scrub_line, wc.raw_wire)
     return dataclasses.replace(wc, sse_event=event, raw_wire=wire, payload_text=payload)
 

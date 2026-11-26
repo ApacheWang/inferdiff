@@ -2,6 +2,7 @@
 
 ## v0.2.0 (unreleased)
 
+- Added `inferdiff proxy --upstream https://api.openai.com --save-dir ./traces --only-breaches` for live SDK traffic. The loopback proxy forwards SSE as it arrives, runs `D1`–`D4`, and redacts credentials in logs, trace files, and `/_inferdiff/status`.
 - Added `C9` for Anthropic `/v1/messages` and `C10` for Google Gemini SSE. The canaries check stream termination, token accounting, and provider-specific wire contracts.
 - Added optional, non-invasive LMCache MP, Mooncake Store, and Linux `/proc/<pid>/io` sampling. Storage detectors `D6`–`D8` cover page-cache warming, lookup hits with delivery failures, and fragmented reads or storage-backed TTFT regressions.
 - Added A/B canary mode to `compare` alongside request replay. It compares wire contracts, model fingerprints, and timings.

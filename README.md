@@ -11,7 +11,7 @@ Catch silent `HTTP 200 OK` failures — truncated tool JSON, ghost thinking star
 
 [中文文档 (README.zh-CN.md)](https://github.com/ApacheWang/inferdiff/blob/main/README.zh-CN.md) · [PyPI (`inferdiff`)](https://pypi.org/project/inferdiff/) · [Releases](https://github.com/ApacheWang/inferdiff/releases)
 
-`v0.1.0` introduced OpenAI Chat and Responses canaries (`C1`–`C8`), trace recording, offline diffs, and HTML waterfalls. `v0.1.1` improved checks for thinking models and relays and added a GitHub Action. `v0.2.0` adds Anthropic and Gemini canaries, KV and storage probes, A/B canary comparison, continuous monitoring, and offline replay with CI reports. See the [changelog](CHANGELOG.md).
+`v0.1.0` introduced OpenAI Chat and Responses canaries (`C1`–`C8`), trace recording, offline diffs, and HTML waterfalls. `v0.1.1` improved checks for thinking models and relays and added a GitHub Action. `v0.2.0` adds a live streaming proxy, Anthropic and Gemini canaries, KV and storage probes, A/B canary comparison, continuous monitoring, and offline replay with CI reports. See the [changelog](CHANGELOG.md).
 
 The v0.2 features below are unreleased. From a checkout of this branch, run `python -m pip install .` to use `0.2.0.dev0`.
 
@@ -56,6 +56,16 @@ inferdiff export \
 ```
 
 > **Auth note**: If neither `--api-key` nor `-H "Authorization: ..."` is passed, `inferdiff doctor` falls back to `OPENAI_API_KEY` from the environment and sends it to the target URL (use `https://` for production keys). Reflected secrets are scrubbed from terminal output, saved traces, JSON, and HTML exports.
+
+## Capture Live SDK Traffic
+
+```bash
+inferdiff proxy --upstream https://api.openai.com --save-dir ./traces --only-breaches
+```
+
+Set your OpenAI-compatible client's base URL to `http://127.0.0.1:8787/v1`. For Claude Code or a Gemini SDK, set `--upstream` to the provider's HTTPS origin and use `http://127.0.0.1:8787` as the client's base URL if it adds the versioned API path itself. Keep the credentials in your client configuration. The proxy forwards them upstream and redacts them from logs, captures, and status output.
+
+The proxy flushes streamed bytes as they arrive and runs `D1`–`D4` when the stream ends. Open `http://127.0.0.1:8787/_inferdiff/status` for JSON counters and recent request timings. Omit `--only-breaches` to capture passing streams too. Run `inferdiff audit` on any saved `.trace.jsonl` file to inspect its findings.
 
 ## Single-File Offline HTML Frame Waterfall
 

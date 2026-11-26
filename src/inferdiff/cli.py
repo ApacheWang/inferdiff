@@ -39,6 +39,7 @@ from .exporters import (
     _ReportCase, audit_cases, canary_cases, comparison_cases, diff_cases, render_junit, render_sarif, replay_cases,
 )
 from .probes import CompositeBackendProbe, LinuxProcIoProbe, LmcacheMpProbe, MooncakeStoreProbe
+from .proxy import create_proxy_server
 from .recorder import RecorderError, record_stream, validate_and_merge_headers, validate_url
 from .redact import (
     extract_body_secret_values,
@@ -280,6 +281,20 @@ _PROBE_OPTIONS = {
     "mooncake-master": (str, "Mooncake Store master HTTP origin"),
     "mooncake-client": (str, "Mooncake Store client HTTP origin"),
 }
+
+
+def _cmd_proxy(args: argparse.Namespace) -> int:
+    with create_proxy_server(
+        args.upstream, host=args.host, port=args.port, save_dir=args.save_dir,
+        only_breaches=args.only_breaches, timeout=args.timeout, max_requests=args.max_requests,
+        no_color=args.no_color,
+    ) as server:
+        server.log(f"inferdiff proxy listening on port {server.server_port}")
+        try:
+            server.serve_forever(poll_interval=0.1)
+        except KeyboardInterrupt:
+            pass
+    return EXIT_OK
 
 
 def _probe_config(args: argparse.Namespace, prefix: str = "") -> dict[str, Any]:
@@ -659,6 +674,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"inferdiff {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    p_proxy = sub.add_parser("proxy", help="Forward local HTTP traffic and audit live LLM streams")
+    p_proxy.add_argument("--upstream", required=True, help="Upstream HTTP(S) base URL")
+    p_proxy.add_argument("--host", default="127.0.0.1", help="Listen address (default: 127.0.0.1)")
+    p_proxy.add_argument("--port", type=int, default=8787, help="Listen port (default: 8787)")
+    p_proxy.add_argument("--save-dir", help="Directory for redacted .trace.jsonl captures")
+    p_proxy.add_argument("--only-breaches", action="store_true", help="Save streams with a breach or warning")
+    p_proxy.add_argument("--timeout", type=float, default=120, help="Socket timeout in seconds (default: 120)")
+    p_proxy.add_argument("--max-requests", type=int, default=0, help="Stop after this many proxied requests (default: unlimited)")
+    p_proxy.add_argument("--no-color", action="store_true", help="Disable terminal colors")
+    p_proxy.set_defaults(func=_cmd_proxy)
 
     # doctor (primary zero-setup entry point per Spec §2.1)
     p_doc = sub.add_parser("doctor", aliases=["canary"],

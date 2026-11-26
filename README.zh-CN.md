@@ -13,7 +13,7 @@
 
 [English Documentation (README.md)](README.md) · [PyPI (`inferdiff`)](https://pypi.org/project/inferdiff/) · [Releases](https://github.com/ApacheWang/inferdiff/releases)
 
-`v0.1.0` 提供 OpenAI Chat 和 Responses 探针（`C1`–`C8`）、轨迹录制、离线差异检查和 HTML 瀑布图。`v0.1.1` 改进了思考模型与中转网关的检查，并加入 GitHub Action。`v0.2.0` 增加 Anthropic 和 Gemini 探针、KV 与存储探针、A/B 探针对比、持续监测，以及带 CI 报告的离线回放。详见[变更日志](CHANGELOG.md)。
+`v0.1.0` 提供 OpenAI Chat 和 Responses 探针（`C1`–`C8`）、轨迹录制、离线差异检查和 HTML 瀑布图。`v0.1.1` 改进了思考模型与中转网关的检查，并加入 GitHub Action。`v0.2.0` 增加实时流式代理、Anthropic 和 Gemini 探针、KV 与存储探针、A/B 探针对比、持续监测，以及带 CI 报告的离线回放。详见[变更日志](CHANGELOG.md)。
 
 下文的 v0.2 功能尚未发布。检出此分支后运行 `python -m pip install .`，即可安装开发版 `0.2.0.dev0`。
 
@@ -56,6 +56,16 @@ inferdiff export \
 ```
 
 > **鉴权安全提示**：若未显式传入 `--api-key` 或 `-H "Authorization: ..."`，`inferdiff doctor` 会自动读取环境变量 `OPENAI_API_KEY` 发送至目标端点（生产密钥请务必使用 `https://`）。服务端反射回来的已知密钥会自动在终端、落盘轨迹、JSON 与 HTML 报告中脱敏。
+
+## 抓取 SDK 的实时流量
+
+```bash
+inferdiff proxy --upstream https://api.openai.com --save-dir ./traces --only-breaches
+```
+
+将 OpenAI 兼容客户端的 Base URL 设为 `http://127.0.0.1:8787/v1`。使用 Claude Code 或 Gemini SDK 时，将 `--upstream` 改为对应服务商的 HTTPS 地址。如果客户端会自行拼接带版本号的 API 路径，Base URL 填 `http://127.0.0.1:8787` 即可。密钥照常配置在客户端。代理会转发鉴权信息，并对日志、抓包文件和状态输出脱敏。
+
+代理收到流式数据后立即转发，在流结束时运行 `D1`–`D4`。访问 `http://127.0.0.1:8787/_inferdiff/status` 可查看 JSON 格式的计数和近期请求耗时。省略 `--only-breaches` 也会保存通过检查的流。用 `inferdiff audit` 可复查已保存的 `.trace.jsonl` 文件。
 
 ## 内网秒开的单文件 HTML 帧级瀑布图
 

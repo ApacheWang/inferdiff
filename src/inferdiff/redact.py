@@ -106,6 +106,9 @@ _GEMINI_HEADER_KEY_RE = re.compile(
 )
 _PATH_CREDENTIAL_NAMES = {"key", "token", "sig", "signature", "bearer"}
 _JSON_STRING_RE = re.compile(r'"(?:\\[^\r\n]|[^"\\\r\n])*"')
+_JSON_NUMBER_PATTERN = r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?"
+_JSON_NUMBER_RE = re.compile(_JSON_NUMBER_PATTERN)
+_JSON_LITERAL_RE = re.compile(rf"{_JSON_STRING_RE.pattern}|{_JSON_NUMBER_PATTERN}")
 
 _CHAT_FINISH_REASONS = frozenset({"stop", "length", "tool_calls", "content_filter", "function_call"})
 # https://aistudio.google.com/api-reference/generate-content#Resource:Candidate
@@ -439,23 +442,33 @@ class _JSONMembers(list):
     """Object pairs in lexical order, including repeated keys."""
 
 
-def scrub_protocol_payload(text: str, dialect: str, known_secrets: Sequence[str]) -> str:
+def scrub_protocol_payload(
+    text: str, dialect: str, known_secrets: Sequence[str], *, scrub_text: Callable[[str], str] | None = None,
+) -> str:
     """Scrub JSON strings while preserving public enums in their actual wire fields."""
     if text == "[DONE]" and dialect not in {"anthropic-messages", "gemini-sse", "ollama-ndjson"}:
         return text
-    scrub = _known_secret_scrubber(known_secrets, 1)
+    scrub = scrub_text or _known_secret_scrubber(known_secrets, 1)
+    numeric_secrets = {
+        secret for secret in known_secrets if len(secret) >= 6 and _JSON_NUMBER_RE.fullmatch(secret)
+    } if scrub_text else set()
+    token_pattern = _JSON_LITERAL_RE if numeric_secrets else _JSON_STRING_RE
     try:
         # Walk decoded paths and replace original string spans to retain wire whitespace and framing.
-        payload = json.loads(text, object_pairs_hook=_JSONMembers)
+        payload = json.loads(text, object_pairs_hook=_JSONMembers, parse_constant=lambda _: None)
         wire_enums = _WIRE_ENUMS.get(dialect, {})
         control_paths = (*wire_enums, *_WIRE_KEYS.get(dialect, ()))
         control_keys = {path[:size] for path in control_paths for size in range(1, len(path) + 1)}
-        literals = iter(_JSON_STRING_RE.finditer(text))
+        literals = iter(token_pattern.finditer(text))
         pieces: list[str] = []
         end = 0
 
-        def redact_literal(value: str, *, preserve: bool, credential: str | None = None) -> None:
+        def replace_literal(literal: re.Match[str], replacement: str) -> None:
             nonlocal end
+            pieces.extend((text[end:literal.start()], replacement))
+            end = literal.end()
+
+        def redact_literal(value: str, *, preserve: bool, credential: str | None = None) -> None:
             literal = next(literals)
             if preserve:
                 return
@@ -464,8 +477,7 @@ def scrub_protocol_payload(text: str, dialect: str, known_secrets: Sequence[str]
             else:
                 safe = scrub(value)
             if safe != value:
-                pieces.extend((text[end:literal.start()], json.dumps(safe, ensure_ascii=True)))
-                end = literal.end()
+                replace_literal(literal, json.dumps(safe, ensure_ascii=True))
 
         def walk(node: Any, path: tuple[str | None, ...]) -> None:
             if isinstance(node, _JSONMembers):
@@ -480,12 +492,18 @@ def scrub_protocol_payload(text: str, dialect: str, known_secrets: Sequence[str]
                 name = path[-1] if path else None
                 credential = name if name and _is_report_credential(name) else None
                 redact_literal(node, preserve=node in wire_enums.get(path, ()), credential=credential)
+            elif numeric_secrets and type(node) in (int, float):
+                literal = next(literals)
+                if literal[0] in numeric_secrets:
+                    replace_literal(literal, "null")
 
         walk(payload, ())
     except (ValueError, RecursionError):
         # A broken envelope may still contain complete JSON string literals.
         def scrub_literal(match: re.Match[str]) -> str:
             literal = match[0]
+            if not literal.startswith('"'):
+                return "null" if literal in numeric_secrets else literal
             try:
                 value = json.loads(literal)
             except ValueError:
@@ -493,7 +511,7 @@ def scrub_protocol_payload(text: str, dialect: str, known_secrets: Sequence[str]
             safe = scrub(value)
             return json.dumps(safe, ensure_ascii=True) if safe != value else literal
 
-        return scrub(_JSON_STRING_RE.sub(scrub_literal, text))
+        return scrub(token_pattern.sub(scrub_literal, text))
     return "".join((*pieces, text[end:]))
 
 
